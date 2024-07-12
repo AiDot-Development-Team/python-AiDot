@@ -21,15 +21,47 @@ class Lan(object):
     _cct : int
     _login_uuid = 0
     _available : bool = False
-    
+
     _connectAndLogin : bool = False
     _connecting = False
     _simpleVersion = ""
     _colorMode = ""
-   
+
+    @property
+    def is_on(self) -> bool:
+        return self._is_on
+
+    @property
+    def brightness(self) -> int:
+        return self._dimming * 255 / 100
+
+    @property
+    def rgdb(self) -> int:
+        return self._rgdb
+
+    @property
+    def cct(self) -> int:
+        return self._cct
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    @property
+    def connectAndLogin(self) -> bool:
+        return self._connectAndLogin
+
+    @property
+    def connecting(self) -> bool:
+        return self._connecting
+
+    @property
+    def colorMode(self) -> str:
+        return self._colorMode
+
     def __init__(self,device:dict,user_info:dict) -> None:
         self.ping_count = 0
-        
+
         if "id" in user_info:
             self.user_id = user_info["id"]
 
@@ -37,7 +69,7 @@ class Lan(object):
             key_string = device["aesKey"][0]
             if key_string is not None:
                 self.aes_key = bytearray(16)
-                key_bytes = key_string.encode()     
+                key_bytes = key_string.encode()
                 self.aes_key[:len(key_bytes)] = key_bytes
 
         if "password" in device:
@@ -67,10 +99,6 @@ class Lan(object):
     def setUpdateDeviceCb(self,callback):
         self._updateDeviceCb = callback
 
-    @property
-    def brightness(self) -> int:
-        return self._dimming * 255 / 100
-
     def printfHex(self,packet):
         hex_representation = binascii.hexlify(packet).decode()
 
@@ -80,7 +108,7 @@ class Lan(object):
 
         if self.aes_key is not None:
             send_data = aes_encrypt(message,self.aes_key)
-        else : 
+        else :
             send_data = message
 
         bodysize = struct.pack('>i', len(send_data))
@@ -91,7 +119,7 @@ class Lan(object):
     async def login(self):
         login_seq = str(int(time.time() * 1000) + self._login_uuid)[-9:]
         self._login_uuid += 1
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f") 
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
         message = {
             "service":"device",
             "method":"loginReq",
@@ -112,12 +140,12 @@ class Lan(object):
         data_len = len(data)
         if(data_len <= 0):
             return
-        
+
         magic, msgtype, bodysize = struct.unpack('>HHI', data[:8])
         encrypted_data = data[8:]
         if self.aes_key is not None:
             decrypted_data = aes_decrypt(encrypted_data, self.aes_key)
-        else : 
+        else :
             decrypted_data = encrypted_data
 
         json_data = json.loads(decrypted_data)
@@ -127,7 +155,7 @@ class Lan(object):
 
         self._available = True
 
-        await self.sendAction({},"getDevAttrReq")   
+        await self.sendAction({},"getDevAttrReq")
 
     async def recvData(self):
         while True:
@@ -140,7 +168,7 @@ class Lan(object):
             data_len = len(data)
             if(data_len <= 0):
                 break
-            
+
             try:
                 magic, msgtype, bodysize = struct.unpack('>HHI', data[:8])
                 encrypted_data = data[8:]
@@ -154,7 +182,7 @@ class Lan(object):
 
             if "service" in json_data:
                 if "test" == json_data["service"]:
-                     self.ping_count = 0
+                    self.ping_count = 0
 
             if "payload" in json_data:
                 if "ascNumber" in json_data["payload"]:
@@ -171,10 +199,10 @@ class Lan(object):
                         self._cct = json_data["payload"]["attr"]["CCT"]
                         self._colorMode = "cct"
                     if self._updateDeviceCb:
-                       await self._updateDeviceCb()
+                        await self._updateDeviceCb()
 
     async def ping_task(self):
-        while True: 
+        while True:
             if await self.sendPingAction() == -1 :
                 return
             await asyncio.sleep(10)
@@ -254,7 +282,7 @@ class Lan(object):
             _LOGGER.error(f"{self.device_id} send action error {e}")
         except Exception as e:
             _LOGGER.error(f"{self.device_id} send action error {e}")
-    
+
     async def sendPingAction(self):
         ping = {
             "service": "test",
@@ -265,9 +293,9 @@ class Lan(object):
         }
         try:
             if self.ping_count >= 2 :
-                 _LOGGER.error(f"Last ping did not return within 20 seconds. device id:{self.device_id}")
-                 await self.reset()
-                 return -1
+                _LOGGER.error(f"Last ping did not return within 20 seconds. device id:{self.device_id}")
+                await self.reset()
+                return -1
             self.writer.write(self.getSendPacket(json.dumps(ping).encode(),2))
             await self.writer.drain()
             self.ping_count += 1
