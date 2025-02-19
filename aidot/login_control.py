@@ -12,7 +12,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import hashes
 
-from .login_const import APP_ID, PUBLIC_KEY_PEM
+from .login_const import APP_ID, PUBLIC_KEY_PEM, SUPPORTED_COUNTRYS
 _LOGGER = logging.getLogger(__name__)
 
 def rsa_password_encrypt(message: str):
@@ -41,12 +41,38 @@ class LoginControl:
 
     def __init__(self) -> None:
         self.LoginData = LoginData()
+        self.region = "us"
+        self.username = ""
+    
+    def get_identifier(self,house_id: str) -> str:
+        identifier = (
+                    "username:"
+                    + self.username
+                    + ","
+                    + "house_id:"
+                    + house_id 
+                    + ","
+                    + "region:"
+                    + self.region
+                )
+        return identifier
 
     def change_country_code(self, selected_contry_obj: str):
         """Do change_country_code."""
         self.LoginData.baseUrl = (
             f"https://prod-{selected_contry_obj['region'].lower()}-api.arnoo.com/v17"
         )
+    
+    def change_country_name(self, selected_contry_name: str):
+        selected_contry_obj = {}
+        for item in SUPPORTED_COUNTRYS:
+            if item["name"] == selected_contry_name:
+                selected_contry_obj = item
+                break
+        selected_region = selected_contry_obj['region']
+        if selected_region is not None:
+            self.region = selected_region.lower()
+            self.LoginData.baseUrl = (f"https://prod-{self.region}-api.arnoo.com/v17")
 
     async def async_get_products(
         self, hass: HomeAssistant, token: str, product_ids: str
@@ -114,7 +140,7 @@ class LoginControl:
 
     async def async_post_login(self, hass: HomeAssistant, username: str, password: str):
         """Login the user input allows us to connect."""
-
+        self.username = username
         url = f"{self.LoginData.baseUrl}/users/loginWithFreeVerification"
         headers = {"Appid": APP_ID, "Terminal": "app"}
         data = {
