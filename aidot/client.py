@@ -1,34 +1,38 @@
 """The aidot integration."""
 
 import logging
-from typing import Any, Optional
-from aiohttp import ClientSession
 import base64
 import aiohttp
+from aiohttp import ClientSession
+from typing import Any, Optional
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding
+
+from .exceptions import AidotAuthFailed, AidotUserOrPassIncorrect
+from .device_client import DeviceClient
+from .discover import Discover
 from .login_const import APP_ID, PUBLIC_KEY_PEM, BASE_URL
 from .const import (
-    SUPPORTED_COUNTRYS,
-    DEFAULT_COUNTRY_NAME,
-    CONF_PRODUCT_ID,
-    CONF_ID,
-    CONF_PRODUCT,
     CONF_ACCESS_TOKEN,
-    CONF_REFRESH_TOKEN,
-    CONF_TERMINAL,
     CONF_APP_ID,
-    CONF_REGION,
-    CONF_COUNTRY,
-    CONF_USERNAME,
-    CONF_PASSWORD,
     CONF_CODE,
-    CONF_TOKEN,
+    CONF_COUNTRY,
     CONF_DEVICE_LIST,
+    CONF_ID,
+    CONF_IPADDRESS,
+    CONF_PASSWORD,
+    CONF_PRODUCT,
+    CONF_PRODUCT_ID,
+    CONF_REFRESH_TOKEN,
+    CONF_REGION,
+    CONF_TERMINAL,
+    CONF_TOKEN,
+    CONF_USERNAME,
+    DEFAULT_COUNTRY_NAME,
+    SUPPORTED_COUNTRYS,
     ServerErrorCode,
 )
-from .exceptions import AidotAuthFailed, AidotUserOrPassIncorrect
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -56,6 +60,8 @@ class AidotClient:
     password: str = ""
     country_name: str = DEFAULT_COUNTRY_NAME
     login_info: dict[str, Any] = {}
+    _device_clients: dict[str:DeviceClient]
+    _discover: Discover = None
 
     def __init__(
         self,
@@ -69,7 +75,8 @@ class AidotClient:
         self.country_name = country_name
         self.username = username
         self.password = password
-        self.login_info = token
+        self.login_info = token.copy()
+        self._device_clients = {}
         for item in SUPPORTED_COUNTRYS:
             if item["name"] == self.country_name:
                 self._region = item["region"].lower()
@@ -154,6 +161,7 @@ class AidotClient:
                 CONF_TOKEN: token,
                 CONF_APP_ID: APP_ID,
             }
+        response_data = {}
         try:
             response = await self.session.get(url, headers=headers)
             response_data = await response.json()
@@ -161,7 +169,7 @@ class AidotClient:
             return response_data
         except aiohttp.ClientError as e:
             _LOGGER.info(f"async_get ClientError {e}")
-            code = response_data[CONF_CODE]
+            code = response_data.get(CONF_CODE)
             if code == ServerErrorCode.TOKEN_EXPIRED:
                 try:
                     await self.async_refresh_token()
@@ -173,7 +181,7 @@ class AidotClient:
             ):
                 self.login_info[CONF_ACCESS_TOKEN] = None
                 raise AidotAuthFailed
-            return None
+            return aiohttp.ClientError
 
     async def async_get_products(self, product_ids: str):
         """Get device list."""
@@ -211,3 +219,35 @@ class AidotClient:
         except Exception as e:
             raise e
         return {CONF_DEVICE_LIST: final_device_list}
+
+    def get_device_client(self, device: dict[str:Any]) -> DeviceClient:
+        device_id = device.get(CONF_ID)
+        device_client: DeviceClient = self._device_clients.get(device_id)
+        if device_client is None:
+            device_client = DeviceClient(device, self.login_info)
+            self._device_clients[device_id] = device_client
+        if self._discover is not None:
+            ip = self._discover.discovered_device.get(device_id)
+            device_client.update_ip_address(ip)
+        return device_client
+
+    async def start_discover(self) -> None:
+        if self._discover is not None:
+            return
+
+        def _discover_callback(dev_id, event: dict[str, str]) -> None:
+            device_ip = event[CONF_IPADDRESS]
+            device_client: DeviceClient = self._device_clients.get(dev_id)
+            if device_client is not None:
+                device_client.update_ip_address(device_ip)
+
+        self._discover = Discover(self.login_info, _discover_callback)
+        await self._discover.repeat_broadcast()
+
+    def stop_discover(self) -> None:
+        self._discover.close()
+        self._discover = None
+
+    def cleanup(self) -> None:
+        self.stop_discover()
+        self._device_clients.clear()

@@ -1,15 +1,40 @@
+"""The aidot integration."""
+
+import ctypes
 import socket
 import struct
 import time
-from datetime import datetime
 import json
 import asyncio
 import logging
+from datetime import datetime
 from typing import Any
-from .const import *
-from .exceptions import AidotNotLogin
 
+from .exceptions import AidotNotLogin
 from .aes_utils import aes_encrypt, aes_decrypt
+from .const import (
+    CONF_AES_KEY,
+    CONF_ASCNUMBER,
+    CONF_ATTR,
+    CONF_CCT,
+    CONF_HARDWARE_VERSION,
+    CONF_ID,
+    CONF_IDENTITY,
+    CONF_MAC,
+    CONF_MAXVALUE,
+    CONF_MINVALUE,
+    CONF_MODEL_ID,
+    CONF_NAME,
+    CONF_ON_OFF,
+    CONF_DIMMING,
+    CONF_PASSWORD,
+    CONF_PAYLOAD,
+    CONF_PRODUCT,
+    CONF_PROPERTIES,
+    CONF_RGBW,
+    CONF_SERVICE_MODULES,
+    Identity,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -18,6 +43,7 @@ class DeviceStatusData:
     online: bool = False
     on: bool = False
     rgdb: int = None
+    rgbw: tuple[int, int, int, int] = None
     cct: int = None
     dimming: int = None
 
@@ -27,9 +53,15 @@ class DeviceStatusData:
         if attr.get(CONF_ON_OFF) is not None:
             self.on = attr.get(CONF_ON_OFF)
         if attr.get(CONF_DIMMING) is not None:
-            self.dimming = attr.get(CONF_DIMMING)
+            self.dimming = int(attr.get(CONF_DIMMING) * 255 / 100)
         if attr.get(CONF_RGBW) is not None:
             self.rgdb = attr.get(CONF_RGBW)
+            rgbw = ctypes.c_uint32(self.rgdb).value
+            r = (rgbw >> 24) & 0xFF
+            g = (rgbw >> 16) & 0xFF
+            b = (rgbw >> 8) & 0xFF
+            w = rgbw & 0xFF
+            self.rgbw = (r, g, b, w)
         if attr.get(CONF_CCT) is not None:
             self.cct = attr.get(CONF_CCT)
 
@@ -66,15 +98,13 @@ class DeviceInformation:
 class DeviceClient(object):
     status: DeviceStatusData
     info: DeviceInformation
-
     _login_uuid = 0
-
     _connect_and_login: bool = False
-    _connecting = False
-    _simpleVersion = ""
-    _color_mode = ""
+    _connecting: bool = False
+    _simpleVersion: str = ""
     _ip_address: str
     device_id: str
+    _is_close: bool = False
 
     @property
     def connect_and_login(self) -> bool:
@@ -83,10 +113,6 @@ class DeviceClient(object):
     @property
     def connecting(self) -> bool:
         return self._connecting
-
-    @property
-    def color_mode(self) -> str:
-        return self._color_mode
 
     def __init__(self, device: dict, user_info: dict) -> None:
         self.ping_count = 0
@@ -105,11 +131,11 @@ class DeviceClient(object):
         self.device_id = device.get(CONF_ID)
         self._simpleVersion = device.get("simpleVersion")
 
-    async def connect(self, ipAddress):
+    async def connect(self, ip_address):
         self.reader = self.writer = None
         self._connecting = True
         try:
-            self.reader, self.writer = await asyncio.open_connection(ipAddress, 10000)
+            self.reader, self.writer = await asyncio.open_connection(ip_address, 10000)
             sock: socket.socket = self.writer.get_extra_info("socket")
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self.seq_num = 1
@@ -160,10 +186,15 @@ class DeviceClient(object):
                 "ascNumber": 1,
             },
         }
-        self.writer.write(self.getSendPacket(json.dumps(message).encode(), 1))
-        await self.writer.drain()
+        try:
+            self.writer.write(self.getSendPacket(json.dumps(message).encode(), 1))
+            await self.writer.drain()
+            data = await self.reader.read(1024)
+        except (BrokenPipeError, ConnectionResetError) as e:
+            _LOGGER.error(f"{self.device_id} login read status error {e}")
+        except Exception as e:
+            _LOGGER.error(f"recv data error {e}")
 
-        data = await self.reader.read(1024)
         data_len = len(data)
         if data_len <= 0:
             return
@@ -180,22 +211,27 @@ class DeviceClient(object):
         self.ascNumber = json_data[CONF_PAYLOAD][CONF_ASCNUMBER]
         self.ascNumber += 1
         self.status.online = True
-        await self.sendAction({}, "getDevAttrReq")
+        await self.send_action({}, "getDevAttrReq")
 
     async def read_status(self):
         if self._connect_and_login is False:
+            await asyncio.sleep(2)
             raise AidotNotLogin
         try:
             data = await self.reader.read(1024)
-        except BrokenPipeError as e:
-            _LOGGER.error(f"{self.device_id} read_statuserror {e}")
-        except ConnectionResetError as e:
-            _LOGGER.error(f"{self.device_id} read_status error {e}")
+        except (BrokenPipeError, ConnectionResetError) as e:
+            _LOGGER.error(f"{self.device_id} read status error {e}")
+            await self.reset()
+            self.status.online = False
+            return self.status
         except Exception as e:
             _LOGGER.error(f"recv data error {e}")
             return self.status
         data_len = len(data)
         if data_len <= 0:
+            _LOGGER.error("recv data error len")
+            await self.reset()
+            self.status.online = False
             return self.status
         try:
             magic, msgtype, bodysize = struct.unpack(">HHI", data[:8])
@@ -203,11 +239,12 @@ class DeviceClient(object):
             json_data = json.loads(decrypted_data)
         except Exception as e:
             _LOGGER.error(f"recv json error : {e}")
-            return self.status
+            return await self.read_status()
 
         if "service" in json_data:
             if "test" == json_data["service"]:
                 self.ping_count = 0
+                return await self.read_status()
         payload = json_data.get(CONF_PAYLOAD)
         if payload is not None:
             self.ascNumber = payload.get(CONF_ASCNUMBER)
@@ -216,38 +253,33 @@ class DeviceClient(object):
 
     async def ping_task(self):
         while True:
-            await asyncio.sleep(
-                5
-            )  # 加个延迟，不然遇到查状态和发ping同时出现状态回不来，暂时不知道什么原因
-            if await self.sendPingAction() == -1:
+            if self._is_close:
                 return
             await asyncio.sleep(5)
+            await self.send_ping_action()
+            await asyncio.sleep(5)
 
-    def getOnOffAction(self, OnOff):
-        self._is_on = OnOff
-        return {CONF_ON_OFF: self._is_on}
-
-    def getDimingAction(self, brightness):
-        self._dimming = int(brightness * 100 / 255)
-        return {CONF_DIMMING: self._dimming}
-
-    def getCCTAction(self, cct):
-        self._cct = cct
-        self._color_mode = Attribute.CCT
-        return {CONF_CCT: self._cct}
-
-    def getRGBWAction(self, rgbw):
-        self._rgdb = rgbw
-        self._color_mode = Attribute.RGBW
-        return {CONF_RGBW: rgbw}
-
-    async def sendDevAttr(self, devAttr):
-        await self.sendAction(devAttr, "setDevAttrReq")
+    async def send_dev_attr(self, dev_attr):
+        await self.send_action(dev_attr, "setDevAttrReq")
 
     async def async_turn_off(self) -> None:
-        await self.sendDevAttr({CONF_ON_OFF: 0})
+        await self.send_dev_attr({CONF_ON_OFF: 0})
 
-    async def sendAction(self, attr, method):
+    async def async_turn_on(self) -> None:
+        await self.send_dev_attr({CONF_ON_OFF: 1})
+
+    async def async_set_brightness(self, brightness: int) -> None:
+        final_dimming = int(brightness * 100 / 255)
+        await self.send_dev_attr({CONF_DIMMING: final_dimming})
+
+    async def async_set_rgbw(self, rgbw: tuple[int, int, int, int]) -> None:
+        final_rgbw = (rgbw[0] << 24) | (rgbw[1] << 16) | (rgbw[2] << 8) | rgbw[3]
+        await self.send_dev_attr({CONF_RGBW: ctypes.c_int32(final_rgbw).value})
+
+    async def async_set_cct(self, cct: int) -> None:
+        await self.send_dev_attr({CONF_CCT: cct})
+
+    async def send_action(self, attr, method):
         current_timestamp_milliseconds = int(time.time() * 1000)
         self.seq_num += 1
         seq = "ha93" + str(self.seq_num).zfill(5)
@@ -291,12 +323,13 @@ class DeviceClient(object):
         try:
             self.writer.write(self.getSendPacket(json.dumps(action).encode(), 1))
             await self.writer.drain()
-        except BrokenPipeError as e:
+        except (BrokenPipeError, ConnectionResetError) as e:
             _LOGGER.error(f"{self.device_id} send action error {e}")
+            await self.reset()
         except Exception as e:
             _LOGGER.error(f"{self.device_id} send action error {e}")
 
-    async def sendPingAction(self):
+    async def send_ping_action(self):
         ping = {
             "service": "test",
             "method": "pingreq",
@@ -310,6 +343,8 @@ class DeviceClient(object):
                     f"Last ping did not return within 20 seconds. device id:{self.device_id}"
                 )
                 await self.reset()
+                return -1
+            if self._connect_and_login is False:
                 return -1
             self.writer.write(self.getSendPacket(json.dumps(ping).encode(), 2))
             await self.writer.drain()
@@ -330,3 +365,7 @@ class DeviceClient(object):
         self._connect_and_login = False
         self.status.online = False
         self.ping_count = 0
+
+    async def close(self):
+        self._is_close = True
+        await self.reset()

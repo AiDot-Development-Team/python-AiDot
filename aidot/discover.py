@@ -2,17 +2,15 @@ import socket
 import json
 import time
 import logging
+import asyncio
 from typing import Any
-import threading
 
 from .aes_utils import aes_encrypt, aes_decrypt
-import asyncio
 from .const import CONF_ID, CONF_IPADDRESS
 from .exceptions import AidotOSError
 
 _LOGGER = logging.getLogger(__name__)
 _DISCOVER_TIME = 5
-
 
 class BroadcastProtocol:
     _is_closed = False
@@ -86,6 +84,7 @@ class Discover:
     _login_info: dict[str:Any] = None
     _broadcast_protocol: BroadcastProtocol = None
     discovered_device: dict[str:str]
+    _is_close: bool = False
 
     def __init__(self, login_info, callback):
         self.discovered_device = {}
@@ -112,12 +111,14 @@ class Discover:
         await self.try_create_broadcast()
         self._broadcast_protocol.send_broadcast()
 
-    def repeat_broadcast(self) -> None:
-        def _send_broadcast() -> None:
-            asyncio.run(self.send_broadcast())
-            self._discover_timer = threading.Timer(_DISCOVER_TIME, _send_broadcast)
-
-        self._discover_timer = threading.Timer(_DISCOVER_TIME, _send_broadcast)
+    async def repeat_broadcast(self) -> None:
+        self._is_close = False
+        while True:
+            await self.send_broadcast()
+            for i in range(_DISCOVER_TIME):
+                await asyncio.sleep(1)  # 每秒检查一次是否需要取消任务
+                if self._is_close is True:
+                    return
 
     async def fetch_devices_info(self) -> dict[str:str]:
         self.try_create_broadcast()
@@ -131,9 +132,7 @@ class Discover:
             self._callback(dev_id, event)
 
     def close(self) -> None:
+        self._is_close = True
         if self._broadcast_protocol is not None:
             self._broadcast_protocol.close()
             self._broadcast_protocol = None
-        if self._discover_timer is not None:
-            self._discover_timer.cancel()
-            self._discover_timer = None
