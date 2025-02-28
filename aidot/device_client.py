@@ -1,80 +1,98 @@
 import socket
 import struct
-import binascii
 import time
 from datetime import datetime
 import json
 import asyncio
 import logging
-from .const import (
-    CONF_ID,
-    CONF_AES_KEY,
-    CONF_PASSWORD,
-    CONF_PAYLOAD,
-    CONF_ASCNUMBER,
-    CONF_ATTR,
-    CONF_ON_OFF,
-    CONF_DIMMING,
-    CONF_RGBW,
-    CONF_CCT,
-    Attribute,
-)
+from typing import Any
+from .const import *
+from .exceptions import AidotNotLogin
 
 from .aes_utils import aes_encrypt, aes_decrypt
 
 _LOGGER = logging.getLogger(__name__)
 
 
-class Lan(object):
-    _is_on: bool = False
-    _dimming = 0
-    _rgdb: int
-    _cct: int
-    _login_uuid = 0
-    _available: bool = False
+class DeviceStatusData:
+    online: bool = False
+    on: bool = False
+    rgdb: int = None
+    cct: int = None
+    dimming: int = None
 
-    _connectAndLogin: bool = False
+    def update(self, attr: dict[str, Any]) -> None:
+        if attr is None:
+            return
+        if attr.get(CONF_ON_OFF) is not None:
+            self.on = attr.get(CONF_ON_OFF)
+        if attr.get(CONF_DIMMING) is not None:
+            self.dimming = attr.get(CONF_DIMMING)
+        if attr.get(CONF_RGBW) is not None:
+            self.rgdb = attr.get(CONF_RGBW)
+        if attr.get(CONF_CCT) is not None:
+            self.cct = attr.get(CONF_CCT)
+
+
+class DeviceInformation:
+    enable_rgbw: bool = False
+    enable_dimming: bool = True
+    enable_cct: bool = False
+    cct_min: int
+    cct_max: int
+    dev_id: str
+    mac: str
+    model_id: str
+    name: str
+    hw_version: str
+
+    def __init__(self, device: dict[str:Any]):
+        self.dev_id = device.get(CONF_ID)
+        self.mac = device.get(CONF_MAC) if device.get(CONF_MAC) is not None else ""
+        self.model_id = device.get(CONF_MODEL_ID)
+        self.name = device.get(CONF_NAME)
+        self.hw_version = device.get(CONF_HARDWARE_VERSION)
+        if CONF_PRODUCT in device and CONF_SERVICE_MODULES in device[CONF_PRODUCT]:
+            for service in device[CONF_PRODUCT][CONF_SERVICE_MODULES]:
+                if service[CONF_IDENTITY] == Identity.RGBW:
+                    self.enable_rgbw = True
+                    self.enable_cct = True
+                elif service[CONF_IDENTITY] == Identity.CCT:
+                    self.cct_min = int(service[CONF_PROPERTIES][0][CONF_MINVALUE])
+                    self.cct_max = int(service[CONF_PROPERTIES][0][CONF_MAXVALUE])
+                    self.enable_cct = True
+
+
+class DeviceClient(object):
+    status: DeviceStatusData
+    info: DeviceInformation
+
+    _login_uuid = 0
+
+    _connect_and_login: bool = False
     _connecting = False
     _simpleVersion = ""
-    _colorMode = ""
+    _color_mode = ""
+    _ip_address: str
+    device_id: str
 
     @property
-    def is_on(self) -> bool:
-        return self._is_on
-
-    @property
-    def brightness(self) -> int:
-        return self._dimming * 255 / 100
-
-    @property
-    def rgdb(self) -> int:
-        return self._rgdb
-
-    @property
-    def cct(self) -> int:
-        return self._cct
-
-    @property
-    def available(self) -> bool:
-        return self._available
-
-    @property
-    def connectAndLogin(self) -> bool:
-        return self._connectAndLogin
+    def connect_and_login(self) -> bool:
+        return self._connect_and_login
 
     @property
     def connecting(self) -> bool:
         return self._connecting
 
     @property
-    def colorMode(self) -> str:
-        return self._colorMode
+    def color_mode(self) -> str:
+        return self._color_mode
 
     def __init__(self, device: dict, user_info: dict) -> None:
         self.ping_count = 0
-
-        if CONF_ID in user_info:
-            self.user_id = user_info[CONF_ID]
+        self.status = DeviceStatusData()
+        self.info = DeviceInformation(device)
+        self.user_id = user_info.get(CONF_ID)
 
         if CONF_AES_KEY in device:
             key_string = device[CONF_AES_KEY][0]
@@ -83,14 +101,9 @@ class Lan(object):
                 key_bytes = key_string.encode()
                 self.aes_key[: len(key_bytes)] = key_bytes
 
-        if CONF_PASSWORD in device:
-            self.password = device[CONF_PASSWORD]
-
-        if CONF_ID in device:
-            self.device_id = device[CONF_ID]
-
-        if "simpleVersion" in device:
-            self._simpleVersion = device["simpleVersion"]
+        self.password = device.get(CONF_PASSWORD)
+        self.device_id = device.get(CONF_ID)
+        self._simpleVersion = device.get("simpleVersion")
 
     async def connect(self, ipAddress):
         self.reader = self.writer = None
@@ -101,17 +114,20 @@ class Lan(object):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self.seq_num = 1
             await self.login()
-            self._connectAndLogin = True
+            self._connect_and_login = True
         except Exception as e:
-            self._connectAndLogin = False
+            self._connect_and_login = False
         finally:
             self._connecting = False
 
-    def setUpdateDeviceCb(self, callback):
-        self._updateDeviceCb = callback
+    def update_ip_address(self, ip: str) -> None:
+        self._ip_address = ip
 
-    def printfHex(self, packet):
-        hex_representation = binascii.hexlify(packet).decode()
+    async def async_login(self) -> None:
+        if self._ip_address is None:
+            return
+        if self._connecting is not True and self._connect_and_login is not True:
+            await self.connect(self._ip_address)
 
     def getSendPacket(self, message, msgtype):
         magic = struct.pack(">H", 0x1EED)
@@ -161,31 +177,33 @@ class Lan(object):
 
         json_data = json.loads(decrypted_data)
 
-        self.ascNumber = json_data["payload"]["ascNumber"]
+        self.ascNumber = json_data[CONF_PAYLOAD][CONF_ASCNUMBER]
         self.ascNumber += 1
-
-        self._available = True
-
+        self.status.online = True
         await self.sendAction({}, "getDevAttrReq")
 
     async def read_status(self):
+        if self._connect_and_login is False:
+            raise AidotNotLogin
         try:
             data = await self.reader.read(1024)
+        except BrokenPipeError as e:
+            _LOGGER.error(f"{self.device_id} read_statuserror {e}")
+        except ConnectionResetError as e:
+            _LOGGER.error(f"{self.device_id} read_status error {e}")
         except Exception as e:
             _LOGGER.error(f"recv data error {e}")
-            return {}
+            return self.status
         data_len = len(data)
         if data_len <= 0:
-            return {}
-
+            return self.status
         try:
             magic, msgtype, bodysize = struct.unpack(">HHI", data[:8])
-            encrypted_data = data[8:]
-            decrypted_data = aes_decrypt(encrypted_data, self.aes_key)
+            decrypted_data = aes_decrypt(data[8:], self.aes_key)
             json_data = json.loads(decrypted_data)
         except Exception as e:
             _LOGGER.error(f"recv json error : {e}")
-            return {}
+            return self.status
 
         if "service" in json_data:
             if "test" == json_data["service"]:
@@ -193,62 +211,8 @@ class Lan(object):
         payload = json_data.get(CONF_PAYLOAD)
         if payload is not None:
             self.ascNumber = payload.get(CONF_ASCNUMBER)
-            attr = payload.get(CONF_ATTR)
-            if attr is not None:
-                if CONF_ON_OFF in attr:
-                    self._is_on = attr.get(CONF_ON_OFF)
-                if CONF_DIMMING in attr:
-                    self._dimming = attr.get(CONF_DIMMING)
-                if CONF_RGBW in attr:
-                    self._rgdb = attr.get(CONF_RGBW)
-                    self._colorMode = Attribute.RGBW
-                if CONF_CCT in attr:
-                    self._cct = attr.get(CONF_CCT)
-                    self._colorMode = Attribute.CCT
-
-    async def recvData(self):
-        while True:
-            try:
-                data = await self.reader.read(1024)
-            except Exception as e:
-                _LOGGER.error(f"recv data error {e}")
-                await asyncio.sleep(3)
-                continue
-            data_len = len(data)
-            if data_len <= 0:
-                break
-
-            try:
-                magic, msgtype, bodysize = struct.unpack(">HHI", data[:8])
-                encrypted_data = data[8:]
-                decrypted_data = aes_decrypt(encrypted_data, self.aes_key)
-
-                json_data = json.loads(decrypted_data)
-            except Exception as e:
-                _LOGGER.error(f"recv json error : {e}")
-                await asyncio.sleep(3)
-                continue
-
-            if "service" in json_data:
-                if "test" == json_data["service"]:
-                    self.ping_count = 0
-
-            if "payload" in json_data:
-                if "ascNumber" in json_data["payload"]:
-                    self.ascNumber = json_data["payload"]["ascNumber"]
-                if "attr" in json_data["payload"]:
-                    if "OnOff" in json_data["payload"]["attr"]:
-                        self._is_on = json_data["payload"]["attr"]["OnOff"]
-                    if "Dimming" in json_data["payload"]["attr"]:
-                        self._dimming = json_data["payload"]["attr"]["Dimming"]
-                    if "RGBW" in json_data["payload"]["attr"]:
-                        self._rgdb = json_data["payload"]["attr"]["RGBW"]
-                        self._colorMode = "rgbw"
-                    if "CCT" in json_data["payload"]["attr"]:
-                        self._cct = json_data["payload"]["attr"]["CCT"]
-                        self._colorMode = "cct"
-                    if self._updateDeviceCb:
-                        await self._updateDeviceCb()
+            self.status.update(payload.get(CONF_ATTR))
+        return self.status
 
     async def ping_task(self):
         while True:
@@ -261,35 +225,35 @@ class Lan(object):
 
     def getOnOffAction(self, OnOff):
         self._is_on = OnOff
-        return {"OnOff": self._is_on}
+        return {CONF_ON_OFF: self._is_on}
 
     def getDimingAction(self, brightness):
         self._dimming = int(brightness * 100 / 255)
-        return {"Dimming": self._dimming}
+        return {CONF_DIMMING: self._dimming}
 
     def getCCTAction(self, cct):
         self._cct = cct
-        self._colorMode = "cct"
-        return {"CCT": self._cct}
+        self._color_mode = Attribute.CCT
+        return {CONF_CCT: self._cct}
 
     def getRGBWAction(self, rgbw):
         self._rgdb = rgbw
-        self._colorMode = "rgbw"
-        return {"RGBW": rgbw}
+        self._color_mode = Attribute.RGBW
+        return {CONF_RGBW: rgbw}
 
     async def sendDevAttr(self, devAttr):
         await self.sendAction(devAttr, "setDevAttrReq")
 
+    async def async_turn_off(self) -> None:
+        await self.sendDevAttr({CONF_ON_OFF: 0})
+
     async def sendAction(self, attr, method):
         current_timestamp_milliseconds = int(time.time() * 1000)
-
         self.seq_num += 1
-
         seq = "ha93" + str(self.seq_num).zfill(5)
-
-        if not self._is_on and not "OnOff" in attr:
-            attr["OnOff"] = 1
-            self._is_on = 1
+        if not self.status.on and not CONF_ON_OFF in attr:
+            self.status.on = True
+            attr[CONF_ON_OFF] = 1
 
         if self._simpleVersion is not None:
             action = {
@@ -308,7 +272,6 @@ class Lan(object):
                     "ascNumber": self.ascNumber,
                 },
                 "tst": current_timestamp_milliseconds,
-                # "tid": "homeassistant",
                 "deviceId": self.device_id,
             }
         else:
@@ -322,7 +285,6 @@ class Lan(object):
                     "ascNumber": self.ascNumber,
                 },
                 "tst": current_timestamp_milliseconds,
-                # "tid": "homeassistant",
                 "deviceId": self.device_id,
             }
 
@@ -340,7 +302,7 @@ class Lan(object):
             "method": "pingreq",
             "seq": "123456",
             "srcAddr": "x.xxxxxxx",
-            "payload": {},
+            CONF_PAYLOAD: {},
         }
         try:
             if self.ping_count >= 2:
@@ -365,8 +327,6 @@ class Lan(object):
                 await self.writer.wait_closed()
         except Exception as e:
             _LOGGER.error(f"{self.device_id} writer close error {e}")
-        self._connectAndLogin = False
-        self._available = False
+        self._connect_and_login = False
+        self.status.online = False
         self.ping_count = 0
-        if self._updateDeviceCb:
-            await self._updateDeviceCb()
