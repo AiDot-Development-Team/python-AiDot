@@ -1,5 +1,6 @@
 """The aidot integration."""
 
+import asyncio
 import logging
 import base64
 import aiohttp
@@ -75,7 +76,6 @@ class AidotClient:
         self.country_name = country_name
         self.username = username
         self.password = password
-        self.login_info = token.copy()
         self._device_clients = {}
         for item in SUPPORTED_COUNTRYS:
             if item["name"] == self.country_name:
@@ -83,6 +83,7 @@ class AidotClient:
                 self._base_url = f"https://prod-{self._region}-api.arnoo.com/v17"
                 break
         if token is not None:
+            self.login_info = token.copy()
             self.username = token[CONF_USERNAME]
             self.password = token[CONF_PASSWORD]
             self._region = token[CONF_REGION]
@@ -226,12 +227,13 @@ class AidotClient:
         if device_client is None:
             device_client = DeviceClient(device, self.login_info)
             self._device_clients[device_id] = device_client
+            asyncio.get_running_loop().create_task(device_client.ping_task())
         if self._discover is not None:
             ip = self._discover.discovered_device.get(device_id)
             device_client.update_ip_address(ip)
         return device_client
 
-    async def start_discover(self) -> None:
+    def start_discover(self) -> None:
         if self._discover is not None:
             return
 
@@ -242,7 +244,7 @@ class AidotClient:
                 device_client.update_ip_address(device_ip)
 
         self._discover = Discover(self.login_info, _discover_callback)
-        await self._discover.repeat_broadcast()
+        asyncio.get_running_loop().create_task(self._discover.repeat_broadcast())
 
     def stop_discover(self) -> None:
         self._discover.close()
@@ -250,4 +252,6 @@ class AidotClient:
 
     def cleanup(self) -> None:
         self.stop_discover()
+        for client in self._device_clients.values():
+            asyncio.get_running_loop().create_task(client.close())
         self._device_clients.clear()

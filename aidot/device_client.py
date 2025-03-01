@@ -369,3 +369,4 @@ class DeviceClient(object):
     async def close(self):
         self._is_close = True
         await self.reset()
+        _LOGGER.info(f"{self.device_id} connect close by user")
