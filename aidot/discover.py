@@ -12,10 +12,11 @@ from .exceptions import AidotOSError
 _LOGGER = logging.getLogger(__name__)
 _DISCOVER_TIME = 5
 
+
 class BroadcastProtocol:
     _is_closed = False
 
-    def __init__(self, callback, user_id):
+    def __init__(self, callback, user_id) -> None:
         self.aes_key = bytearray(32)
         key_string = "T54uednca587"
         key_bytes = key_string.encode()
@@ -24,7 +25,7 @@ class BroadcastProtocol:
         self._discover_cb = callback
         self.user_id = user_id
 
-    def connection_made(self, transport):
+    def connection_made(self, transport) -> None:
         self.transport = transport
         sock = transport.get_extra_info("socket")
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -54,7 +55,7 @@ class BroadcastProtocol:
         except Exception as error:
             _LOGGER.error(f"{self.user_id}:Connection lost due to error: {error}")
 
-    def datagram_received(self, data, addr):
+    def datagram_received(self, data, addr) -> None:
         data_str = aes_decrypt(data, self.aes_key)
         data_json = json.loads(data_str)
         if "payload" in data_json:
@@ -63,7 +64,7 @@ class BroadcastProtocol:
                 if self._discover_cb:
                     self._discover_cb(devId, {CONF_IPADDRESS: addr[0]})
 
-    def error_received(self, exc):
+    def error_received(self, exc) -> None:
         _LOGGER.error(f"{self.user_id}:Error occurred: {exc}")
 
     def close(self) -> None:
@@ -72,7 +73,7 @@ class BroadcastProtocol:
         except Exception as error:
             _LOGGER.error(f"Connection lost due to error: {error}")
 
-    def connection_lost(self, exc):
+    def connection_lost(self, exc) -> None:
         self._is_closed = True
         if exc:
             _LOGGER.error(f"{self.user_id}:Connection lost due to error: {exc}")
@@ -81,9 +82,9 @@ class BroadcastProtocol:
 
 
 class Discover:
-    _login_info: dict[str:Any] = None
+    _login_info: dict[str, Any] = None
     _broadcast_protocol: BroadcastProtocol = None
-    discovered_device: dict[str:str]
+    discovered_device: dict[str, str]
     _is_close: bool = False
 
     def __init__(self, login_info, callback):
@@ -120,7 +121,7 @@ class Discover:
                 if self._is_close is True:
                     return
 
-    async def fetch_devices_info(self) -> dict[str:str]:
+    async def fetch_devices_info(self) -> dict[str, str]:
         self.try_create_broadcast()
         self._broadcast_protocol.send_broadcast()
         await asyncio.sleep(2)

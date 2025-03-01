@@ -78,7 +78,7 @@ class DeviceInformation:
     name: str
     hw_version: str
 
-    def __init__(self, device: dict[str:Any]):
+    def __init__(self, device: dict[str, Any]) -> None:
         self.dev_id = device.get(CONF_ID)
         self.mac = device.get(CONF_MAC) if device.get(CONF_MAC) is not None else ""
         self.model_id = device.get(CONF_MODEL_ID)
@@ -114,7 +114,7 @@ class DeviceClient(object):
     def connecting(self) -> bool:
         return self._connecting
 
-    def __init__(self, device: dict, user_info: dict) -> None:
+    def __init__(self, device: dict[str, Any], user_info: dict[str, Any]) -> None:
         self.ping_count = 0
         self.status = DeviceStatusData()
         self.info = DeviceInformation(device)
@@ -131,7 +131,7 @@ class DeviceClient(object):
         self.device_id = device.get(CONF_ID)
         self._simpleVersion = device.get("simpleVersion")
 
-    async def connect(self, ip_address):
+    async def connect(self, ip_address) -> None:
         self.reader = self.writer = None
         self._connecting = True
         try:
@@ -155,7 +155,7 @@ class DeviceClient(object):
         if self._connecting is not True and self._connect_and_login is not True:
             await self.connect(self._ip_address)
 
-    def getSendPacket(self, message, msgtype):
+    def get_send_packet(self, message, msgtype):
         magic = struct.pack(">H", 0x1EED)
         _msgtype = struct.pack(">h", msgtype)
 
@@ -169,7 +169,7 @@ class DeviceClient(object):
 
         return packet
 
-    async def login(self):
+    async def login(self) -> None:
         login_seq = str(int(time.time() * 1000) + self._login_uuid)[-9:]
         self._login_uuid += 1
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
@@ -187,7 +187,7 @@ class DeviceClient(object):
             },
         }
         try:
-            self.writer.write(self.getSendPacket(json.dumps(message).encode(), 1))
+            self.writer.write(self.get_send_packet(json.dumps(message).encode(), 1))
             await self.writer.drain()
             data = await self.reader.read(1024)
         except (BrokenPipeError, ConnectionResetError) as e:
@@ -213,7 +213,7 @@ class DeviceClient(object):
         self.status.online = True
         await self.send_action({}, "getDevAttrReq")
 
-    async def read_status(self):
+    async def read_status(self) -> DeviceStatusData:
         if self._connect_and_login is False:
             await asyncio.sleep(2)
             raise AidotNotLogin
@@ -251,7 +251,7 @@ class DeviceClient(object):
             self.status.update(payload.get(CONF_ATTR))
         return self.status
 
-    async def ping_task(self):
+    async def ping_task(self) -> None:
         while True:
             if self._is_close:
                 return
@@ -259,7 +259,7 @@ class DeviceClient(object):
             await self.send_ping_action()
             await asyncio.sleep(5)
 
-    async def send_dev_attr(self, dev_attr):
+    async def send_dev_attr(self, dev_attr) -> None:
         await self.send_action(dev_attr, "setDevAttrReq")
 
     async def async_turn_off(self) -> None:
@@ -279,7 +279,7 @@ class DeviceClient(object):
     async def async_set_cct(self, cct: int) -> None:
         await self.send_dev_attr({CONF_CCT: cct})
 
-    async def send_action(self, attr, method):
+    async def send_action(self, attr, method) -> None:
         current_timestamp_milliseconds = int(time.time() * 1000)
         self.seq_num += 1
         seq = "ha93" + str(self.seq_num).zfill(5)
@@ -321,7 +321,7 @@ class DeviceClient(object):
             }
 
         try:
-            self.writer.write(self.getSendPacket(json.dumps(action).encode(), 1))
+            self.writer.write(self.get_send_packet(json.dumps(action).encode(), 1))
             await self.writer.drain()
         except (BrokenPipeError, ConnectionResetError) as e:
             _LOGGER.error(f"{self.device_id} send action error {e}")
@@ -329,7 +329,7 @@ class DeviceClient(object):
         except Exception as e:
             _LOGGER.error(f"{self.device_id} send action error {e}")
 
-    async def send_ping_action(self):
+    async def send_ping_action(self) -> int:
         ping = {
             "service": "test",
             "method": "pingreq",
@@ -346,7 +346,7 @@ class DeviceClient(object):
                 return -1
             if self._connect_and_login is False:
                 return -1
-            self.writer.write(self.getSendPacket(json.dumps(ping).encode(), 2))
+            self.writer.write(self.get_send_packet(json.dumps(ping).encode(), 2))
             await self.writer.drain()
             self.ping_count += 1
             return 1
@@ -355,7 +355,7 @@ class DeviceClient(object):
             await self.reset()
             return -1
 
-    async def reset(self):
+    async def reset(self) -> None:
         try:
             if self.writer:
                 self.writer.close()
@@ -366,7 +366,7 @@ class DeviceClient(object):
         self.status.online = False
         self.ping_count = 0
 
-    async def close(self):
+    async def close(self) -> None:
         self._is_close = True
         await self.reset()
         _LOGGER.info(f"{self.device_id} connect close by user")

@@ -38,7 +38,7 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
-def rsa_password_encrypt(message: str):
+def rsa_password_encrypt(message: str) -> str:
     """Get password rsa encrypt."""
     public_key = serialization.load_pem_public_key(
         PUBLIC_KEY_PEM, backend=default_backend()
@@ -61,7 +61,7 @@ class AidotClient:
     password: str = ""
     country_name: str = DEFAULT_COUNTRY_NAME
     login_info: dict[str, Any] = {}
-    _device_clients: dict[str:DeviceClient]
+    _device_clients: dict[str, DeviceClient]
     _discover: Discover = None
 
     def __init__(
@@ -89,16 +89,16 @@ class AidotClient:
             self._region = token[CONF_REGION]
             self.country_name = token[CONF_COUNTRY]
 
-    def set_token_fresh_cb(self, callback):
+    def set_token_fresh_cb(self, callback) -> None:
         self._token_fresh_cb = callback
 
     def get_identifier(self) -> str:
         return f"{self._region}-{self.username}"
 
-    def update_password(self, password: str):
+    def update_password(self, password: str) -> None:
         self.password = password
 
-    async def async_post_login(self):
+    async def async_post_login(self) -> dict[str, Any]:
         """Login the user input allows us to connect."""
         url = f"{self._base_url}/users/loginWithFreeVerification"
         headers = {CONF_APP_ID: APP_ID, CONF_TERMINAL: "app"}
@@ -127,7 +127,7 @@ class AidotClient:
                 raise AidotUserOrPassIncorrect
             raise Exception
 
-    async def async_refresh_token(self):
+    async def async_refresh_token(self) -> dict[str, Any]:
         url = f"{self._base_url}/users/refreshToken"
         headers = {CONF_APP_ID: APP_ID, CONF_TERMINAL: "app"}
         data = {
@@ -151,7 +151,9 @@ class AidotClient:
                 raise AidotAuthFailed
             return None
 
-    async def async_session_get(self, params: str, headers: str | None = None):
+    async def async_session_get(
+        self, params: str, headers: str | None = None
+    ) -> dict[str, Any]:
         url = f"{self._base_url}{params}"
         token = self.login_info[CONF_ACCESS_TOKEN]
         if token is None:
@@ -184,22 +186,22 @@ class AidotClient:
                 raise AidotAuthFailed
             return aiohttp.ClientError
 
-    async def async_get_products(self, product_ids: str):
+    async def async_get_products(self, product_ids: str) -> list[dict[str, Any]]:
         """Get device list."""
         params = f"/products/{product_ids}"
         return await self.async_session_get(params)
 
-    async def async_get_devices(self, house_id: str):
+    async def async_get_devices(self, house_id: str) -> list[dict[str, Any]]:
         """Get device list."""
         params = f"/devices?houseId={house_id}"
         return await self.async_session_get(params)
 
-    async def async_get_houses(self):
+    async def async_get_houses(self) -> list[dict[str, Any]]:
         """Get house list."""
         params = "/houses"
         return await self.async_session_get(params)
 
-    async def async_get_all_device(self):
+    async def async_get_all_device(self) -> dict[str, Any]:
         final_device_list: list[dict[str, Any]] = []
         try:
             houses = await self.async_get_houses()
@@ -221,7 +223,7 @@ class AidotClient:
             raise e
         return {CONF_DEVICE_LIST: final_device_list}
 
-    def get_device_client(self, device: dict[str:Any]) -> DeviceClient:
+    def get_device_client(self, device: dict[str, Any]) -> DeviceClient:
         device_id = device.get(CONF_ID)
         device_client: DeviceClient = self._device_clients.get(device_id)
         if device_client is None:
