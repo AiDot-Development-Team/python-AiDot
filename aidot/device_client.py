@@ -105,7 +105,7 @@ class DeviceClient(object):
     _ip_address: str
     device_id: str
     _is_close: bool = False
-
+    _status_fresh_cb: Any = None
     @property
     def connect_and_login(self) -> bool:
         return self._connect_and_login
@@ -211,44 +211,84 @@ class DeviceClient(object):
         self.ascNumber = json_data[CONF_PAYLOAD][CONF_ASCNUMBER]
         self.ascNumber += 1
         self.status.online = True
+        asyncio.get_running_loop().create_task(self.reveive_data())
         await self.send_action({}, "getDevAttrReq")
 
-    async def read_status(self) -> DeviceStatusData:
-        if self._connect_and_login is False:
-            await asyncio.sleep(2)
-            raise AidotNotLogin
-        try:
-            data = await self.reader.read(1024)
-        except (BrokenPipeError, ConnectionResetError) as e:
-            _LOGGER.error(f"{self.device_id} read status error {e}")
-            await self.reset()
-            self.status.online = False
-            return self.status
-        except Exception as e:
-            _LOGGER.error(f"recv data error {e}")
-            return self.status
-        data_len = len(data)
-        if data_len <= 0:
-            _LOGGER.error("recv data error len")
-            await self.reset()
-            self.status.online = False
-            return self.status
-        try:
-            magic, msgtype, bodysize = struct.unpack(">HHI", data[:8])
-            decrypted_data = aes_decrypt(data[8:], self.aes_key)
-            json_data = json.loads(decrypted_data)
-        except Exception as e:
-            _LOGGER.error(f"recv json error : {e}")
-            return await self.read_status()
+    async def reveive_data(self) -> None:
+        while True:
+            try:
+                data = await self.reader.read(1024)
+            except (BrokenPipeError, ConnectionResetError) as e:
+                _LOGGER.error(f"{self.device_id} read status error {e}")
+                await self.reset()
+                self.status.online = False
+                return
+            except Exception as e:
+                _LOGGER.error(f"recv data error {e}")
+                return
+            data_len = len(data)
+            if data_len <= 0:
+                _LOGGER.error("recv data error len, exit socket")
+                await self.reset()
+                self.status.online = False
+                return
+            try:
+                magic, msgtype, bodysize = struct.unpack(">HHI", data[:8])
+                decrypted_data = aes_decrypt(data[8:], self.aes_key)
+                json_data = json.loads(decrypted_data)
+            except Exception as e:
+                _LOGGER.error(f"recv json error : {e}")
 
-        if "service" in json_data:
-            if "test" == json_data["service"]:
-                self.ping_count = 0
-                return await self.read_status()
-        payload = json_data.get(CONF_PAYLOAD)
-        if payload is not None:
-            self.ascNumber = payload.get(CONF_ASCNUMBER)
-            self.status.update(payload.get(CONF_ATTR))
+            if "service" in json_data:
+                if "test" == json_data["service"]:
+                    self.ping_count = 0
+                    continue
+
+            payload = json_data.get(CONF_PAYLOAD)
+            if payload is not None:
+                self.ascNumber = payload.get(CONF_ASCNUMBER)
+                self.status.update(payload.get(CONF_ATTR))
+                _LOGGER.info(f"recv status : {payload}")
+                if self._status_fresh_cb:
+                    self._status_fresh_cb(self.status)
+    def set_status_fresh_cb(self, callback) -> None:
+        self._status_fresh_cb = callback
+    async def read_status(self) -> DeviceStatusData:
+        # if self._connect_and_login is False:
+        #     await asyncio.sleep(2)
+        #     raise AidotNotLogin
+        # try:
+        #     data = await self.reader.read(1024)
+        # except (BrokenPipeError, ConnectionResetError) as e:
+        #     _LOGGER.error(f"{self.device_id} read status error {e}")
+        #     await self.reset()
+        #     self.status.online = False
+        #     return self.status
+        # except Exception as e:
+        #     _LOGGER.error(f"recv data error {e}")
+        #     return self.status
+        # data_len = len(data)
+        # if data_len <= 0:
+        #     _LOGGER.error("recv data error len")
+        #     await self.reset()
+        #     self.status.online = False
+        #     return self.status
+        # try:
+        #     magic, msgtype, bodysize = struct.unpack(">HHI", data[:8])
+        #     decrypted_data = aes_decrypt(data[8:], self.aes_key)
+        #     json_data = json.loads(decrypted_data)
+        # except Exception as e:
+        #     _LOGGER.error(f"recv json error : {e}")
+        #     return await self.read_status()
+
+        # if "service" in json_data:
+        #     if "test" == json_data["service"]:
+        #         self.ping_count = 0
+        #         return await self.read_status()
+        # payload = json_data.get(CONF_PAYLOAD)
+        # if payload is not None:
+        #     self.ascNumber = payload.get(CONF_ASCNUMBER)
+        #     self.status.update(payload.get(CONF_ATTR))
         return self.status
 
     async def ping_task(self) -> None:

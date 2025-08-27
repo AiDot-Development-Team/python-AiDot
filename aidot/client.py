@@ -235,6 +235,12 @@ class AidotClient:
             device_client.update_ip_address(ip)
         return device_client
 
+    async def remove_device_client(self, dev_id: str) -> None:
+        device_client: DeviceClient = self._device_clients.get(dev_id)
+        if device_client is not None:
+            await device_client.close()
+            del self._device_clients[dev_id]
+
     def start_discover(self) -> None:
         if self._discover is not None:
             return
