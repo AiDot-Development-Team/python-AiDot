@@ -102,7 +102,7 @@ class DeviceClient(object):
     _connect_and_login: bool = False
     _connecting: bool = False
     _simpleVersion: str = ""
-    _ip_address: str
+    _ip_address: str = None
     device_id: str
     _is_close: bool = False
     _status_fresh_cb: Any = None
@@ -132,6 +132,7 @@ class DeviceClient(object):
         self._simpleVersion = device.get("simpleVersion")
 
     async def connect(self, ip_address) -> None:
+        _LOGGER.info(f"connect device : {ip_address}")
         self.reader = self.writer = None
         self._connecting = True
         try:
@@ -147,8 +148,12 @@ class DeviceClient(object):
             self._connecting = False
 
     def update_ip_address(self, ip: str) -> None:
+        if ip is None:
+            return
         self._ip_address = ip
-
+        if self._connecting is not True and self._connect_and_login is not True:
+            asyncio.get_running_loop().create_task(self.async_login())
+        
     async def async_login(self) -> None:
         if self._ip_address is None:
             return
@@ -248,7 +253,7 @@ class DeviceClient(object):
             if payload is not None:
                 self.ascNumber = payload.get(CONF_ASCNUMBER)
                 self.status.update(payload.get(CONF_ATTR))
-                _LOGGER.info(f"recv status : {payload}")
+                # _LOGGER.info(f"recv status : {payload}")
                 if self._status_fresh_cb:
                     self._status_fresh_cb(self.status)
     def set_status_fresh_cb(self, callback) -> None:
@@ -300,6 +305,8 @@ class DeviceClient(object):
             await asyncio.sleep(5)
 
     async def send_dev_attr(self, dev_attr) -> None:
+        if not self._connect_and_login:
+            raise ConnectionError('Device offline')
         await self.send_action(dev_attr, "setDevAttrReq")
 
     async def async_turn_off(self) -> None:
