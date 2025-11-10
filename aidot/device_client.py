@@ -33,6 +33,8 @@ from .const import (
     CONF_PROPERTIES,
     CONF_RGBW,
     CONF_SERVICE_MODULES,
+    CONF_ACK,
+    CONF_CODE,
     Identity,
 )
 
@@ -203,21 +205,34 @@ class DeviceClient(object):
         data_len = len(data)
         if data_len <= 0:
             return
+        
+        try:
+            magic, msgtype, bodysize = struct.unpack(">HHI", data[:8])
+            encrypted_data = data[8:]
+            if self.aes_key is not None:
+                decrypted_data = aes_decrypt(encrypted_data, self.aes_key)
+            else:
+                decrypted_data = encrypted_data
 
-        magic, msgtype, bodysize = struct.unpack(">HHI", data[:8])
-        encrypted_data = data[8:]
-        if self.aes_key is not None:
-            decrypted_data = aes_decrypt(encrypted_data, self.aes_key)
-        else:
-            decrypted_data = encrypted_data
+            json_data = json.loads(decrypted_data)
+            code = json_data[CONF_ACK][CONF_CODE]
+            if code != 200:
+                # 登录失败
+                _LOGGER.error(f"{self.device_id} login error, code: {code}")
+                await self.reset()
+                return
 
-        json_data = json.loads(decrypted_data)
+            self.ascNumber = json_data[CONF_PAYLOAD][CONF_ASCNUMBER]
+            self.ascNumber += 1
+            self.status.online = True
+            asyncio.get_running_loop().create_task(self.reveive_data())
+            _LOGGER.info(f"connect device success: {self._ip_address}")
+            await self.send_action({}, "getDevAttrReq")
+        except Exception as e:
+            _LOGGER.error(f"connect device error : {e}")
+            return
 
-        self.ascNumber = json_data[CONF_PAYLOAD][CONF_ASCNUMBER]
-        self.ascNumber += 1
-        self.status.online = True
-        asyncio.get_running_loop().create_task(self.reveive_data())
-        await self.send_action({}, "getDevAttrReq")
+        
 
     async def reveive_data(self) -> None:
         while True:
@@ -243,6 +258,7 @@ class DeviceClient(object):
                 json_data = json.loads(decrypted_data)
             except Exception as e:
                 _LOGGER.error(f"recv json error : {e}")
+                continue
 
             if "service" in json_data:
                 if "test" == json_data["service"]:

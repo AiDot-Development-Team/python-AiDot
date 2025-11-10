@@ -32,6 +32,8 @@ from .const import (
     CONF_USERNAME,
     DEFAULT_COUNTRY_NAME,
     SUPPORTED_COUNTRYS,
+    DEFAULT_COUNTRY_CODE,
+    CONF_IS_OWNER,
     ServerErrorCode,
 )
 
@@ -60,6 +62,7 @@ class AidotClient:
     username: str = ""
     password: str = ""
     country_name: str = DEFAULT_COUNTRY_NAME
+    country_code: str = DEFAULT_COUNTRY_CODE
     login_info: dict[str, Any] = {}
     _device_clients: dict[str, DeviceClient]
     _discover: Discover = None
@@ -67,18 +70,19 @@ class AidotClient:
     def __init__(
         self,
         session: Optional[ClientSession],
-        country_name: str | None = None,
+        country_code: str | None = None,
         username: str | None = None,
         password: str | None = None,
         token: dict | None = None,
     ) -> None:
         self.session = session
-        self.country_name = country_name
         self.username = username
         self.password = password
+        self.country_code = country_code
         self._device_clients = {}
         for item in SUPPORTED_COUNTRYS:
-            if item["name"] == self.country_name:
+            if item["id"] == self.country_code:
+                self.country_name = item["name"]
                 self._region = item["region"].lower()
                 self._base_url = f"https://prod-{self._region}-api.arnoo.com/v17"
                 break
@@ -88,6 +92,7 @@ class AidotClient:
             self.password = token[CONF_PASSWORD]
             self._region = token[CONF_REGION]
             self.country_name = token[CONF_COUNTRY]
+            self._base_url = f"https://prod-{self._region}-api.arnoo.com/v17"
 
     def set_token_fresh_cb(self, callback) -> None:
         self._token_fresh_cb = callback
@@ -102,8 +107,9 @@ class AidotClient:
         """Login the user input allows us to connect."""
         url = f"{self._base_url}/users/loginWithFreeVerification"
         headers = {CONF_APP_ID: APP_ID, CONF_TERMINAL: "app"}
+        # f"{region}:{self.country_name.strip()}",
         data = {
-            "countryKey": "region:UnitedStates",
+            "countryKey": f"region:{self.country_name.strip()}",
             "username": self.username,
             "password": rsa_password_encrypt(self.password),
             "terminalId": "gvz3gjae10l4zii00t7y0",
@@ -146,7 +152,7 @@ class AidotClient:
                 self._token_fresh_cb()
             return response_data
         except aiohttp.ClientError as e:
-            _LOGGER.info(f"async_refresh_token ClientError {e}")
+            _LOGGER.info(f"async_refresh_token ClientError {e} {response_data}")
             if response_data[CONF_CODE] == ServerErrorCode.LOGIN_INVALID:
                 raise AidotAuthFailed
             return None
@@ -171,7 +177,7 @@ class AidotClient:
             response.raise_for_status()
             return response_data
         except aiohttp.ClientError as e:
-            _LOGGER.info(f"async_get ClientError {e}")
+            _LOGGER.info(f"async_get ClientError {e} {response_data}")
             code = response_data.get(CONF_CODE)
             if code == ServerErrorCode.TOKEN_EXPIRED:
                 try:
@@ -206,6 +212,8 @@ class AidotClient:
         try:
             houses = await self.async_get_houses()
             for house in houses:
+                if house.get(CONF_IS_OWNER) is False:
+                    continue
                 # get device_list
                 device_list = await self.async_get_devices(house[CONF_ID])
                 if device_list:

@@ -111,7 +111,7 @@ SUPPORTED_COUNTRYS = [
     {"_id": "19-4", "id": "SR", "name": "Suriname", "ext": "", "region": "US"},
     {"_id": "19-5", "id": "SE", "name": "Sweden", "ext": "", "region": "EU"},
     {"_id": "19-6", "id": "SK", "name": "Slovakia", "ext": "", "region": "EU"},
-    {"_id": "19-7", "id": "RS/ME", "name": "Serbia", "ext": "", "region": "EU"},
+    {"_id": "19-7", "id": "RS", "name": "Serbia", "ext": "", "region": "EU"},
     {
         "_id": "19-8",
         "id": "KN",
@@ -161,9 +161,10 @@ SUPPORTED_COUNTRYS = [
     {"_id": "22-2", "id": "VN", "name": "Vietnam", "ext": "", "region": "JP"},
     {"_id": "23-0", "id": "YE", "name": "Yemen", "ext": "", "region": "JP"},
 ]
-
+SUPPORTED_COUNTRY_CODES = [item["id"] for item in SUPPORTED_COUNTRYS]
 SUPPORTED_COUNTRY_NAMES = [item["name"] for item in SUPPORTED_COUNTRYS]
 DEFAULT_COUNTRY_NAME = "United States"
+DEFAULT_COUNTRY_CODE = "US"
 CONF_APP_ID = "Appid"
 CONF_TERMINAL = "Terminal"
 CONF_LOGIN_RESPONSE = "login_response"
@@ -203,6 +204,8 @@ CONF_ON_OFF = "OnOff"
 CONF_DIMMING = "Dimming"
 CONF_RGBW = "RGBW"
 CONF_CCT = "CCT"
+CONF_ACK = "ack"
+CONF_IS_OWNER = "isOwner"
 
 
 class Identity(StrEnum):

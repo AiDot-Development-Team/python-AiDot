@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="python-aidot",
-    version="0.3.41",
+    version="0.3.45",
     author="aidotdev2024",
     url='https://github.com/Aidot-Development-Team/python-aidot',
     description="aidot control wifi lights",
@@ -15,7 +15,6 @@ setuptools.setup(
     install_requires=[
         "requests",
         "aiohttp",
-        "setuptools",
     ],
     classifiers=(
         "Programming Language :: Python :: 3.12",
