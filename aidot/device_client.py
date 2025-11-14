@@ -117,6 +117,8 @@ class DeviceClient(object):
         return self._connecting
 
     def __init__(self, device: dict[str, Any], user_info: dict[str, Any]) -> None:
+        self.writer = None
+        self.reader = None
         self.ping_count = 0
         self.status = DeviceStatusData()
         self.info = DeviceInformation(device)
