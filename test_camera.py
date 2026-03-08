@@ -279,25 +279,37 @@ async def run(args: argparse.Namespace) -> None:
                 print(f"[DIAG] Probing smarthome endpoints for MQTT credentials...")
                 print(f"       hosts: {_smarthome_base}  AND  {_global_smarthome_base}")
                 async with _ah.ClientSession() as _sess:
-                    # Probe 1: POST /user/getUser on both hosts
+                    # Probe 1: /user/getUser on both hosts, 3 request styles
+                    _uid_for_getuser = _lid.get("id") or ""
                     for _base_host in (_smarthome_base, _global_smarthome_base):
-                        try:
-                            async with _sess.post(
-                                f"{_base_host}/user/getUser",
-                                headers=_leedarson_headers,
-                                json={"desc": _token},
-                                timeout=_ah.ClientTimeout(total=8),
-                            ) as _r:
-                                _rb = await _r.json(content_type=None)
-                            _d = _rb.get("data") or {}
-                            _has_mqtt = any(k in str(_d) for k in ("mqtt", "Mqtt", "MQTT", "authInfo"))
-                            _marker = "  *** HAS MQTT DATA ***" if _has_mqtt else ""
-                            print(f"    POST {_base_host}/user/getUser -> code={_rb.get('code')} "
-                                  f"data_keys={list(_d.keys()) if isinstance(_d, dict) else _d!r}{_marker}")
-                            if _has_mqtt and isinstance(_d, dict):
-                                print(f"       data={_d}")
-                        except Exception as _e:
-                            print(f"    POST {_base_host}/user/getUser EXCEPTION: {_e}")
+                        for _gu_style, _gu_kw in (
+                            ("json", {"json":   {"desc": _uid_for_getuser}}),
+                            ("qs",   {"params": {"desc": _uid_for_getuser}}),
+                            ("form", {"data":   {"desc": _uid_for_getuser}}),
+                        ):
+                            try:
+                                async with _sess.post(
+                                    f"{_base_host}/user/getUser",
+                                    headers=_leedarson_headers,
+                                    timeout=_ah.ClientTimeout(total=8),
+                                    **_gu_kw,
+                                ) as _r:
+                                    _rb = await _r.json(content_type=None)
+                                _d = _rb.get("data") or {}
+                                _has_mqtt = any(k in str(_rb) for k in
+                                    ("mqqtPwd", "mqttPwd", "associatedAccount", "authInfo", "mqtt"))
+                                _marker = "  *** HAS MQTT DATA ***" if _has_mqtt else ""
+                                _host_s = "global" if "global" in _base_host else "regional"
+                                print(f"    [{_host_s}][{_gu_style}] POST /user/getUser -> "
+                                      f"code={_rb.get('code')} "
+                                      f"data_keys={list(_d.keys()) if isinstance(_d, dict) else _d!r}"
+                                      f"{_marker}")
+                                if _has_mqtt:
+                                    print(f"       data={_d}")
+                            except Exception as _e:
+                                _host_s = "global" if "global" in _base_host else "regional"
+                                print(f"    [{_host_s}][{_gu_style}] POST /user/getUser "
+                                      f"EXCEPTION: {type(_e).__name__}: {_e}")
 
                     # Probe 2: candidate MQTT-credential endpoints on both hosts
                     _uid_for_probe = _lid.get("id") or str(dc.user_id)
@@ -342,37 +354,56 @@ async def run(args: argparse.Namespace) -> None:
                                 print(f"    [{_host_label}] {_method} {_ep} -> "
                                       f"ERROR: {type(_e).__name__}: {_e}")
 
-                    # Probe 3: /user/login — the AiDot tid ("0001IF") is NOT the smarthome
-                    # tenantId (integer 11).  Try: no tenantId, and with each appId.
-                    _login_hdr = {"terminal": "thirdPlatFormUser",
-                                  "active-language": "en_US", "appKey": "appa070"}
+                    # Probe 3: /user/login
+                    # The Android SDK uses Retrofit @QueryMap on POST, which sends
+                    # params as URL query string (not form body).  We try both:
+                    #   "qs"   = params= (URL query string on POST)  <-- SDK pattern
+                    #   "form" = data=   (application/x-www-form-urlencoded body)
+                    #   "json" = json=   (application/json body)
+                    import hashlib as _hl
+                    _md5_pwd = _hl.md5(_pwd.encode()).hexdigest().upper() if _pwd else ""
+                    _login_hdr_noct = {"terminal": "thirdPlatFormUser",
+                                       "active-language": "en_US", "appKey": "appa070"}
+                    _login_hdr_json = {**_login_hdr_noct, "Content-Type": "application/json"}
                     for _apid in ("appa070", "1383974540041977857"):
                         for _tmark in ("app", "thirdPlatFormUser"):
-                            for _tdata in (
-                                {},                                           # no tenantId
-                                {"tenantId": "11"},                           # smarthome numeric tenantId
-                            ):
-                                _body = {"userName": _uname, "passWord": _pwd, "os": "ios",
-                                         "terminalMark": _tmark, "appId": _apid,
-                                         "phoneId": _tidx, "locationId": "us",
-                                         **_tdata}
-                                _label = f"appId={_apid} tmark={_tmark} tenantId={_tdata.get('tenantId','<none>')}"
-                                try:
-                                    async with _sess.post(
-                                        f"{_smarthome_base}/user/login",
-                                        data=_body,
-                                        headers=_login_hdr,
-                                        timeout=_ah.ClientTimeout(total=8),
-                                    ) as _r:
-                                        _rb = await _r.json(content_type=None)
-                                    _code = _rb.get("code")
-                                    print(f"    /user/login {_label} -> "
-                                          f"code={_code} desc={_rb.get('desc')!r} "
-                                          f"data_keys={list(_rb.get('data') or {})}")
-                                    if _code in (200, 0) and _rb.get("data"):
-                                        print(f"       FULL DATA: {_rb['data']}")
-                                except Exception as _e:
-                                    print(f"    /user/login {_label} EXCEPTION: {_e}")
+                            for _tdata in ({}, {"tenantId": "11"}):
+                                for _pwd_type, _pwd_val in (("plain", _pwd), ("md5", _md5_pwd)):
+                                    _base_body = {
+                                        "userName": _uname, "passWord": _pwd_val,
+                                        "os": "ios", "terminalMark": _tmark,
+                                        "appId": _apid, "phoneId": _tidx,
+                                        "locationId": "us", **_tdata,
+                                    }
+                                    _label = (f"appId={_apid} tmark={_tmark} "
+                                              f"tenantId={_tdata.get('tenantId','<none>')} "
+                                              f"pwd={_pwd_type}")
+                                    for _style, _kw, _hdr in (
+                                        ("qs",   {"params": _base_body}, _login_hdr_noct),
+                                        ("form", {"data":   _base_body}, _login_hdr_noct),
+                                        ("json", {"json":   _base_body}, _login_hdr_json),
+                                    ):
+                                        try:
+                                            async with _sess.post(
+                                                f"{_smarthome_base}/user/login",
+                                                headers=_hdr,
+                                                timeout=_ah.ClientTimeout(total=8),
+                                                **_kw,
+                                            ) as _r:
+                                                _rb = await _r.json(content_type=None)
+                                            _code = _rb.get("code")
+                                            _has_auth = any(k in str(_rb) for k in
+                                                ("mqqtPwd", "mqttPwd", "associatedAccount",
+                                                 "authInfo", "mqtt"))
+                                            _ok = "  *** AUTH DATA ***" if _has_auth else ""
+                                            print(f"    /user/login [{_style}] {_label} -> "
+                                                  f"code={_code} desc={_rb.get('desc')!r}"
+                                                  f"{_ok}")
+                                            if _has_auth or _code in (200, 0):
+                                                print(f"       DATA: {_rb.get('data')}")
+                                        except Exception as _e:
+                                            print(f"    /user/login [{_style}] {_label} "
+                                                  f"EXCEPTION: {type(_e).__name__}: {_e}")
 
                 # Step A: fetch server config
                 print(f"\n[DIAG] Calling getServerUrlConfig (full response logged at WARNING)...")

@@ -1246,10 +1246,20 @@ class DeviceClient(object):
             or ""
         )
         last_body: dict = {}
+        # The Android SDK uses Retrofit @QueryMap on POST (/deviceController/getP2pId etc.)
+        # which appends params as URL query string, NOT as form body.  Try both styles:
+        #   "qs"   = params= (URL query string)   <-- Retrofit @QueryMap pattern
+        #   "form" = data=   (x-www-form-urlencoded body)
+        #   "json" = json=   (application/json body)
+        _login_styles = [
+            ("qs",   lambda d: {"params": d}),
+            ("form", lambda d: {"data":   d}),
+            ("json", lambda d: {"json":   d}),
+        ]
         async with aiohttp.ClientSession() as session:
             for app_id in (_LEEDARSON_APP_KEY, _AIDOT_APP_ID):
                 for pwd_type, pwd_val in pwd_variants:
-                    form_data = {
+                    base_data = {
                         "userName":     username,
                         "passWord":     pwd_val,
                         "os":           "ios",
@@ -1259,74 +1269,77 @@ class DeviceClient(object):
                         "locationId":   self._region or "us",
                     }
                     if _smarthome_tenant_id:
-                        form_data["tenantId"] = _smarthome_tenant_id
-                    try:
-                        async with session.post(
-                            f"{self._smarthome_base}/user/login",
-                            data=form_data,
-                            headers=login_headers,
-                            timeout=aiohttp.ClientTimeout(total=10),
-                        ) as resp:
-                            last_body = await resp.json(content_type=None)
+                        base_data["tenantId"] = _smarthome_tenant_id
+                    for style, make_kw in _login_styles:
+                        try:
+                            async with session.post(
+                                f"{self._smarthome_base}/user/login",
+                                headers=login_headers,
+                                timeout=aiohttp.ClientTimeout(total=10),
+                                **make_kw(base_data),
+                            ) as resp:
+                                last_body = await resp.json(content_type=None)
 
-                        code = last_body.get("code")
-                        _LOGGER.warning(
-                            "_async_get_smarthome_auth /user/login appId=%s pwd=%s "
-                            "-> code=%s: %s",
-                            app_id, pwd_type, code, last_body.get("desc"),
-                        )
-                        print(f"    [/user/login] appId={app_id} pwd={pwd_type} "
-                              f"tenantId={_tenant_id!r} -> code={code} desc={last_body.get('desc')!r}")
-                        if code not in (200, 0):
-                            continue
-
-                        data = last_body.get("data") or {}
-                        if isinstance(data, str):
-                            import json as _json
-                            try:
-                                data = _json.loads(data)
-                            except Exception:
-                                data = {}
-
-                        auth = (data.get("authInfo") if isinstance(data, dict) else None) or data
-                        mqtt_user = (
-                            (auth.get("mqttUser")             if isinstance(auth, dict) else None)
-                            or (auth.get("userId")            if isinstance(auth, dict) else None)
-                            or (auth.get("associatedAccount") if isinstance(auth, dict) else None)
-                            or _mqtt_id
-                        )
-                        mqtt_pwd = (
-                            (auth.get("mqttPassword") if isinstance(auth, dict) else None)
-                            or (auth.get("mqqtPwd")   if isinstance(auth, dict) else None)
-                            or (auth.get("mqttPwd")   if isinstance(auth, dict) else None)
-                            or ""
-                        )
-                        if mqtt_pwd:
-                            self._smarthome_auth = {
-                                "mqttUser":     mqtt_user,
-                                "mqttPassword": mqtt_pwd,
-                                "userId":       (auth.get("userId") if isinstance(auth, dict) else None) or mqtt_user,
-                                "raw":          auth,
-                            }
+                            code = last_body.get("code")
                             _LOGGER.warning(
-                                "_async_get_smarthome_auth OK via /user/login: "
-                                "mqttUser=%s appId=%s pwd=%s", mqtt_user, app_id, pwd_type,
+                                "_async_get_smarthome_auth /user/login style=%s appId=%s pwd=%s "
+                                "-> code=%s: %s",
+                                style, app_id, pwd_type, code, last_body.get("desc"),
                             )
-                            return self._smarthome_auth
+                            print(f"    [/user/login] style={style} appId={app_id} pwd={pwd_type} "
+                                  f"tenantId={_smarthome_tenant_id!r} -> code={code} "
+                                  f"desc={last_body.get('desc')!r}")
+                            if code not in (200, 0):
+                                continue
 
-                        _LOGGER.warning(
-                            "_async_get_smarthome_auth /user/login code=200 but no "
-                            "mqttPassword. data_keys=%s  auth_keys=%s",
-                            list(data.keys()) if isinstance(data, dict) else data,
-                            list(auth.keys()) if isinstance(auth, dict) else auth,
-                        )
+                            data = last_body.get("data") or {}
+                            if isinstance(data, str):
+                                import json as _json
+                                try:
+                                    data = _json.loads(data)
+                                except Exception:
+                                    data = {}
 
-                    except Exception as exc:
-                        _LOGGER.debug(
-                            "_async_get_smarthome_auth /user/login appId=%s pwd=%s: %s",
-                            app_id, pwd_type, exc,
-                        )
-                        continue
+                            auth = (data.get("authInfo") if isinstance(data, dict) else None) or data
+                            mqtt_user = (
+                                (auth.get("mqttUser")             if isinstance(auth, dict) else None)
+                                or (auth.get("userId")            if isinstance(auth, dict) else None)
+                                or (auth.get("associatedAccount") if isinstance(auth, dict) else None)
+                                or _mqtt_id
+                            )
+                            mqtt_pwd = (
+                                (auth.get("mqttPassword") if isinstance(auth, dict) else None)
+                                or (auth.get("mqqtPwd")   if isinstance(auth, dict) else None)
+                                or (auth.get("mqttPwd")   if isinstance(auth, dict) else None)
+                                or ""
+                            )
+                            if mqtt_pwd:
+                                self._smarthome_auth = {
+                                    "mqttUser":     mqtt_user,
+                                    "mqttPassword": mqtt_pwd,
+                                    "userId":       (auth.get("userId") if isinstance(auth, dict) else None) or mqtt_user,
+                                    "raw":          auth,
+                                }
+                                _LOGGER.warning(
+                                    "_async_get_smarthome_auth OK via /user/login: "
+                                    "mqttUser=%s style=%s appId=%s pwd=%s",
+                                    mqtt_user, style, app_id, pwd_type,
+                                )
+                                return self._smarthome_auth
+
+                            _LOGGER.warning(
+                                "_async_get_smarthome_auth /user/login code=200 but no "
+                                "mqttPassword. data_keys=%s  auth_keys=%s",
+                                list(data.keys()) if isinstance(data, dict) else data,
+                                list(auth.keys()) if isinstance(auth, dict) else auth,
+                            )
+
+                        except Exception as exc:
+                            _LOGGER.debug(
+                                "_async_get_smarthome_auth /user/login style=%s appId=%s pwd=%s: %s",
+                                style, app_id, pwd_type, exc,
+                            )
+                            continue
 
         # --- Strategy 5: accessToken as MQTT password (common Arnoo pattern) ---
         # The Arnoo broker frequently accepts (userId, accessToken) as credentials.
