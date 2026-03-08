@@ -992,7 +992,7 @@ class DeviceClient(object):
         )
         return {
             "terminal":        "thirdPlatFormUser",
-            "active-language": "zh_CN",
+            "active-language": "en_US",
             "access-token":    token,
             "token":           token,
             "appKey":          _LEEDARSON_APP_KEY,
@@ -1232,30 +1232,34 @@ class DeviceClient(object):
             "active-language": "en_US",
             "appKey":          _LEEDARSON_APP_KEY,
         }
+        # smarthome tenantId (integer 11 from /user/getUser) is different from
+        # the AiDot platform tid ("0001IF").  Passing the AiDot tid causes a
+        # server-side NumberFormatException (500).  Use the smarthome tenantId
+        # if we fetched it; otherwise omit the field entirely.
+        _smarthome_tenant_id = str(
+            self._smarthome_auth.get("tenantId", "")
+            if self._smarthome_auth else ""
+        )
+        _phone_id = (
+            self._user_info.get("terminalIndex")
+            or self._user_info.get("phoneId")
+            or ""
+        )
         last_body: dict = {}
         async with aiohttp.ClientSession() as session:
             for app_id in (_LEEDARSON_APP_KEY, _AIDOT_APP_ID):
                 for pwd_type, pwd_val in pwd_variants:
-                    _tenant_id = (
-                        self._user_info.get("tid")
-                        or self._user_info.get("tenantId")
-                        or ""
-                    )
-                    _phone_id = (
-                        self._user_info.get("terminalIndex")
-                        or self._user_info.get("phoneId")
-                        or ""
-                    )
                     form_data = {
                         "userName":     username,
                         "passWord":     pwd_val,
                         "os":           "ios",
-                        "terminalMark": "thirdPlatFormUser",
+                        "terminalMark": "app",
                         "appId":        app_id,
-                        "tenantId":     _tenant_id,
                         "phoneId":      _phone_id,
                         "locationId":   self._region or "us",
                     }
+                    if _smarthome_tenant_id:
+                        form_data["tenantId"] = _smarthome_tenant_id
                     try:
                         async with session.post(
                             f"{self._smarthome_base}/user/login",

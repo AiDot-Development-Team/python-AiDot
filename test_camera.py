@@ -342,42 +342,37 @@ async def run(args: argparse.Namespace) -> None:
                                 print(f"    [{_host_label}] {_method} {_ep} -> "
                                       f"ERROR: {type(_e).__name__}: {_e}")
 
-                    # Probe 3: /user/login form-encoded with tenantId
+                    # Probe 3: /user/login — the AiDot tid ("0001IF") is NOT the smarthome
+                    # tenantId (integer 11).  Try: no tenantId, and with each appId.
+                    _login_hdr = {"terminal": "thirdPlatFormUser",
+                                  "active-language": "en_US", "appKey": "appa070"}
                     for _apid in ("appa070", "1383974540041977857"):
-                        try:
-                            async with _sess.post(
-                                f"{_smarthome_base}/user/login",
-                                data={"userName": _uname, "passWord": _pwd, "os": "ios",
-                                      "terminalMark": "thirdPlatFormUser", "appId": _apid,
-                                      "tenantId": _tid, "phoneId": _tidx, "locationId": "us"},
-                                headers={"terminal": "thirdPlatFormUser", "appKey": "appa070"},
-                                params={"appId": _apid},
-                                timeout=_ah.ClientTimeout(total=8),
-                            ) as _r:
-                                _rb = await _r.json(content_type=None)
-                            print(f"    /user/login appId={_apid} -> code={_rb.get('code')} "
-                                  f"desc={_rb.get('desc')!r} "
-                                  f"data_keys={list(_rb.get('data') or {})}")
-                            if _rb.get("code") in (200, 0) and _rb.get("data"):
-                                print(f"       FULL DATA: {_rb['data']}")
-                        except Exception as _e:
-                            print(f"    /user/login appId={_apid} EXCEPTION: {_e}")
-
-                    # Probe 4: accessToken as password (token-based re-auth)
-                    try:
-                        async with _sess.post(
-                            f"{_smarthome_base}/user/login",
-                            data={"userName": _uname, "passWord": _token, "os": "ios",
-                                  "terminalMark": "thirdPlatFormUser", "appId": "appa070",
-                                  "tenantId": _tid},
-                            headers={"terminal": "thirdPlatFormUser", "appKey": "appa070"},
-                            timeout=_ah.ClientTimeout(total=8),
-                        ) as _r:
-                            _rb = await _r.json(content_type=None)
-                        print(f"    /user/login (token-as-pwd) -> code={_rb.get('code')} "
-                              f"desc={_rb.get('desc')!r}")
-                    except Exception as _e:
-                        print(f"    /user/login (token-as-pwd) EXCEPTION: {_e}")
+                        for _tmark in ("app", "thirdPlatFormUser"):
+                            for _tdata in (
+                                {},                                           # no tenantId
+                                {"tenantId": "11"},                           # smarthome numeric tenantId
+                            ):
+                                _body = {"userName": _uname, "passWord": _pwd, "os": "ios",
+                                         "terminalMark": _tmark, "appId": _apid,
+                                         "phoneId": _tidx, "locationId": "us",
+                                         **_tdata}
+                                _label = f"appId={_apid} tmark={_tmark} tenantId={_tdata.get('tenantId','<none>')}"
+                                try:
+                                    async with _sess.post(
+                                        f"{_smarthome_base}/user/login",
+                                        data=_body,
+                                        headers=_login_hdr,
+                                        timeout=_ah.ClientTimeout(total=8),
+                                    ) as _r:
+                                        _rb = await _r.json(content_type=None)
+                                    _code = _rb.get("code")
+                                    print(f"    /user/login {_label} -> "
+                                          f"code={_code} desc={_rb.get('desc')!r} "
+                                          f"data_keys={list(_rb.get('data') or {})}")
+                                    if _code in (200, 0) and _rb.get("data"):
+                                        print(f"       FULL DATA: {_rb['data']}")
+                                except Exception as _e:
+                                    print(f"    /user/login {_label} EXCEPTION: {_e}")
 
                 # Step A: fetch server config
                 print(f"\n[DIAG] Calling getServerUrlConfig (full response logged at WARNING)...")
