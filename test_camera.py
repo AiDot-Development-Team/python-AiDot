@@ -405,6 +405,48 @@ async def run(args: argparse.Namespace) -> None:
                                             print(f"    /user/login [{_style}] {_label} "
                                                   f"EXCEPTION: {type(_e).__name__}: {_e}")
 
+                # Step A0: probe AiDot platform (prod-us-api.arnoo.com) for MQTT endpoints
+                _aidot_base = f"https://prod-{_lid.get('region') or 'us'}-api.arnoo.com/v17"
+                _aidot_headers = {
+                    "appId":          "1383974540041977857",
+                    "terminal":       "app",
+                    "access-token":   _token,
+                    "token":          _token,
+                    "Content-Type":   "application/json",
+                }
+                print(f"\n[DIAG] Probing AiDot platform ({_aidot_base}) for MQTT endpoints...")
+                _aidot_eps = [
+                    ("GET",  "/users/getMqttInfo",    {}),
+                    ("GET",  "/users/mqttInfo",        {}),
+                    ("GET",  "/iot/mqttInfo",          {}),
+                    ("POST", "/users/getMqttInfo",    {"userId": _lid.get("id")}),
+                    ("GET",  "/mqtt/userAuth",         {}),
+                    ("POST", "/mqtt/userAuth",         {"userId": _lid.get("id")}),
+                    ("GET",  "/users/getAuthInfo",    {}),
+                    ("POST", "/users/getAuthInfo",    {"userId": _lid.get("id")}),
+                ]
+                async with _ah.ClientSession() as _s3:
+                    for _m3, _ep3, _par3 in _aidot_eps:
+                        try:
+                            _kw3 = {"headers": _aidot_headers, "timeout": _ah.ClientTimeout(total=6)}
+                            if _m3 == "GET":
+                                _kw3["params"] = _par3
+                                _r3 = _s3.get(f"{_aidot_base}{_ep3}", **_kw3)
+                            else:
+                                _kw3["json"] = _par3
+                                _r3 = _s3.post(f"{_aidot_base}{_ep3}", **_kw3)
+                            async with _r3 as _rr3:
+                                _rb3 = await _rr3.json(content_type=None)
+                            _has_m = any(k in str(_rb3) for k in ("mqtt", "Mqtt", "MQTT",
+                                         "mqqt", "associatedAccount", "authInfo"))
+                            _ok3 = "  *** HAS MQTT DATA ***" if _has_m else ""
+                            print(f"    {_m3} {_ep3} -> code={_rb3.get('code')} "
+                                  f"desc={_rb3.get('desc')!r}{_ok3}")
+                            if _has_m or _rb3.get("code") in (200, 0):
+                                print(f"       data={_rb3.get('data')}")
+                        except Exception as _e3:
+                            print(f"    {_m3} {_ep3} -> ERROR: {type(_e3).__name__}: {_e3}")
+
                 # Step A: fetch server config
                 print(f"\n[DIAG] Calling getServerUrlConfig (full response logged at WARNING)...")
                 mqtt_url = await dc._async_get_mqtt_url()
@@ -464,14 +506,41 @@ async def run(args: argparse.Namespace) -> None:
                     _init_pwd = _lid.get("initPassword") or ""
 
                     _cred_candidates = []
+                    # --- Fetch numeric smarthome ID from /user/getUser ---
+                    # The AuthInfo.associatedAccount might be the numeric long int ID,
+                    # not the UUID string.  /user/getUser returns:
+                    #   {"id": 1348043005373399042, "uuid": "5354ad296b...", ...}
+                    _smarthome_num_id = ""
+                    _smarthome_uuid   = _smarthome_uid  # UUID string (same as AiDot id)
+                    try:
+                        async with _ah.ClientSession() as _s2:
+                            async with _s2.post(
+                                f"{_smarthome_base}/user/getUser",
+                                headers=_leedarson_headers,
+                                json={},
+                                timeout=_ah.ClientTimeout(total=8),
+                            ) as _r2:
+                                _gu = await _r2.json(content_type=None)
+                        _gu_data = _gu.get("data") or {}
+                        if isinstance(_gu_data, dict) and _gu_data.get("id"):
+                            _smarthome_num_id = str(_gu_data["id"])  # e.g. "1348043005373399042"
+                        print(f"    smarthome numeric id: {_smarthome_num_id!r}")
+                    except Exception as _e:
+                        print(f"    getUser for numeric id EXCEPTION: {_e}")
+
                     if _access_token:
                         _cred_candidates.append((_smarthome_uid, _access_token, "userId+accessToken"))
+                    if _smarthome_num_id and _access_token:
+                        _cred_candidates.append((_smarthome_num_id, _access_token, "numId+accessToken"))
+                        _cred_candidates.append((f"app-{_smarthome_num_id}", _access_token, "app-numId+accessToken"))
                     if mqtt_user_for_diag and mqtt_pwd_used:
                         _cred_candidates.append((mqtt_user_for_diag, mqtt_pwd_used, "smarthome_auth"))
                     if _hdr_token and _hdr_token != _access_token:
                         _cred_candidates.append((_smarthome_uid, _hdr_token, "userId+httpHeader.token"))
                     if _terminal_idx:
                         _cred_candidates.append((_smarthome_uid, _terminal_idx, "userId+terminalIndex"))
+                        if _smarthome_num_id:
+                            _cred_candidates.append((_smarthome_num_id, _terminal_idx, "numId+terminalIndex"))
                     if _access_token:
                         _cred_candidates.append((_access_token, _access_token, "accessToken+accessToken"))
                     if _tid and _access_token:
@@ -483,7 +552,11 @@ async def run(args: argparse.Namespace) -> None:
                     # initPassword (4-char PIN stored in login_info) as MQTT password
                     if _init_pwd and _access_token:
                         _cred_candidates.append((_smarthome_uid, _init_pwd, "userId+initPassword"))
+                        if _smarthome_num_id:
+                            _cred_candidates.append((_smarthome_num_id, _init_pwd, "numId+initPassword"))
                     _cred_candidates.append((_smarthome_uid, "", "userId+empty"))
+                    if _smarthome_num_id:
+                        _cred_candidates.append((_smarthome_num_id, "", "numId+empty"))
 
                     # WebSocket paths to try — broker may not use /mqtt
                     _ws_paths = ["/mqtt", "/", "/ws", "/mqtt/"]
