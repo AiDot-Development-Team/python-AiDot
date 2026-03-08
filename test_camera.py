@@ -274,63 +274,72 @@ async def run(args: argparse.Namespace) -> None:
                     "token":           _token,
                     "Content-Type":    "application/json",
                 }
+                # MQTT broker is global-us-mqtt; try matching global-us-smarthome host too
+                _global_smarthome_base = f"https://global-{_lid.get('region') or 'us'}-smarthome.arnoo.com:443"
                 print(f"[DIAG] Probing smarthome endpoints for MQTT credentials...")
+                print(f"       hosts: {_smarthome_base}  AND  {_global_smarthome_base}")
                 async with _ah.ClientSession() as _sess:
-                    # Probe 1: POST /user/getUser (server rejects GET; POST returns user info
-                    # but currently no mqttUser/mqttPassword - logged here for visibility)
-                    try:
-                        async with _sess.post(
-                            f"{_smarthome_base}/user/getUser",
-                            headers=_leedarson_headers,
-                            json={"desc": _token},
-                            timeout=_ah.ClientTimeout(total=8),
-                        ) as _r:
-                            _rb = await _r.json(content_type=None)
-                        _d = _rb.get("data") or {}
-                        print(f"    POST /user/getUser -> code={_rb.get('code')} "
-                              f"data_keys={list(_d.keys()) if isinstance(_d, dict) else _d!r}")
-                        if isinstance(_d, dict):
-                            for _mk in ("mqttUser", "mqttPassword", "mqqtPwd", "mqttPwd",
-                                        "authInfo", "mqttToken", "mqtttoken"):
-                                if _mk in _d:
-                                    print(f"       *** {_mk}={_d[_mk]!r} ***")
-                    except Exception as _e:
-                        print(f"    POST /user/getUser EXCEPTION: {_e}")
-
-                    # Probe 2: candidate MQTT-credential endpoints
-                    _mqtt_cred_endpoints = [
-                        ("GET",  "/user/getMqttInfo",         {}),
-                        ("POST", "/user/getMqttInfo",         {"userId": _tid or _uname}),
-                        ("GET",  "/user/authInfo",            {"userId": _tid or _uname}),
-                        ("POST", "/user/authInfo",            {"userId": _tid or _uname}),
-                        ("GET",  "/commonController/getMqttConfig", {}),
-                        ("POST", "/commonController/getMqttConfig", {}),
-                        ("GET",  "/user/getUserMqtt",         {}),
-                        ("POST", "/user/getUserMqtt",         {"userId": _tid or _uname}),
-                    ]
-                    for _method, _ep, _params in _mqtt_cred_endpoints:
+                    # Probe 1: POST /user/getUser on both hosts
+                    for _base_host in (_smarthome_base, _global_smarthome_base):
                         try:
-                            _kw = {"headers": _leedarson_headers,
-                                   "timeout": _ah.ClientTimeout(total=6)}
-                            if _method == "GET":
-                                _kw["params"] = _params
-                                _req = _sess.get(f"{_smarthome_base}{_ep}", **_kw)
-                            else:
-                                _kw["json"] = _params
-                                _req = _sess.post(f"{_smarthome_base}{_ep}", **_kw)
-                            async with _req as _r:
+                            async with _sess.post(
+                                f"{_base_host}/user/getUser",
+                                headers=_leedarson_headers,
+                                json={"desc": _token},
+                                timeout=_ah.ClientTimeout(total=8),
+                            ) as _r:
                                 _rb = await _r.json(content_type=None)
                             _d = _rb.get("data") or {}
-                            _has_mqtt = any(k in (str(_d) if not isinstance(_d, dict) else _d)
-                                            for k in ("mqtt", "Mqtt", "MQTT"))
+                            _has_mqtt = any(k in str(_d) for k in ("mqtt", "Mqtt", "MQTT", "authInfo"))
                             _marker = "  *** HAS MQTT DATA ***" if _has_mqtt else ""
-                            print(f"    {_method} {_ep} -> code={_rb.get('code')} "
-                                  f"desc={_rb.get('desc')!r}{_marker}")
+                            print(f"    POST {_base_host}/user/getUser -> code={_rb.get('code')} "
+                                  f"data_keys={list(_d.keys()) if isinstance(_d, dict) else _d!r}{_marker}")
                             if _has_mqtt and isinstance(_d, dict):
                                 print(f"       data={_d}")
                         except Exception as _e:
-                            _ec = getattr(getattr(_e, 'status', None), '__str__', lambda: str(_e))()
-                            print(f"    {_method} {_ep} -> ERROR: {type(_e).__name__}: {_e}")
+                            print(f"    POST {_base_host}/user/getUser EXCEPTION: {_e}")
+
+                    # Probe 2: candidate MQTT-credential endpoints on both hosts
+                    _mqtt_cred_endpoints = [
+                        ("GET",  "/user/getMqttInfo",              {}),
+                        ("POST", "/user/getMqttInfo",              {"userId": _tid or _uname}),
+                        ("GET",  "/user/authInfo",                 {"userId": _tid or _uname}),
+                        ("POST", "/user/authInfo",                 {"userId": _tid or _uname}),
+                        ("GET",  "/commonController/getMqttConfig", {}),
+                        ("POST", "/commonController/getMqttConfig", {}),
+                        ("GET",  "/user/getUserMqtt",              {}),
+                        ("POST", "/user/getUserMqtt",              {"userId": _tid or _uname}),
+                        ("POST", "/user/reqUserAuthInfo",          {"userId": _smarthome_uid}),
+                        ("GET",  "/user/reqUserAuthInfo",          {"userId": _smarthome_uid}),
+                        ("POST", "/iot/getToken",                  {"userId": _smarthome_uid}),
+                        ("POST", "/user/getUserAuthInfo",          {"userId": _smarthome_uid}),
+                    ]
+                    for _base_url in [_smarthome_base, _global_smarthome_base]:
+                        for _method, _ep, _params in _mqtt_cred_endpoints:
+                            try:
+                                _kw = {"headers": _leedarson_headers,
+                                       "timeout": _ah.ClientTimeout(total=6)}
+                                if _method == "GET":
+                                    _kw["params"] = _params
+                                    _req = _sess.get(f"{_base_url}{_ep}", **_kw)
+                                else:
+                                    _kw["json"] = _params
+                                    _req = _sess.post(f"{_base_url}{_ep}", **_kw)
+                                async with _req as _r:
+                                    _rb = await _r.json(content_type=None)
+                                _d = _rb.get("data") or {}
+                                _has_mqtt = any(k in str(_rb)
+                                                for k in ("mqtt", "Mqtt", "MQTT", "authInfo"))
+                                _marker = "  *** HAS MQTT DATA ***" if _has_mqtt else ""
+                                _host_label = "global" if "global" in _base_url else "regional"
+                                print(f"    [{_host_label}] {_method} {_ep} -> "
+                                      f"code={_rb.get('code')} desc={_rb.get('desc')!r}{_marker}")
+                                if _has_mqtt:
+                                    print(f"       data={_d}")
+                            except Exception as _e:
+                                _host_label = "global" if "global" in _base_url else "regional"
+                                print(f"    [{_host_label}] {_method} {_ep} -> "
+                                      f"ERROR: {type(_e).__name__}: {_e}")
 
                     # Probe 3: /user/login form-encoded with tenantId
                     for _apid in ("appa070", "1383974540041977857"):
@@ -425,8 +434,7 @@ async def run(args: argparse.Namespace) -> None:
                         except Exception:
                             pass
 
-                    # Numeric user id (from getUser response: data.id is int, not uuid)
-                    _numeric_uid = str(_lid.get("numericId") or "")
+                    _init_pwd = _lid.get("initPassword") or ""
 
                     _cred_candidates = []
                     if _access_token:
@@ -439,15 +447,19 @@ async def run(args: argparse.Namespace) -> None:
                         _cred_candidates.append((_smarthome_uid, _terminal_idx, "userId+terminalIndex"))
                     if _access_token:
                         _cred_candidates.append((_access_token, _access_token, "accessToken+accessToken"))
-                    # Try tenantId-qualified username formats (common in multi-tenant MQTT brokers)
                     if _tid and _access_token:
                         _cred_candidates.append((f"{_smarthome_uid}@{_tid}", _access_token, "userId@tid+accessToken"))
                         _cred_candidates.append((f"{_tid}:{_smarthome_uid}", _access_token, "tid:userId+accessToken"))
-                    # Try clientId as username (some brokers use clientId==username)
                     _app_client_id = f"app-{_smarthome_uid}"
                     if _access_token:
                         _cred_candidates.append((_app_client_id, _access_token, "app-userId+accessToken"))
+                    # initPassword (4-char PIN stored in login_info) as MQTT password
+                    if _init_pwd and _access_token:
+                        _cred_candidates.append((_smarthome_uid, _init_pwd, "userId+initPassword"))
                     _cred_candidates.append((_smarthome_uid, "", "userId+empty"))
+
+                    # WebSocket paths to try — broker may not use /mqtt
+                    _ws_paths = ["/mqtt", "/", "/ws", "/mqtt/"]
 
                     print(f"    MQTT will try {len(_cred_candidates)} credential combinations")
                     for _cred_label in [c[2] for c in _cred_candidates]:
@@ -507,47 +519,56 @@ async def run(args: argparse.Namespace) -> None:
 
                     mqtt_success = False
                     for _cred_user, _cred_pwd, _cred_label in _cred_candidates:
-                        print(f"\n    [MQTT attempt] {_cred_label}  user={_cred_user[:16]}...")
-                        connect_rc_box[0] = None
-                        messages_seen.clear()
-                        done_event.clear()
-                        _client_id = f"app-{_smarthome_uid}"
+                        # For the first credential combo, also try all WS paths.
+                        # For subsequent combos use the default path (skip path sweep
+                        # once we know rc=4 = bad creds on the default path).
+                        _paths_to_try = _ws_paths if _cred_label == _cred_candidates[0][2] else [path]
+                        for _try_path in _paths_to_try:
+                            _path_label = f" path={_try_path}" if _try_path != path else ""
+                            print(f"\n    [MQTT attempt] {_cred_label}{_path_label}  user={_cred_user[:16]}...")
+                            connect_rc_box[0] = None
+                            messages_seen.clear()
+                            done_event.clear()
+                            _client_id = f"app-{_smarthome_uid}"
 
-                        def _run(_u=_cred_user, _p=_cred_pwd, _cid=_client_id):
-                            mqttc = _mqtt.Client(client_id=_cid, transport=transport)
-                            if use_tls:
-                                mqttc.tls_set(cert_reqs=_ssl.CERT_REQUIRED)
-                            if transport == "websockets":
-                                mqttc.ws_set_options(path=path)
-                            mqttc.username_pw_set(_u, _p)
-                            mqttc.on_connect    = _on_connect
-                            mqttc.on_message    = _on_message
-                            mqttc.on_disconnect = _on_disconnect
-                            try:
-                                mqttc.connect(host, port, keepalive=30)
-                                mqttc.loop_start()
-                                done_event.wait(timeout=8)
-                            except Exception as e:
-                                print(f"    MQTT connect exception: {e}")
-                            finally:
-                                mqttc.loop_stop()
+                            def _run(_u=_cred_user, _p=_cred_pwd, _cid=_client_id, _wp=_try_path):
+                                mqttc = _mqtt.Client(client_id=_cid, transport=transport)
+                                if use_tls:
+                                    mqttc.tls_set(cert_reqs=_ssl.CERT_REQUIRED)
+                                if transport == "websockets":
+                                    mqttc.ws_set_options(path=_wp)
+                                mqttc.username_pw_set(_u, _p)
+                                mqttc.on_connect    = _on_connect
+                                mqttc.on_message    = _on_message
+                                mqttc.on_disconnect = _on_disconnect
                                 try:
-                                    mqttc.disconnect()
-                                except Exception:
-                                    pass
+                                    mqttc.connect(host, port, keepalive=30)
+                                    mqttc.loop_start()
+                                    done_event.wait(timeout=8)
+                                except Exception as e:
+                                    print(f"    MQTT connect exception: {e}")
+                                finally:
+                                    mqttc.loop_stop()
+                                    try:
+                                        mqttc.disconnect()
+                                    except Exception:
+                                        pass
 
-                        await asyncio.get_event_loop().run_in_executor(None, _run)
+                            await asyncio.get_event_loop().run_in_executor(None, _run)
 
-                        if connect_rc_box[0] == 0:
-                            print(f"    *** MQTT CONNECTED with {_cred_label} ***")
-                            mqtt_success = True
-                            if messages_seen:
-                                print(f"    MQTT: {len(messages_seen)} message(s) received")
+                            if connect_rc_box[0] == 0:
+                                print(f"    *** MQTT CONNECTED with {_cred_label}{_path_label} ***")
+                                mqtt_success = True
+                                if messages_seen:
+                                    print(f"    MQTT: {len(messages_seen)} message(s) received")
+                                else:
+                                    print("    MQTT: connected but no response to connectipc within 8s")
+                                break
                             else:
-                                print("    MQTT: connected but no response to connectipc within 8s")
+                                print(f"    rc={connect_rc_box[0]} -> skip")
+
+                        if mqtt_success:
                             break
-                        else:
-                            print(f"    rc={connect_rc_box[0]} -> skip")
 
                     if not mqtt_success:
                         print("\n    MQTT: all credential combinations failed (rc=4 or rc=5)")
