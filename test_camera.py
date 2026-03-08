@@ -300,6 +300,7 @@ async def run(args: argparse.Namespace) -> None:
                             print(f"    POST {_base_host}/user/getUser EXCEPTION: {_e}")
 
                     # Probe 2: candidate MQTT-credential endpoints on both hosts
+                    _uid_for_probe = _lid.get("id") or str(dc.user_id)
                     _mqtt_cred_endpoints = [
                         ("GET",  "/user/getMqttInfo",              {}),
                         ("POST", "/user/getMqttInfo",              {"userId": _tid or _uname}),
@@ -309,10 +310,10 @@ async def run(args: argparse.Namespace) -> None:
                         ("POST", "/commonController/getMqttConfig", {}),
                         ("GET",  "/user/getUserMqtt",              {}),
                         ("POST", "/user/getUserMqtt",              {"userId": _tid or _uname}),
-                        ("POST", "/user/reqUserAuthInfo",          {"userId": _smarthome_uid}),
-                        ("GET",  "/user/reqUserAuthInfo",          {"userId": _smarthome_uid}),
-                        ("POST", "/iot/getToken",                  {"userId": _smarthome_uid}),
-                        ("POST", "/user/getUserAuthInfo",          {"userId": _smarthome_uid}),
+                        ("POST", "/user/reqUserAuthInfo",          {"userId": _uid_for_probe}),
+                        ("GET",  "/user/reqUserAuthInfo",          {"userId": _uid_for_probe}),
+                        ("POST", "/iot/getToken",                  {"userId": _uid_for_probe}),
+                        ("POST", "/user/getUserAuthInfo",          {"userId": _uid_for_probe}),
                     ]
                     for _base_url in [_smarthome_base, _global_smarthome_base]:
                         for _method, _ep, _params in _mqtt_cred_endpoints:
