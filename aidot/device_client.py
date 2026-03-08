@@ -1111,13 +1111,13 @@ class DeviceClient(object):
         if token:
             headers = self._leedarson_headers()
             for desc_val in (_mqtt_id, "", None):
-                params = {"desc": desc_val} if desc_val is not None else {}
+                body_data = {"desc": desc_val} if desc_val is not None else {}
                 try:
                     async with aiohttp.ClientSession() as session:
-                        async with session.get(
+                        async with session.post(
                             f"{self._smarthome_base}/user/getUser",
                             headers=headers,
-                            params=params,
+                            json=body_data,
                             timeout=aiohttp.ClientTimeout(total=10),
                         ) as resp:
                             body = await resp.json(content_type=None)
@@ -1125,7 +1125,7 @@ class DeviceClient(object):
                     code = body.get("code")
                     data = body.get("data") or {}
                     _LOGGER.warning(
-                        "_async_get_smarthome_auth GET /user/getUser desc=%r -> "
+                        "_async_get_smarthome_auth POST /user/getUser desc=%r -> "
                         "code=%s  data_keys=%s  body=%s",
                         desc_val, code,
                         list(data.keys()) if isinstance(data, dict) else data,
@@ -1261,7 +1261,6 @@ class DeviceClient(object):
                             f"{self._smarthome_base}/user/login",
                             data=form_data,
                             headers=login_headers,
-                            params={"appId": app_id},
                             timeout=aiohttp.ClientTimeout(total=10),
                         ) as resp:
                             last_body = await resp.json(content_type=None)
