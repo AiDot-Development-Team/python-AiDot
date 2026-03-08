@@ -266,23 +266,73 @@ async def run(args: argparse.Namespace) -> None:
                 print(f"\n[DIAG] accessToken prefix: {_token[:8]}...  len={len(_token)}")
                 print(f"[DIAG] tid={_tid!r}  terminalIndex={_tidx!r}")
                 _smarthome_base = f"https://{_lid.get('region') or 'us'}-smarthome.arnoo.com:443"
-                print(f"[DIAG] Probing /user/login and /user/getUser directly...")
+                _leedarson_headers = {
+                    "terminal":        "thirdPlatFormUser",
+                    "active-language": "en_US",
+                    "appKey":          "appa070",
+                    "access-token":    _token,
+                    "token":           _token,
+                    "Content-Type":    "application/json",
+                }
+                print(f"[DIAG] Probing smarthome endpoints for MQTT credentials...")
                 async with _ah.ClientSession() as _sess:
-                    # Probe 1: /user/getUser with accessToken header
+                    # Probe 1: POST /user/getUser (server rejects GET; POST returns user info
+                    # but currently no mqttUser/mqttPassword - logged here for visibility)
                     try:
-                        async with _sess.get(
+                        async with _sess.post(
                             f"{_smarthome_base}/user/getUser",
-                            headers={"terminal": "thirdPlatFormUser", "access-token": _token,
-                                     "token": _token, "appKey": "appa070"},
-                            params={"desc": ""},
+                            headers=_leedarson_headers,
+                            json={"desc": _token},
                             timeout=_ah.ClientTimeout(total=8),
                         ) as _r:
                             _rb = await _r.json(content_type=None)
-                        print(f"    /user/getUser -> {_rb}")
+                        _d = _rb.get("data") or {}
+                        print(f"    POST /user/getUser -> code={_rb.get('code')} "
+                              f"data_keys={list(_d.keys()) if isinstance(_d, dict) else _d!r}")
+                        if isinstance(_d, dict):
+                            for _mk in ("mqttUser", "mqttPassword", "mqqtPwd", "mqttPwd",
+                                        "authInfo", "mqttToken", "mqtttoken"):
+                                if _mk in _d:
+                                    print(f"       *** {_mk}={_d[_mk]!r} ***")
                     except Exception as _e:
-                        print(f"    /user/getUser EXCEPTION: {_e}")
+                        print(f"    POST /user/getUser EXCEPTION: {_e}")
 
-                    # Probe 2: /user/login form-encoded with tenantId
+                    # Probe 2: candidate MQTT-credential endpoints
+                    _mqtt_cred_endpoints = [
+                        ("GET",  "/user/getMqttInfo",         {}),
+                        ("POST", "/user/getMqttInfo",         {"userId": _tid or _uname}),
+                        ("GET",  "/user/authInfo",            {"userId": _tid or _uname}),
+                        ("POST", "/user/authInfo",            {"userId": _tid or _uname}),
+                        ("GET",  "/commonController/getMqttConfig", {}),
+                        ("POST", "/commonController/getMqttConfig", {}),
+                        ("GET",  "/user/getUserMqtt",         {}),
+                        ("POST", "/user/getUserMqtt",         {"userId": _tid or _uname}),
+                    ]
+                    for _method, _ep, _params in _mqtt_cred_endpoints:
+                        try:
+                            _kw = {"headers": _leedarson_headers,
+                                   "timeout": _ah.ClientTimeout(total=6)}
+                            if _method == "GET":
+                                _kw["params"] = _params
+                                _req = _sess.get(f"{_smarthome_base}{_ep}", **_kw)
+                            else:
+                                _kw["json"] = _params
+                                _req = _sess.post(f"{_smarthome_base}{_ep}", **_kw)
+                            async with _req as _r:
+                                _rb = await _r.json(content_type=None)
+                            _d = _rb.get("data") or {}
+                            _has_mqtt = any(k in (str(_d) if not isinstance(_d, dict) else _d)
+                                            for k in ("mqtt", "Mqtt", "MQTT"))
+                            _marker = "  *** HAS MQTT DATA ***" if _has_mqtt else ""
+                            print(f"    {_method} {_ep} -> code={_rb.get('code')} "
+                                  f"desc={_rb.get('desc')!r}{_marker}")
+                            if _has_mqtt and isinstance(_d, dict):
+                                print(f"       data={_d}")
+                        except Exception as _e:
+                            _ec = getattr(getattr(_e, 'status', None), '__str__', lambda: str(_e))()
+                            print(f"    {_method} {_ep} -> ERROR: {type(_e).__name__}: {_e}")
+
+                    # Probe 3: /user/login form-encoded with tenantId
                     for _apid in ("appa070", "1383974540041977857"):
                         try:
                             async with _sess.post(
@@ -303,7 +353,7 @@ async def run(args: argparse.Namespace) -> None:
                         except Exception as _e:
                             print(f"    /user/login appId={_apid} EXCEPTION: {_e}")
 
-                    # Probe 3: accessToken as password (token-based re-auth)
+                    # Probe 4: accessToken as password (token-based re-auth)
                     try:
                         async with _sess.post(
                             f"{_smarthome_base}/user/login",
@@ -375,6 +425,9 @@ async def run(args: argparse.Namespace) -> None:
                         except Exception:
                             pass
 
+                    # Numeric user id (from getUser response: data.id is int, not uuid)
+                    _numeric_uid = str(_lid.get("numericId") or "")
+
                     _cred_candidates = []
                     if _access_token:
                         _cred_candidates.append((_smarthome_uid, _access_token, "userId+accessToken"))
@@ -386,6 +439,14 @@ async def run(args: argparse.Namespace) -> None:
                         _cred_candidates.append((_smarthome_uid, _terminal_idx, "userId+terminalIndex"))
                     if _access_token:
                         _cred_candidates.append((_access_token, _access_token, "accessToken+accessToken"))
+                    # Try tenantId-qualified username formats (common in multi-tenant MQTT brokers)
+                    if _tid and _access_token:
+                        _cred_candidates.append((f"{_smarthome_uid}@{_tid}", _access_token, "userId@tid+accessToken"))
+                        _cred_candidates.append((f"{_tid}:{_smarthome_uid}", _access_token, "tid:userId+accessToken"))
+                    # Try clientId as username (some brokers use clientId==username)
+                    _app_client_id = f"app-{_smarthome_uid}"
+                    if _access_token:
+                        _cred_candidates.append((_app_client_id, _access_token, "app-userId+accessToken"))
                     _cred_candidates.append((_smarthome_uid, "", "userId+empty"))
 
                     print(f"    MQTT will try {len(_cred_candidates)} credential combinations")
@@ -450,7 +511,7 @@ async def run(args: argparse.Namespace) -> None:
                         connect_rc_box[0] = None
                         messages_seen.clear()
                         done_event.clear()
-                        _client_id = f"diag-{_random.randint(1000, 9999)}"
+                        _client_id = f"app-{_smarthome_uid}"
 
                         def _run(_u=_cred_user, _p=_cred_pwd, _cid=_client_id):
                             mqttc = _mqtt.Client(client_id=_cid, transport=transport)
