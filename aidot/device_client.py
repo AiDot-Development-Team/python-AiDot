@@ -1325,9 +1325,32 @@ class DeviceClient(object):
                         )
                         continue
 
+        # --- Strategy 5: accessToken as MQTT password (common Arnoo pattern) ---
+        # The Arnoo broker frequently accepts (userId, accessToken) as credentials.
+        # This is always available and is the first candidate --diag-mqtt tries.
+        # Use it as a guaranteed non-empty fallback rather than returning None.
+        access_token = (
+            self._user_info.get("accessToken")
+            or self._user_info.get("access_token")
+            or ""
+        )
+        if access_token:
+            _LOGGER.warning(
+                "_async_get_smarthome_auth: all HTTP strategies failed; "
+                "falling back to userId+accessToken for MQTT (common Arnoo pattern). "
+                "last_body=%s", last_body,
+            )
+            self._smarthome_auth = {
+                "mqttUser":     _mqtt_id,
+                "mqttPassword": access_token,
+                "userId":       _mqtt_id,
+                "raw":          {"source": "accessToken_fallback"},
+            }
+            return self._smarthome_auth
+
         _LOGGER.error(
-            "_async_get_smarthome_auth: all strategies failed. last_body=%s  "
-            "login_info_keys=%s",
+            "_async_get_smarthome_auth: all strategies failed (no accessToken either). "
+            "last_body=%s  login_info_keys=%s",
             last_body,
             list(self._user_info.keys()),
         )
