@@ -961,6 +961,10 @@ class DeviceClient(object):
         # Cache slot for MQTT broker URL, fetched lazily on first playback call
         self._mqtt_url: Optional[str] = None
 
+        # Cache slot for Leedarson smarthome auth (mqttUser, mqttPassword, userId)
+        # Fetched lazily via _async_get_smarthome_auth()
+        self._smarthome_auth: Optional[dict] = None
+
         if CONF_AES_KEY in device:
             key_string = device[CONF_AES_KEY][0]
             if key_string is not None:
@@ -996,8 +1000,9 @@ class DeviceClient(object):
         }
 
     async def _async_get_mqtt_url(self) -> Optional[str]:
-        # Fetch and cache the WSS MQTT broker URL from getServerUrlConfig.
-        # Source: LDSOpenSDK.getServerConfig() in the Leedarson Android SDK.
+        # Fetch and cache the WSS MQTT broker URL (and MQTT credentials) from
+        # getServerUrlConfig.  The full response is stored in self._smarthome_auth
+        # so mqttUser / mqttPassword are captured in the same call.
         if self._mqtt_url:
             return self._mqtt_url
 
@@ -1015,7 +1020,10 @@ class DeviceClient(object):
                 ) as resp:
                     body = await resp.json(content_type=None)
 
-            mqtt_host = (body.get("data") or {}).get("mqttServerUrl") or ""
+            data = body.get("data") or {}
+            _LOGGER.warning("getServerUrlConfig full response data keys=%s  body=%s", list(data.keys()), body)
+
+            mqtt_host = data.get("mqttServerUrl") or ""
             if not mqtt_host:
                 _LOGGER.error("getServerUrlConfig returned no mqttServerUrl: %s", body)
                 return None
@@ -1025,12 +1033,305 @@ class DeviceClient(object):
                 if mqtt_host.startswith(("wss://", "ws://"))
                 else f"wss://{mqtt_host}"
             )
-            _LOGGER.debug("MQTT URL cached: %s", self._mqtt_url)
+
+            # Capture mqttUser + mqttPassword from this same response if present.
+            # iOS SDK binary strings confirm these fields cluster with mqttServerUrl.
+            if not self._smarthome_auth:
+                self._smarthome_auth = {
+                    "mqttUrl":      self._mqtt_url,
+                    "mqttUser":     (data.get("mqttUser") or data.get("userId")
+                                     or str(self.user_id)),
+                    "mqttPassword": (data.get("mqttPassword") or data.get("mqqtPwd")
+                                     or ""),
+                    "raw":          data,
+                }
+                _LOGGER.debug(
+                    "Server config cached: url=%s mqttUser=%s hasPwd=%s  all_keys=%s",
+                    self._mqtt_url,
+                    self._smarthome_auth["mqttUser"],
+                    bool(self._smarthome_auth["mqttPassword"]),
+                    list(data.keys()),
+                )
+                _LOGGER.warning("getServerUrlConfig data=%s", data)
+
             return self._mqtt_url
 
         except Exception as exc:
             _LOGGER.error("_async_get_mqtt_url failed: %s", exc)
             return None
+
+    async def _async_get_smarthome_auth(self) -> Optional[dict]:
+        """Fetch MQTT credentials (mqttUser + mqttPassword) for the Arnoo broker.
+
+        Strategy order — stops at first success:
+          0. Already cached
+          1. mqttPassword already in AiDot login_info (unlikely but cheap to check)
+          2. GET /user/getUser  <- THE DOCUMENTED STEP 3 from LDSAppOpenSDK CocoaPods README
+             The SDK calls reqUserAuthInfoWithCallback which hits /user/getUser?desc=...
+             and returns LDSAuthInfo {userId, mqttUser, mqttPassword, ...}
+          3. getServerUrlConfig response (fallback — may not include mqtt creds)
+          4. POST /user/login form-encoded with multiple appId/pwd variants (last resort)
+        """
+        if self._smarthome_auth and self._smarthome_auth.get("mqttPassword"):
+            return self._smarthome_auth
+
+        import aiohttp
+
+        # Smarthome userId — 'id' in AiDot login_info is the Leedarson userId
+        _mqtt_id = (
+            self._user_info.get("id")
+            or self._user_info.get("userId")
+            or str(self.user_id)
+        )
+
+        # --- Strategy 1: mqttPassword already in AiDot login_info ---
+        for key in ("mqttPassword", "mqqtPwd", "mqttPwd", "mqtt_pwd",
+                    "mqttPass", "mqtttoken", "mqttToken", "MQTTPassword"):
+            val = self._user_info.get(key)
+            if val:
+                _LOGGER.warning("_async_get_smarthome_auth: found %r in login_info", key)
+                self._smarthome_auth = {
+                    "mqttUser":     _mqtt_id,
+                    "mqttPassword": val,
+                    "userId":       _mqtt_id,
+                    "raw":          {"source": f"login_info.{key}"},
+                }
+                return self._smarthome_auth
+
+        # --- Strategy 2: GET /user/getUser  (reqUserAuthInfoWithCallback in SDK) ---
+        # CocoaPods README documents the 3-step auth flow:
+        #   1. loginWithUserName -> accessToken
+        #   2. setHeader (set token on SDK)
+        #   3. reqUserAuthInfoWithCallback -> LDSAuthInfo {mqttUser, mqttPassword}
+        token = (
+            self._user_info.get("accessToken")
+            or self._user_info.get("access_token")
+            or ""
+        )
+        if token:
+            headers = self._leedarson_headers()
+            for desc_val in (_mqtt_id, "", None):
+                params = {"desc": desc_val} if desc_val is not None else {}
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                            f"{self._smarthome_base}/user/getUser",
+                            headers=headers,
+                            params=params,
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        ) as resp:
+                            body = await resp.json(content_type=None)
+
+                    code = body.get("code")
+                    data = body.get("data") or {}
+                    _LOGGER.warning(
+                        "_async_get_smarthome_auth GET /user/getUser desc=%r -> "
+                        "code=%s  data_keys=%s  body=%s",
+                        desc_val, code,
+                        list(data.keys()) if isinstance(data, dict) else data,
+                        body,
+                    )
+                    print(f"    [getUser] desc={desc_val!r} code={code} "
+                          f"data_keys={list(data.keys()) if isinstance(data, dict) else data!r} "
+                          f"body={body!r}")
+
+                    if isinstance(data, dict):
+                        auth = data.get("authInfo") or data
+                        mqtt_user = (
+                            auth.get("mqttUser")
+                            or auth.get("userId")
+                            or auth.get("associatedAccount")
+                            or _mqtt_id
+                        )
+                        mqtt_pwd = (
+                            auth.get("mqttPassword")
+                            or auth.get("mqqtPwd")
+                            or auth.get("mqttPwd")
+                            or ""
+                        )
+                        if mqtt_pwd:
+                            self._smarthome_auth = {
+                                "mqttUser":     mqtt_user,
+                                "mqttPassword": mqtt_pwd,
+                                "userId":       auth.get("userId") or mqtt_user,
+                                "raw":          auth,
+                            }
+                            _LOGGER.warning(
+                                "_async_get_smarthome_auth OK via /user/getUser: "
+                                "mqttUser=%s desc=%r", mqtt_user, desc_val,
+                            )
+                            return self._smarthome_auth
+
+                    if code not in (200, 0, None):
+                        break  # hard error, don't retry other desc values
+
+                except Exception as exc:
+                    _LOGGER.debug("_async_get_smarthome_auth /user/getUser exc: %s", exc)
+                    print(f"    [getUser] EXCEPTION: {exc}")
+                    break
+
+        # --- Strategy 3: getServerUrlConfig ---
+        if not self._mqtt_url:
+            await self._async_get_mqtt_url()
+        if self._smarthome_auth and self._smarthome_auth.get("mqttPassword"):
+            _LOGGER.warning("_async_get_smarthome_auth: mqttPassword from getServerUrlConfig")
+            return self._smarthome_auth
+
+        # --- Strategy 4: POST /user/login (form-encoded, multiple appId+pwd variants) ---
+        import hashlib
+
+        username = (
+            self._user_info.get("username")
+            or self._user_info.get("userName")
+            or ""
+        )
+        password = (
+            self._user_info.get("password")
+            or self._user_info.get("passWord")
+            or ""
+        )
+        if not username or not password:
+            _LOGGER.error(
+                "_async_get_smarthome_auth: username/password missing — cannot try /user/login"
+            )
+            return None
+
+        rsa_pwd: Optional[str] = None
+        try:
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.asymmetric import padding as _apad
+            from cryptography.hazmat.backends import default_backend
+            import base64 as _b64
+            _PUBLIC_KEY_PEM = (
+                b"-----BEGIN PUBLIC KEY-----\n"
+                b"MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCtQAnPCi8ksPnS1Du6z96PsKfN\n"
+                b"p2Gp/f/bHwlrAdplbX3p7/TnGpnbJGkLq8uRxf6cw+vOthTsZjkPCF7CatRvRnTj\n"
+                b"c9fcy7yE0oXa5TloYyXD6GkxgftBbN/movkJJGQCc7gFavuYoAdTRBOyQoXBtm0m\n"
+                b"kXMSjXOldI/290b9BQIDAQAB\n"
+                b"-----END PUBLIC KEY-----"
+            )
+            pub_key = serialization.load_pem_public_key(
+                _PUBLIC_KEY_PEM, backend=default_backend()
+            )
+            rsa_pwd = _b64.b64encode(
+                pub_key.encrypt(password.encode("utf-8"), _apad.PKCS1v15())
+            ).decode("utf-8")
+        except Exception as exc:
+            _LOGGER.debug("RSA encrypt unavailable: %s", exc)
+
+        md5_pwd = hashlib.md5(password.encode("utf-8")).hexdigest().upper()
+        _AIDOT_APP_ID = "1383974540041977857"
+        pwd_variants = []
+        if rsa_pwd:
+            pwd_variants.append(("rsa", rsa_pwd))
+        pwd_variants.append(("plain", password))
+        pwd_variants.append(("md5", md5_pwd))
+
+        login_headers = {
+            "terminal":        "thirdPlatFormUser",
+            "active-language": "en_US",
+            "appKey":          _LEEDARSON_APP_KEY,
+        }
+        last_body: dict = {}
+        async with aiohttp.ClientSession() as session:
+            for app_id in (_LEEDARSON_APP_KEY, _AIDOT_APP_ID):
+                for pwd_type, pwd_val in pwd_variants:
+                    _tenant_id = (
+                        self._user_info.get("tid")
+                        or self._user_info.get("tenantId")
+                        or ""
+                    )
+                    _phone_id = (
+                        self._user_info.get("terminalIndex")
+                        or self._user_info.get("phoneId")
+                        or ""
+                    )
+                    form_data = {
+                        "userName":     username,
+                        "passWord":     pwd_val,
+                        "os":           "ios",
+                        "terminalMark": "thirdPlatFormUser",
+                        "appId":        app_id,
+                        "tenantId":     _tenant_id,
+                        "phoneId":      _phone_id,
+                        "locationId":   self._region or "us",
+                    }
+                    try:
+                        async with session.post(
+                            f"{self._smarthome_base}/user/login",
+                            data=form_data,
+                            headers=login_headers,
+                            params={"appId": app_id},
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        ) as resp:
+                            last_body = await resp.json(content_type=None)
+
+                        code = last_body.get("code")
+                        _LOGGER.warning(
+                            "_async_get_smarthome_auth /user/login appId=%s pwd=%s "
+                            "-> code=%s: %s",
+                            app_id, pwd_type, code, last_body.get("desc"),
+                        )
+                        print(f"    [/user/login] appId={app_id} pwd={pwd_type} "
+                              f"tenantId={_tenant_id!r} -> code={code} desc={last_body.get('desc')!r}")
+                        if code not in (200, 0):
+                            continue
+
+                        data = last_body.get("data") or {}
+                        if isinstance(data, str):
+                            import json as _json
+                            try:
+                                data = _json.loads(data)
+                            except Exception:
+                                data = {}
+
+                        auth = (data.get("authInfo") if isinstance(data, dict) else None) or data
+                        mqtt_user = (
+                            (auth.get("mqttUser")             if isinstance(auth, dict) else None)
+                            or (auth.get("userId")            if isinstance(auth, dict) else None)
+                            or (auth.get("associatedAccount") if isinstance(auth, dict) else None)
+                            or _mqtt_id
+                        )
+                        mqtt_pwd = (
+                            (auth.get("mqttPassword") if isinstance(auth, dict) else None)
+                            or (auth.get("mqqtPwd")   if isinstance(auth, dict) else None)
+                            or (auth.get("mqttPwd")   if isinstance(auth, dict) else None)
+                            or ""
+                        )
+                        if mqtt_pwd:
+                            self._smarthome_auth = {
+                                "mqttUser":     mqtt_user,
+                                "mqttPassword": mqtt_pwd,
+                                "userId":       (auth.get("userId") if isinstance(auth, dict) else None) or mqtt_user,
+                                "raw":          auth,
+                            }
+                            _LOGGER.warning(
+                                "_async_get_smarthome_auth OK via /user/login: "
+                                "mqttUser=%s appId=%s pwd=%s", mqtt_user, app_id, pwd_type,
+                            )
+                            return self._smarthome_auth
+
+                        _LOGGER.warning(
+                            "_async_get_smarthome_auth /user/login code=200 but no "
+                            "mqttPassword. data_keys=%s  auth_keys=%s",
+                            list(data.keys()) if isinstance(data, dict) else data,
+                            list(auth.keys()) if isinstance(auth, dict) else auth,
+                        )
+
+                    except Exception as exc:
+                        _LOGGER.debug(
+                            "_async_get_smarthome_auth /user/login appId=%s pwd=%s: %s",
+                            app_id, pwd_type, exc,
+                        )
+                        continue
+
+        _LOGGER.error(
+            "_async_get_smarthome_auth: all strategies failed. last_body=%s  "
+            "login_info_keys=%s",
+            last_body,
+            list(self._user_info.keys()),
+        )
+        return None
 
     # -- Camera public methods ----------------------------------------------- #
 
@@ -1126,13 +1427,12 @@ class DeviceClient(object):
         #   3. TCP binary login + stream
         import aiohttp
 
-        mqtt_pwd = (
-            self._user_info.get("mqqtPwd")
-            or self._user_info.get("mqttPwd")
-            or self._user_info.get("mqtt_pwd")
-            or ""
-        )
-        client_id = f"app-{self.user_id}"
+        # Fetch MQTT credentials from the Leedarson smarthome /user/login endpoint.
+        # The AiDot platform login does NOT return mqttUser/mqttPassword.
+        smarthome_auth = await self._async_get_smarthome_auth()
+        mqtt_user = (smarthome_auth or {}).get("mqttUser") or str(self.user_id)
+        mqtt_pwd  = (smarthome_auth or {}).get("mqttPassword") or ""
+        client_id = f"app-{mqtt_user}"
 
         # Step 1 - MQTT
         mqtt_url = await self._async_get_mqtt_url()
@@ -1145,7 +1445,7 @@ class DeviceClient(object):
 
         _LOGGER.debug("Cloud playback step 1: MQTT for %s", self.device_id)
         srv_info = await _mqtt_get_playback_server_info(
-            mqtt_url, str(self.user_id), mqtt_pwd, self.device_id, client_id,
+            mqtt_url, mqtt_user, mqtt_pwd, self.device_id, client_id,
         )
         if not srv_info:
             _LOGGER.error(
@@ -1240,13 +1540,12 @@ class DeviceClient(object):
         #   1. MQTT connectipc  -> serverIP, serverPort, sessionId, aesKey, heartbeat, tls
         #   2. TLS TCP LOGIN + STREAM_REQ (AES-256/ECB/PKCS7 on all payloads)
 
-        mqtt_pwd = (
-            self._user_info.get("mqqtPwd")
-            or self._user_info.get("mqttPwd")
-            or self._user_info.get("mqtt_pwd")
-            or ""
-        )
-        client_id = f"app-{self.user_id}"
+        # Fetch MQTT credentials from the Leedarson smarthome /user/login endpoint.
+        # The AiDot platform login does NOT return mqttUser/mqttPassword.
+        smarthome_auth = await self._async_get_smarthome_auth()
+        mqtt_user = (smarthome_auth or {}).get("mqttUser") or str(self.user_id)
+        mqtt_pwd  = (smarthome_auth or {}).get("mqttPassword") or ""
+        client_id = f"app-{mqtt_user}"
 
         # Step 1 -- MQTT connectipc
         mqtt_url = await self._async_get_mqtt_url()
@@ -1259,7 +1558,7 @@ class DeviceClient(object):
 
         _LOGGER.debug("Live stream step 1: MQTT connectipc for %s", self.device_id)
         srv_info = await _mqtt_get_live_server_info(
-            mqtt_url, str(self.user_id), mqtt_pwd,
+            mqtt_url, mqtt_user, mqtt_pwd,
             self.device_id, client_id, timeout=timeout,
         )
         if not srv_info:
