@@ -540,7 +540,8 @@ def main() -> None:
     if not any([args.p2p, args.list_recordings, args.play, args.live, args.diag_mqtt]):
         args.p2p             = True
         args.list_recordings = True
-        # Don't auto-enable --play / --live; they require paho-mqtt and a live camera
+        args.play            = True
+        args.live            = True
 
     try:
         asyncio.run(run(args))
