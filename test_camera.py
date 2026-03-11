@@ -80,12 +80,18 @@ async def run(args: argparse.Namespace) -> None:
             password=args.password,
         )
 
-        # Login
+        # Login (now calls /users/login with MD5 password + fetches MQTT pwd via /commons/userConfig)
         print(f"\n[1] Logging in as {args.username} ...")
         try:
             info = await client.async_post_login()
             user_id = info.get("id") or info.get("userId") or "?"
-            print(f"    OK  userId={user_id}  region={client._region}")
+            has_mqtt_pwd = bool(info.get("mqttPassword"))
+            print(f"    OK  userId={user_id}  region={client._region}  "
+                  f"mqttPassword={'present' if has_mqtt_pwd else 'MISSING'}")
+            if not has_mqtt_pwd:
+                raw_cfg = info.get("_userConfigRaw") or {}
+                print(f"    [userConfig raw keys]: {list(raw_cfg.keys())}")
+                print(f"    [userConfig raw body]: {raw_cfg}")
         except Exception as e:
             print(f"    FAILED: {e}")
             return
@@ -405,46 +411,61 @@ async def run(args: argparse.Namespace) -> None:
                                             print(f"    /user/login [{_style}] {_label} "
                                                   f"EXCEPTION: {type(_e).__name__}: {_e}")
 
-                # Step A0: probe AiDot platform (prod-us-api.arnoo.com) for MQTT endpoints
-                _aidot_base = f"https://prod-{_lid.get('region') or 'us'}-api.arnoo.com/v17"
+                # Step A0: probe AiDot platform (prod-us-api.arnoo.com) for MQTT endpoints.
+                # Headers match the working curl commands from reverse-engineering the web app:
+                #   appid: 68  owner: <userId>  token: <accessToken>  terminal: app
+                _aidot_region = _lid.get('region') or 'us'
+                _aidot_api_base = f"https://prod-{_aidot_region}-api.arnoo.com"
+                _aidot_base    = f"{_aidot_api_base}/v17"
+                _owner_id      = _lid.get("id") or ""
                 _aidot_headers = {
-                    "appId":          "1383974540041977857",
-                    "terminal":       "app",
-                    "access-token":   _token,
-                    "token":          _token,
-                    "Content-Type":   "application/json",
+                    "appid":    "68",
+                    "owner":    _owner_id,
+                    "token":    _token,
+                    "terminal": "app",
+                    "locale":   "en-US",
+                    "accept":   "application/json, text/plain, */*",
                 }
-                print(f"\n[DIAG] Probing AiDot platform ({_aidot_base}) for MQTT endpoints...")
+                print(f"\n[DIAG] Probing AiDot platform ({_aidot_api_base}) for MQTT/config...")
+                # /commons/userConfig is the documented endpoint for MQTT password retrieval.
+                # /v17 endpoints are also probed for completeness.
                 _aidot_eps = [
-                    ("GET",  "/users/getMqttInfo",    {}),
-                    ("GET",  "/users/mqttInfo",        {}),
-                    ("GET",  "/iot/mqttInfo",          {}),
-                    ("POST", "/users/getMqttInfo",    {"userId": _lid.get("id")}),
-                    ("GET",  "/mqtt/userAuth",         {}),
-                    ("POST", "/mqtt/userAuth",         {"userId": _lid.get("id")}),
-                    ("GET",  "/users/getAuthInfo",    {}),
-                    ("POST", "/users/getAuthInfo",    {"userId": _lid.get("id")}),
+                    ("GET",  _aidot_api_base + "/commons/userConfig",  {}),
+                    ("GET",  _aidot_base + "/users/getMqttInfo",       {}),
+                    ("GET",  _aidot_base + "/users/mqttInfo",          {}),
+                    ("GET",  _aidot_base + "/iot/mqttInfo",            {}),
+                    ("POST", _aidot_base + "/users/getMqttInfo",       {"userId": _owner_id}),
+                    ("GET",  _aidot_base + "/mqtt/userAuth",           {}),
+                    ("POST", _aidot_base + "/mqtt/userAuth",           {"userId": _owner_id}),
+                    ("GET",  _aidot_base + "/users/getAuthInfo",       {}),
+                    ("POST", _aidot_base + "/users/getAuthInfo",       {"userId": _owner_id}),
+                    ("GET",  _aidot_base + "/users/getUserInfo",       {}),
+                    ("GET",  _aidot_base + "/commons/userConfig",      {}),
                 ]
                 async with _ah.ClientSession() as _s3:
-                    for _m3, _ep3, _par3 in _aidot_eps:
+                    for _m3, _url3, _par3 in _aidot_eps:
                         try:
                             _kw3 = {"headers": _aidot_headers, "timeout": _ah.ClientTimeout(total=6)}
                             if _m3 == "GET":
-                                _kw3["params"] = _par3
-                                _r3 = _s3.get(f"{_aidot_base}{_ep3}", **_kw3)
+                                if _par3:
+                                    _kw3["params"] = _par3
+                                _r3 = _s3.get(_url3, **_kw3)
                             else:
                                 _kw3["json"] = _par3
-                                _r3 = _s3.post(f"{_aidot_base}{_ep3}", **_kw3)
+                                _r3 = _s3.post(_url3, **_kw3)
                             async with _r3 as _rr3:
+                                _http3 = _rr3.status
                                 _rb3 = await _rr3.json(content_type=None)
                             _has_m = any(k in str(_rb3) for k in ("mqtt", "Mqtt", "MQTT",
-                                         "mqqt", "associatedAccount", "authInfo"))
+                                         "mqqt", "associatedAccount", "authInfo", "Password"))
                             _ok3 = "  *** HAS MQTT DATA ***" if _has_m else ""
-                            print(f"    {_m3} {_ep3} -> code={_rb3.get('code')} "
-                                  f"desc={_rb3.get('desc')!r}{_ok3}")
-                            if _has_m or _rb3.get("code") in (200, 0):
-                                print(f"       data={_rb3.get('data')}")
+                            _ep3 = _url3.replace(_aidot_api_base, "")
+                            print(f"    {_m3} {_ep3} -> HTTP={_http3} "
+                                  f"code={_rb3.get('code')} desc={_rb3.get('desc')!r}{_ok3}")
+                            # Always print full body (truncated) — never skip code=None responses.
+                            print(f"       BODY={str(_rb3)[:600]}")
                         except Exception as _e3:
+                            _ep3 = _url3.replace(_aidot_api_base, "")
                             print(f"    {_m3} {_ep3} -> ERROR: {type(_e3).__name__}: {_e3}")
 
                 # Step A: fetch server config
@@ -503,9 +524,24 @@ async def run(args: argparse.Namespace) -> None:
                         except Exception:
                             pass
 
-                    _init_pwd = _lid.get("initPassword") or ""
+                    _init_pwd   = _lid.get("initPassword") or ""
+                    # mqttPassword is now populated by /commons/userConfig in async_post_login
+                    _mqtt_pwd_from_config = _lid.get("mqttPassword") or ""
 
                     _cred_candidates = []
+                    # --- /commons/userConfig mqttPassword (highest priority) ---
+                    if _mqtt_pwd_from_config:
+                        print(f"    mqttPassword from userConfig: <len={len(_mqtt_pwd_from_config)}>")
+                        _cred_candidates.append((_smarthome_uid, _mqtt_pwd_from_config,
+                                                 "userId+userConfigPwd"))
+                        if _smarthome_uid != _smarthome_uid.lower():
+                            # Try both casings of the userId
+                            _cred_candidates.append((_smarthome_uid.lower(),
+                                                     _mqtt_pwd_from_config,
+                                                     "userId(lower)+userConfigPwd"))
+                    else:
+                        print("    mqttPassword from userConfig: MISSING — check _userConfigRaw above")
+
                     # --- Fetch numeric smarthome ID from /user/getUser ---
                     # The AuthInfo.associatedAccount might be the numeric long int ID,
                     # not the UUID string.  /user/getUser returns:
@@ -583,8 +619,20 @@ async def run(args: argparse.Namespace) -> None:
                         },
                     })
 
-                    parsed    = _up.urlparse(mqtt_url)
-                    host      = parsed.hostname or mqtt_url
+                    # Build list of MQTT broker URLs to try.
+                    # Primary: whatever getServerUrlConfig returned.
+                    # Also try the regional broker used by the AiDot web app.
+                    _broker_urls = []
+                    if mqtt_url:
+                        _broker_urls.append(mqtt_url)
+                    _regional_mqtt = f"wss://{_lid.get('region') or 'us'}-mqtt.arnoo.com:8443/mqtt"
+                    if _regional_mqtt not in _broker_urls:
+                        _broker_urls.append(_regional_mqtt)
+
+                    # Use first broker URL for initial path/transport/tls params.
+                    _first_parsed = _up.urlparse(_broker_urls[0])
+                    parsed    = _first_parsed
+                    host      = parsed.hostname or _broker_urls[0]
                     port      = parsed.port or 443
                     path      = parsed.path or "/mqtt"
                     use_tls   = parsed.scheme in ("wss", "mqtts")
@@ -618,55 +666,66 @@ async def run(args: argparse.Namespace) -> None:
                         print(f"    MQTT disconnected rc={rc}")
 
                     mqtt_success = False
-                    for _cred_user, _cred_pwd, _cred_label in _cred_candidates:
-                        # For the first credential combo, also try all WS paths.
-                        # For subsequent combos use the default path (skip path sweep
-                        # once we know rc=4 = bad creds on the default path).
-                        _paths_to_try = _ws_paths if _cred_label == _cred_candidates[0][2] else [path]
-                        for _try_path in _paths_to_try:
-                            _path_label = f" path={_try_path}" if _try_path != path else ""
-                            print(f"\n    [MQTT attempt] {_cred_label}{_path_label}  user={_cred_user[:16]}...")
-                            connect_rc_box[0] = None
-                            messages_seen.clear()
-                            done_event.clear()
-                            _client_id = f"app-{_smarthome_uid}"
+                    for _broker_url in _broker_urls:
+                        _bp = _up.urlparse(_broker_url)
+                        _bhost   = _bp.hostname or _broker_url
+                        _bport   = _bp.port or 443
+                        _bpath   = _bp.path or "/mqtt"
+                        _btls    = _bp.scheme in ("wss", "mqtts")
+                        _bxport  = "websockets" if _bp.scheme in ("wss", "ws") else "tcp"
+                        print(f"\n  [Broker] {_broker_url}")
 
-                            def _run(_u=_cred_user, _p=_cred_pwd, _cid=_client_id, _wp=_try_path):
-                                mqttc = _mqtt.Client(client_id=_cid, transport=transport)
-                                if use_tls:
-                                    mqttc.tls_set(cert_reqs=_ssl.CERT_REQUIRED)
-                                if transport == "websockets":
-                                    mqttc.ws_set_options(path=_wp)
-                                mqttc.username_pw_set(_u, _p)
-                                mqttc.on_connect    = _on_connect
-                                mqttc.on_message    = _on_message
-                                mqttc.on_disconnect = _on_disconnect
-                                try:
-                                    mqttc.connect(host, port, keepalive=30)
-                                    mqttc.loop_start()
-                                    done_event.wait(timeout=8)
-                                except Exception as e:
-                                    print(f"    MQTT connect exception: {e}")
-                                finally:
-                                    mqttc.loop_stop()
+                        for _cred_user, _cred_pwd, _cred_label in _cred_candidates:
+                            # For the first credential combo, also try all WS paths.
+                            _paths_to_try = _ws_paths if _cred_label == _cred_candidates[0][2] else [_bpath]
+                            for _try_path in _paths_to_try:
+                                _path_label = f" path={_try_path}" if _try_path != _bpath else ""
+                                print(f"\n    [MQTT attempt] {_cred_label}{_path_label}  user={_cred_user[:20]}...")
+                                connect_rc_box[0] = None
+                                messages_seen.clear()
+                                done_event.clear()
+                                _client_id = f"app-{_smarthome_uid}"
+
+                                def _run(_u=_cred_user, _p=_cred_pwd, _cid=_client_id,
+                                         _wp=_try_path, _bh=_bhost, _pp=_bport,
+                                         _tls=_btls, _tr=_bxport):
+                                    mqttc = _mqtt.Client(client_id=_cid, transport=_tr)
+                                    if _tls:
+                                        mqttc.tls_set(cert_reqs=_ssl.CERT_REQUIRED)
+                                    if _tr == "websockets":
+                                        mqttc.ws_set_options(path=_wp)
+                                    mqttc.username_pw_set(_u, _p)
+                                    mqttc.on_connect    = _on_connect
+                                    mqttc.on_message    = _on_message
+                                    mqttc.on_disconnect = _on_disconnect
                                     try:
-                                        mqttc.disconnect()
-                                    except Exception:
-                                        pass
+                                        mqttc.connect(_bh, _pp, keepalive=30)
+                                        mqttc.loop_start()
+                                        done_event.wait(timeout=8)
+                                    except Exception as e:
+                                        print(f"    MQTT connect exception: {e}")
+                                    finally:
+                                        mqttc.loop_stop()
+                                        try:
+                                            mqttc.disconnect()
+                                        except Exception:
+                                            pass
 
-                            await asyncio.get_event_loop().run_in_executor(None, _run)
+                                await asyncio.get_event_loop().run_in_executor(None, _run)
 
-                            if connect_rc_box[0] == 0:
-                                print(f"    *** MQTT CONNECTED with {_cred_label}{_path_label} ***")
-                                mqtt_success = True
-                                if messages_seen:
-                                    print(f"    MQTT: {len(messages_seen)} message(s) received")
+                                if connect_rc_box[0] == 0:
+                                    print(f"    *** MQTT CONNECTED with {_cred_label}{_path_label} ***")
+                                    mqtt_success = True
+                                    if messages_seen:
+                                        print(f"    MQTT: {len(messages_seen)} message(s) received")
+                                    else:
+                                        print("    MQTT: connected but no response to connectipc within 8s")
+                                    break
                                 else:
-                                    print("    MQTT: connected but no response to connectipc within 8s")
-                                break
-                            else:
-                                print(f"    rc={connect_rc_box[0]} -> skip")
+                                    print(f"    rc={connect_rc_box[0]} -> skip")
 
+                            if mqtt_success:
+                                break
                         if mqtt_success:
                             break
 

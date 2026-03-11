@@ -1025,8 +1025,13 @@ class DeviceClient(object):
 
             mqtt_host = data.get("mqttServerUrl") or ""
             if not mqtt_host:
-                _LOGGER.error("getServerUrlConfig returned no mqttServerUrl: %s", body)
-                return None
+                # Fall back to the regional MQTT broker URL known to work from
+                # the AiDot web client: wss://{region}-mqtt.arnoo.com:8443/mqtt
+                _LOGGER.warning(
+                    "getServerUrlConfig returned no mqttServerUrl; "
+                    "using regional fallback. body=%s", body
+                )
+                mqtt_host = f"wss://{self._region}-mqtt.arnoo.com:8443/mqtt"
 
             self._mqtt_url = (
                 mqtt_host
