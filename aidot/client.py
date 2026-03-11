@@ -182,20 +182,32 @@ class AidotClient:
             data = body if isinstance(body, dict) else {}
             if isinstance(data.get("data"), dict):
                 data = data["data"]
+            # Always store the raw response for DeviceClient inspection.
+            self.login_info["_userConfigRaw"] = data
+            # Password may be at top level OR nested under 'mqtt' subkey.
+            mqtt_block = data.get("mqtt") or {}
+            if isinstance(mqtt_block, str):
+                import json as _json
+                try: mqtt_block = _json.loads(mqtt_block)
+                except Exception: mqtt_block = {}
             pwd = (data.get("mqttPassword")
                    or data.get("mqqtPwd")
                    or data.get("mqttPwd")
+                   or mqtt_block.get("password")
                    or "")
             if pwd:
                 self.login_info["mqttPassword"] = pwd
                 _LOGGER.info("_async_fetch_user_config: mqttPassword stored (len=%d)", len(pwd))
             else:
-                # Store the raw response so DeviceClient can inspect all fields.
-                self.login_info["_userConfigRaw"] = data
                 _LOGGER.warning(
                     "_async_fetch_user_config: mqttPassword not found in response. "
                     "keys=%s  body=%s", list(data.keys()), body
                 )
+            # Also extract MQTT clientId if provided.
+            client_id = data.get("mqttClientId") or mqtt_block.get("clientId") or ""
+            if client_id:
+                self.login_info["mqttClientId"] = client_id
+                _LOGGER.info("_async_fetch_user_config: mqttClientId stored: %s", client_id)
         except Exception as exc:
             _LOGGER.warning("_async_fetch_user_config failed: %s", exc)
 
