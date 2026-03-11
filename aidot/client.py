@@ -3,14 +3,18 @@
 import asyncio
 import hashlib
 import logging
+import base64
 import aiohttp
 from aiohttp import ClientSession
 from typing import Any, Optional
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 
 from .exceptions import AidotAuthFailed, AidotUserOrPassIncorrect
 from .device_client import DeviceClient
 from .discover import Discover
-from .login_const import BASE_URL
+from .login_const import APP_ID, PUBLIC_KEY_PEM, BASE_URL
 from .const import (
     CONF_ACCESS_TOKEN,
     CONF_APP_ID,
@@ -36,12 +40,22 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# App ID used by the AiDot web/mobile client for cloud API calls.
+# App ID used by the AiDot web/mobile client for /commons/userConfig and
+# other cloud API calls that use owner+token headers.
 _CLOUD_APP_ID = "68"
 
 
+def rsa_password_encrypt(message: str) -> str:
+    """RSA-encrypt the password using the AiDot public key (for loginWithFreeVerification)."""
+    public_key = serialization.load_pem_public_key(
+        PUBLIC_KEY_PEM, backend=default_backend()
+    )
+    encrypted = public_key.encrypt(message.encode("utf-8"), padding.PKCS1v15())
+    return base64.b64encode(encrypted).decode("utf-8")
+
+
 def md5_password(message: str) -> str:
-    """Return the MD5 hex digest of the password (uppercase), as expected by the API."""
+    """MD5 hex digest of the password (for /users/login web-app flow)."""
     return hashlib.md5(message.encode("utf-8")).hexdigest()
 
 
@@ -94,34 +108,17 @@ class AidotClient:
         self.password = password
 
     async def async_post_login(self) -> dict[str, Any]:
-        """Login via the AiDot cloud API (/users/login with MD5 password)."""
-        # Base URL without /v17 path — login lives at the root API path.
-        base = f"https://prod-{self._region}-api.arnoo.com"
-        url = f"{base}/users/login"
-        # Headers must match the AiDot web client exactly (server checks UA/origin).
-        headers = {
-            "appid":           _CLOUD_APP_ID,
-            "terminal":        "app",
-            "locale":          "en-US",
-            "accept-language": "en-us",
-            "content-type":    "application/json;charset=utf-8",
-            "accept":          "application/json, text/plain, */*",
-            "accept-encoding": "gzip, deflate, br",
-            "origin":          "http://localhost:27388",
-            "referer":         "http://localhost:27388/",
-            "user-agent":      (
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0_1 like Mac OS X) "
-                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-                "Version/14.0 Mobile/15E148 Safari/604.1"
-            ),
-        }
+        """Login via loginWithFreeVerification (RSA-encrypted password)."""
+        url = f"{self._base_url}/users/loginWithFreeVerification"
+        headers = {CONF_APP_ID: APP_ID, CONF_TERMINAL: "app"}
         data = {
+            "countryKey": f"region:{self.country_name.strip()}",
             "username":   self.username,
-            "password":   md5_password(self.password),
-            "phoneId":    "f0f6ee8281905ed216582671271f0d74ed85e4969295a053de95a5cd71d73642",
-            "os":         1,
-            "appVersion": "99.0.0",
-            "webVersion": "2.20.18",
+            "password":   rsa_password_encrypt(self.password),
+            "terminalId": "gvz3gjae10l4zii00t7y0",
+            "webVersion": "0.5.0",
+            "area":       "Asia/Shanghai",
+            "UTC":        "UTC+8",
         }
 
         response_data: dict = {}
@@ -129,7 +126,6 @@ class AidotClient:
             response = await self.session.post(url, headers=headers, json=data)
             response_data = await response.json(content_type=None)
             _LOGGER.debug("async_post_login HTTP=%d response: %s", response.status, response_data)
-            # Check application-level error codes before raising on HTTP status.
             app_code = response_data.get(CONF_CODE)
             if app_code == ServerErrorCode.USER_PWD_INCORRECT:
                 raise AidotUserOrPassIncorrect
@@ -144,7 +140,7 @@ class AidotClient:
             self.login_info[CONF_REGION] = self._region
             self.login_info[CONF_COUNTRY] = self.country_name
             self.login_info[CONF_USERNAME] = self.username
-            # Immediately fetch the MQTT password from /commons/userConfig.
+            # Fetch MQTT password from /commons/userConfig (separate call required).
             await self._async_fetch_user_config()
             return self.login_info
         except AidotUserOrPassIncorrect:
