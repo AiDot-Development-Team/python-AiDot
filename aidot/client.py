@@ -98,12 +98,22 @@ class AidotClient:
         # Base URL without /v17 path — login lives at the root API path.
         base = f"https://prod-{self._region}-api.arnoo.com"
         url = f"{base}/users/login"
+        # Headers must match the AiDot web client exactly (server checks UA/origin).
         headers = {
-            "appid":        _CLOUD_APP_ID,
-            "terminal":     "app",
-            "locale":       "en-US",
-            "content-type": "application/json;charset=utf-8",
-            "accept":       "application/json, text/plain, */*",
+            "appid":           _CLOUD_APP_ID,
+            "terminal":        "app",
+            "locale":          "en-US",
+            "accept-language": "en-us",
+            "content-type":    "application/json;charset=utf-8",
+            "accept":          "application/json, text/plain, */*",
+            "accept-encoding": "gzip, deflate, br",
+            "origin":          "http://localhost:27388",
+            "referer":         "http://localhost:27388/",
+            "user-agent":      (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0_1 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                "Version/14.0 Mobile/15E148 Safari/604.1"
+            ),
         }
         data = {
             "username":   self.username,
@@ -118,10 +128,17 @@ class AidotClient:
         try:
             response = await self.session.post(url, headers=headers, json=data)
             response_data = await response.json(content_type=None)
-            _LOGGER.debug("async_post_login response: %s", response_data)
-            if response_data.get(CONF_CODE) == ServerErrorCode.USER_PWD_INCORRECT:
+            _LOGGER.debug("async_post_login HTTP=%d response: %s", response.status, response_data)
+            # Check application-level error codes before raising on HTTP status.
+            app_code = response_data.get(CONF_CODE)
+            if app_code == ServerErrorCode.USER_PWD_INCORRECT:
                 raise AidotUserOrPassIncorrect
-            response.raise_for_status()
+            if response.status >= 400:
+                raise aiohttp.ClientResponseError(
+                    response.request_info, response.history,
+                    status=response.status,
+                    message=f"HTTP {response.status}: {response_data}",
+                )
             self.login_info = response_data
             self.login_info[CONF_PASSWORD] = self.password
             self.login_info[CONF_REGION] = self._region
