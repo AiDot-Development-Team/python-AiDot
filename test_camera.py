@@ -527,15 +527,24 @@ async def run(args: argparse.Namespace) -> None:
                     _init_pwd   = _lid.get("initPassword") or ""
                     # mqttPassword is now populated by /commons/userConfig in async_post_login
                     _mqtt_pwd_from_config = _lid.get("mqttPassword") or ""
+                    # mqttClientId = the server-assigned clientId from userConfig
+                    # (format: terminalIndex-userId, e.g. "2g3t66-5354ad...").
+                    # The broker may require this as the MQTT username or client_id.
+                    _mqtt_client_id_from_config = _lid.get("mqttClientId") or ""
 
                     _cred_candidates = []
                     # --- /commons/userConfig mqttPassword (highest priority) ---
                     if _mqtt_pwd_from_config:
                         print(f"    mqttPassword from userConfig: <len={len(_mqtt_pwd_from_config)}>")
+                        print(f"    mqttClientId from userConfig: {_mqtt_client_id_from_config!r}")
                         _cred_candidates.append((_smarthome_uid, _mqtt_pwd_from_config,
                                                  "userId+userConfigPwd"))
+                        # Also try with the server-assigned mqttClientId as the MQTT username
+                        if _mqtt_client_id_from_config:
+                            _cred_candidates.append((_mqtt_client_id_from_config,
+                                                     _mqtt_pwd_from_config,
+                                                     "mqttClientId+userConfigPwd"))
                         if _smarthome_uid != _smarthome_uid.lower():
-                            # Try both casings of the userId
                             _cred_candidates.append((_smarthome_uid.lower(),
                                                      _mqtt_pwd_from_config,
                                                      "userId(lower)+userConfigPwd"))
@@ -684,7 +693,14 @@ async def run(args: argparse.Namespace) -> None:
                                 connect_rc_box[0] = None
                                 messages_seen.clear()
                                 done_event.clear()
-                                _client_id = f"app-{_smarthome_uid}"
+                                # Choose MQTT client_id:
+                                # - For mqttClientId+userConfigPwd, use mqttClientId as
+                                #   both CONNECT clientIdentifier and username (as server assigned it)
+                                # - Otherwise use app-userId (per Consciot web-app reverse engineering)
+                                if _cred_label == "mqttClientId+userConfigPwd" and _mqtt_client_id_from_config:
+                                    _client_id = _mqtt_client_id_from_config
+                                else:
+                                    _client_id = f"app-{_smarthome_uid}"
 
                                 def _run(_u=_cred_user, _p=_cred_pwd, _cid=_client_id,
                                          _wp=_try_path, _bh=_bhost, _pp=_bport,
