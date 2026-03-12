@@ -539,6 +539,10 @@ async def run(args: argparse.Namespace) -> None:
                         print(f"    mqttClientId from userConfig: {_mqtt_client_id_from_config!r}")
                         _cred_candidates.append((_smarthome_uid, _mqtt_pwd_from_config,
                                                  "userId+userConfigPwd"))
+                        # Same creds but with server-assigned clientId (terminalIndex-userId)
+                        if _mqtt_client_id_from_config:
+                            _cred_candidates.append((_smarthome_uid, _mqtt_pwd_from_config,
+                                                     "userId+userConfigPwd+mqttCid"))
                         # Also try with the server-assigned mqttClientId as the MQTT username
                         if _mqtt_client_id_from_config:
                             _cred_candidates.append((_mqtt_client_id_from_config,
@@ -697,7 +701,9 @@ async def run(args: argparse.Namespace) -> None:
                                 # - For mqttClientId+userConfigPwd, use mqttClientId as
                                 #   both CONNECT clientIdentifier and username (as server assigned it)
                                 # - Otherwise use app-userId (per Consciot web-app reverse engineering)
-                                if _cred_label == "mqttClientId+userConfigPwd" and _mqtt_client_id_from_config:
+                                if (_cred_label in ("mqttClientId+userConfigPwd",
+                                                    "userId+userConfigPwd+mqttCid")
+                                        and _mqtt_client_id_from_config):
                                     _client_id = _mqtt_client_id_from_config
                                 else:
                                     _client_id = f"app-{_smarthome_uid}"
