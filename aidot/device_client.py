@@ -296,7 +296,7 @@ async def _mqtt_get_playback_server_info(
     import urllib.parse
 
     seq              = str(random.randint(100_000, 999_999))
-    pub_topic        = f"iot/v1/s/{user_id}/IPC/getPlaybackServerInfoReq"
+    pub_topic        = f"iot/v1/s/{dev_id}/IPC/getPlaybackServerInfoReq"
     sub_topic        = f"iot/v1/c/{user_id}/#"
     sub_topic_device = f"iot/v1/c/{dev_id}/#"
 
@@ -448,7 +448,7 @@ async def _mqtt_get_live_server_info(
     import urllib.parse
 
     seq              = str(random.randint(100_000, 999_999))
-    pub_topic        = f"iot/v1/s/{user_id}/IPC/connectipc"
+    pub_topic        = f"iot/v1/s/{dev_id}/IPC/connectipc"
     sub_topic        = f"iot/v1/c/{user_id}/#"
     sub_topic_device = f"iot/v1/c/{dev_id}/#"
 

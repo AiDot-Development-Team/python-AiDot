@@ -285,8 +285,9 @@ async def run(args: argparse.Namespace) -> None:
                         f"iot/v1/cb/{user_id}/#",
                         f"iot/v1/c/{device_id}/#",
                     ]
-                    # serverV1 commands use userId in the path (not deviceId).
-                    pub_topic = f"iot/v1/s/{user_id}/IPC/connectipc"
+                    # connectipc addresses the specific camera; camera subscribes to
+                    # iot/v1/s/{deviceId}/#, so deviceId belongs in the path.
+                    pub_topic = f"iot/v1/s/{device_id}/IPC/connectipc"
 
                     req_body = _json.dumps({
                         "service": "IPC",           # JS uses "IPC", not "IPCAM"
