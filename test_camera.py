@@ -125,6 +125,13 @@ async def run(args: argparse.Namespace) -> None:
         for cam in cameras:
             print(f"      {cam.get('id')}  model={cam.get('modelId')}  name={cam.get('name')}")
 
+        if args.device:
+            cameras = [c for c in cameras if c.get("id") == args.device]
+            if not cameras:
+                print(f"    --device {args.device!r} not found in camera list")
+                return
+            print(f"    Filtered to device {args.device!r}")
+
         # Run selected tests
         for cam in cameras:
             dc = client.get_device_client(cam)
@@ -217,34 +224,10 @@ async def run(args: argparse.Namespace) -> None:
                 # MQTT diagnostics: print broker URL, connection status, and
                 # ALL raw messages received so we can see what the broker delivers.
                 # --------------------------------------------------------------- #
-                props = cam.get("properties") or {}
-                live_type   = props.get("liveType", "?")
-                spt_preconn = props.get("sptPreconn", "?")
-                ip_addr_raw = props.get("ipAddress", "")
-                enable_sdes = props.get("enableSdes", "?")
-                is_dtls     = props.get("isDTLS", "?")
-                password    = cam.get("password", "")
-
-                # Decode corrupted IP: '49.57.50.46' = ASCII bytes '1','9','2','.'
-                # The camera stores the IP string bytes as dotted-decimal octets.
-                def decode_ip(raw):
-                    try:
-                        parts   = [int(x) for x in raw.split(".")]
-                        decoded = bytes(parts).decode("ascii")
-                        import re
-                        if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", decoded):
-                            return decoded
-                    except Exception:
-                        pass
-                    return raw
-
-                ip_addr = decode_ip(ip_addr_raw) if ip_addr_raw else ""
-
-                print(f"\n[DIAG] Device streaming properties for {cam.get('name')}:")
-                print(f"    liveType={live_type}  sptPreconn={spt_preconn}  "
-                      f"enableSdes={enable_sdes}  isDTLS={is_dtls}")
-                print(f"    ipAddress raw={ip_addr_raw!r}  decoded={ip_addr!r}")
-                print(f"    password={password!r}")
+                print(f"\n[DIAG] All raw device fields for {cam.get('name')}:")
+                for _dk, _dv in cam.items():
+                    if _dk != "product":
+                        print(f"    {_dk} = {_dv!r}")
 
                 # Dump ALL user_info keys
                 print(f"\n[DIAG] All user_info keys ({len(dc._user_info)} total):")
@@ -256,242 +239,8 @@ async def run(args: argparse.Namespace) -> None:
                         print(f"    {k!r}: {v!r}")
 
                 _lid = dc._user_info
-                print(f"\n[DIAG] login_info notable fields:")
-                print(f"    id (smarthome userId): {_lid.get('id')!r}")
-                print(f"    url: {_lid.get('url')!r}")
-                print(f"    tid: {_lid.get('tid')!r}")
-                print(f"    terminalIndex: {_lid.get('terminalIndex')!r}")
-
-                # Raw probe: /user/login and /user/getUser directly
-                import aiohttp as _ah
-                _tid    = _lid.get("tid") or ""
-                _tidx   = _lid.get("terminalIndex") or ""
-                _token  = _lid.get("accessToken") or ""
-                _uname  = _lid.get("username") or ""
-                _pwd    = _lid.get("password") or ""
-                print(f"\n[DIAG] accessToken prefix: {_token[:8]}...  len={len(_token)}")
-                print(f"[DIAG] tid={_tid!r}  terminalIndex={_tidx!r}")
-                _smarthome_base = f"https://{_lid.get('region') or 'us'}-smarthome.arnoo.com:443"
-                _leedarson_headers = {
-                    "terminal":        "thirdPlatFormUser",
-                    "active-language": "en_US",
-                    "appKey":          "appa070",
-                    "access-token":    _token,
-                    "token":           _token,
-                    "Content-Type":    "application/json",
-                }
-                # MQTT broker is global-us-mqtt; try matching global-us-smarthome host too
-                _global_smarthome_base = f"https://global-{_lid.get('region') or 'us'}-smarthome.arnoo.com:443"
-                print(f"[DIAG] Probing smarthome endpoints for MQTT credentials...")
-                print(f"       hosts: {_smarthome_base}  AND  {_global_smarthome_base}")
-                async with _ah.ClientSession() as _sess:
-                    # Probe 1: /user/getUser on both hosts, 3 request styles
-                    _uid_for_getuser = _lid.get("id") or ""
-                    for _base_host in (_smarthome_base, _global_smarthome_base):
-                        for _gu_style, _gu_kw in (
-                            ("json", {"json":   {"desc": _uid_for_getuser}}),
-                            ("qs",   {"params": {"desc": _uid_for_getuser}}),
-                            ("form", {"data":   {"desc": _uid_for_getuser}}),
-                        ):
-                            try:
-                                async with _sess.post(
-                                    f"{_base_host}/user/getUser",
-                                    headers=_leedarson_headers,
-                                    timeout=_ah.ClientTimeout(total=8),
-                                    **_gu_kw,
-                                ) as _r:
-                                    _rb = await _r.json(content_type=None)
-                                _d = _rb.get("data") or {}
-                                _has_mqtt = any(k in str(_rb) for k in
-                                    ("mqqtPwd", "mqttPwd", "associatedAccount", "authInfo", "mqtt"))
-                                _marker = "  *** HAS MQTT DATA ***" if _has_mqtt else ""
-                                _host_s = "global" if "global" in _base_host else "regional"
-                                print(f"    [{_host_s}][{_gu_style}] POST /user/getUser -> "
-                                      f"code={_rb.get('code')} "
-                                      f"data_keys={list(_d.keys()) if isinstance(_d, dict) else _d!r}"
-                                      f"{_marker}")
-                                if _has_mqtt:
-                                    print(f"       data={_d}")
-                            except Exception as _e:
-                                _host_s = "global" if "global" in _base_host else "regional"
-                                print(f"    [{_host_s}][{_gu_style}] POST /user/getUser "
-                                      f"EXCEPTION: {type(_e).__name__}: {_e}")
-
-                    # Probe 2: candidate MQTT-credential endpoints on both hosts
-                    _uid_for_probe = _lid.get("id") or str(dc.user_id)
-                    _mqtt_cred_endpoints = [
-                        ("GET",  "/user/getMqttInfo",              {}),
-                        ("POST", "/user/getMqttInfo",              {"userId": _tid or _uname}),
-                        ("GET",  "/user/authInfo",                 {"userId": _tid or _uname}),
-                        ("POST", "/user/authInfo",                 {"userId": _tid or _uname}),
-                        ("GET",  "/commonController/getMqttConfig", {}),
-                        ("POST", "/commonController/getMqttConfig", {}),
-                        ("GET",  "/user/getUserMqtt",              {}),
-                        ("POST", "/user/getUserMqtt",              {"userId": _tid or _uname}),
-                        ("POST", "/user/reqUserAuthInfo",          {"userId": _uid_for_probe}),
-                        ("GET",  "/user/reqUserAuthInfo",          {"userId": _uid_for_probe}),
-                        ("POST", "/iot/getToken",                  {"userId": _uid_for_probe}),
-                        ("POST", "/user/getUserAuthInfo",          {"userId": _uid_for_probe}),
-                    ]
-                    for _base_url in [_smarthome_base, _global_smarthome_base]:
-                        for _method, _ep, _params in _mqtt_cred_endpoints:
-                            try:
-                                _kw = {"headers": _leedarson_headers,
-                                       "timeout": _ah.ClientTimeout(total=6)}
-                                if _method == "GET":
-                                    _kw["params"] = _params
-                                    _req = _sess.get(f"{_base_url}{_ep}", **_kw)
-                                else:
-                                    _kw["json"] = _params
-                                    _req = _sess.post(f"{_base_url}{_ep}", **_kw)
-                                async with _req as _r:
-                                    _rb = await _r.json(content_type=None)
-                                _d = _rb.get("data") or {}
-                                _has_mqtt = any(k in str(_rb)
-                                                for k in ("mqtt", "Mqtt", "MQTT", "authInfo"))
-                                _marker = "  *** HAS MQTT DATA ***" if _has_mqtt else ""
-                                _host_label = "global" if "global" in _base_url else "regional"
-                                print(f"    [{_host_label}] {_method} {_ep} -> "
-                                      f"code={_rb.get('code')} desc={_rb.get('desc')!r}{_marker}")
-                                if _has_mqtt:
-                                    print(f"       data={_d}")
-                            except Exception as _e:
-                                _host_label = "global" if "global" in _base_url else "regional"
-                                print(f"    [{_host_label}] {_method} {_ep} -> "
-                                      f"ERROR: {type(_e).__name__}: {_e}")
-
-                    # Probe 3: /user/login
-                    # The Android SDK uses Retrofit @QueryMap on POST, which sends
-                    # params as URL query string (not form body).  We try both:
-                    #   "qs"   = params= (URL query string on POST)  <-- SDK pattern
-                    #   "form" = data=   (application/x-www-form-urlencoded body)
-                    #   "json" = json=   (application/json body)
-                    import hashlib as _hl
-                    _md5_pwd = _hl.md5(_pwd.encode()).hexdigest().upper() if _pwd else ""
-                    _login_hdr_noct = {"terminal": "thirdPlatFormUser",
-                                       "active-language": "en_US", "appKey": "appa070"}
-                    _login_hdr_json = {**_login_hdr_noct, "Content-Type": "application/json"}
-                    for _apid in ("appa070", "1383974540041977857"):
-                        for _tmark in ("app", "thirdPlatFormUser"):
-                            for _tdata in ({}, {"tenantId": "11"}):
-                                for _pwd_type, _pwd_val in (("plain", _pwd), ("md5", _md5_pwd)):
-                                    _base_body = {
-                                        "userName": _uname, "passWord": _pwd_val,
-                                        "os": "ios", "terminalMark": _tmark,
-                                        "appId": _apid, "phoneId": _tidx,
-                                        "locationId": "us", **_tdata,
-                                    }
-                                    _label = (f"appId={_apid} tmark={_tmark} "
-                                              f"tenantId={_tdata.get('tenantId','<none>')} "
-                                              f"pwd={_pwd_type}")
-                                    for _style, _kw, _hdr in (
-                                        ("qs",   {"params": _base_body}, _login_hdr_noct),
-                                        ("form", {"data":   _base_body}, _login_hdr_noct),
-                                        ("json", {"json":   _base_body}, _login_hdr_json),
-                                    ):
-                                        try:
-                                            async with _sess.post(
-                                                f"{_smarthome_base}/user/login",
-                                                headers=_hdr,
-                                                timeout=_ah.ClientTimeout(total=8),
-                                                **_kw,
-                                            ) as _r:
-                                                _rb = await _r.json(content_type=None)
-                                            _code = _rb.get("code")
-                                            _has_auth = any(k in str(_rb) for k in
-                                                ("mqqtPwd", "mqttPwd", "associatedAccount",
-                                                 "authInfo", "mqtt"))
-                                            _ok = "  *** AUTH DATA ***" if _has_auth else ""
-                                            print(f"    /user/login [{_style}] {_label} -> "
-                                                  f"code={_code} desc={_rb.get('desc')!r}"
-                                                  f"{_ok}")
-                                            if _has_auth or _code in (200, 0):
-                                                print(f"       DATA: {_rb.get('data')}")
-                                        except Exception as _e:
-                                            print(f"    /user/login [{_style}] {_label} "
-                                                  f"EXCEPTION: {type(_e).__name__}: {_e}")
-
-                # Step A0: probe AiDot platform (prod-us-api.arnoo.com) for MQTT endpoints.
-                # Headers match the working curl commands from reverse-engineering the web app:
-                #   appid: 68  owner: <userId>  token: <accessToken>  terminal: app
-                _aidot_region = _lid.get('region') or 'us'
-                _aidot_api_base = f"https://prod-{_aidot_region}-api.arnoo.com"
-                _aidot_base    = f"{_aidot_api_base}/v17"
-                _owner_id      = _lid.get("id") or ""
-                _aidot_headers = {
-                    "appid":    "68",
-                    "owner":    _owner_id,
-                    "token":    _token,
-                    "terminal": "app",
-                    "locale":   "en-US",
-                    "accept":   "application/json, text/plain, */*",
-                }
-                print(f"\n[DIAG] Probing AiDot platform ({_aidot_api_base}) for MQTT/config...")
-                # /commons/userConfig is the documented endpoint for MQTT password retrieval.
-                # /v17 endpoints are also probed for completeness.
-                _aidot_eps = [
-                    ("GET",  _aidot_api_base + "/commons/userConfig",  {}),
-                    ("GET",  _aidot_base + "/users/getMqttInfo",       {}),
-                    ("GET",  _aidot_base + "/users/mqttInfo",          {}),
-                    ("GET",  _aidot_base + "/iot/mqttInfo",            {}),
-                    ("POST", _aidot_base + "/users/getMqttInfo",       {"userId": _owner_id}),
-                    ("GET",  _aidot_base + "/mqtt/userAuth",           {}),
-                    ("POST", _aidot_base + "/mqtt/userAuth",           {"userId": _owner_id}),
-                    ("GET",  _aidot_base + "/users/getAuthInfo",       {}),
-                    ("POST", _aidot_base + "/users/getAuthInfo",       {"userId": _owner_id}),
-                    ("GET",  _aidot_base + "/users/getUserInfo",       {}),
-                    ("GET",  _aidot_base + "/commons/userConfig",      {}),
-                ]
-                async with _ah.ClientSession() as _s3:
-                    for _m3, _url3, _par3 in _aidot_eps:
-                        try:
-                            _kw3 = {"headers": _aidot_headers, "timeout": _ah.ClientTimeout(total=6)}
-                            if _m3 == "GET":
-                                if _par3:
-                                    _kw3["params"] = _par3
-                                _r3 = _s3.get(_url3, **_kw3)
-                            else:
-                                _kw3["json"] = _par3
-                                _r3 = _s3.post(_url3, **_kw3)
-                            async with _r3 as _rr3:
-                                _http3 = _rr3.status
-                                _rb3 = await _rr3.json(content_type=None)
-                            _has_m = any(k in str(_rb3) for k in ("mqtt", "Mqtt", "MQTT",
-                                         "mqqt", "associatedAccount", "authInfo", "Password"))
-                            _ok3 = "  *** HAS MQTT DATA ***" if _has_m else ""
-                            _ep3 = _url3.replace(_aidot_api_base, "")
-                            print(f"    {_m3} {_ep3} -> HTTP={_http3} "
-                                  f"code={_rb3.get('code')} desc={_rb3.get('desc')!r}{_ok3}")
-                            # Always print full body (truncated) — never skip code=None responses.
-                            print(f"       BODY={str(_rb3)[:600]}")
-                        except Exception as _e3:
-                            _ep3 = _url3.replace(_aidot_api_base, "")
-                            print(f"    {_m3} {_ep3} -> ERROR: {type(_e3).__name__}: {_e3}")
-
-                # Step A: fetch server config
-                print(f"\n[DIAG] Calling getServerUrlConfig (full response logged at WARNING)...")
                 mqtt_url = await dc._async_get_mqtt_url()
                 print(f"[DIAG] MQTT broker URL: {mqtt_url!r}")
-                srv_cfg  = dc._smarthome_auth or {}
-                _raw_cfg = srv_cfg.get("raw", {})
-                print(f"[DIAG] getServerUrlConfig data keys: {list(_raw_cfg.keys())}")
-                print(f"[DIAG] getServerUrlConfig httpHeader: {_raw_cfg.get('httpHeader')!r}")
-                print(f"[DIAG] getServerUrlConfig uniqueMsgId: {_raw_cfg.get('uniqueMsgId')!r}")
-                print(f"[DIAG] getServerUrlConfig heartbeat: {_raw_cfg.get('heartbeat')!r}")
-
-                # Step B: fetch MQTT credentials (all strategies)
-                print(f"\n[DIAG] Fetching MQTT credentials (all strategies)...")
-                smarthome_auth = await dc._async_get_smarthome_auth()
-                if smarthome_auth:
-                    print(f"    mqttUser: {smarthome_auth.get('mqttUser')!r}")
-                    _mp = smarthome_auth.get("mqttPassword") or ""
-                    print(f"    mqttPassword: <len={len(_mp)}>")
-                    print(f"    raw keys: {list(smarthome_auth.get('raw', {}).keys())}")
-                else:
-                    print("    FAILED — all strategies exhausted")
-
-                access_token = _lid.get("accessToken") or _lid.get("access_token") or ""
-                print(f"[DIAG] accessToken present: {bool(access_token)} len={len(access_token)}")
 
                 if not mqtt_url:
                     print("    ERROR: Could not fetch MQTT broker URL — skipping MQTT diag")
@@ -525,19 +274,27 @@ async def run(args: argparse.Namespace) -> None:
                     _ws_paths = ["/mqtt"]
 
                     user_id   = _smarthome_uid
+                    device_id = cam.get("id") or ""
                     seq       = str(_random.randint(100_000, 999_999))
-                    sub_topic    = f"iot/v1/c/{user_id}/#"
-                    sub_topic_cb = f"iot/v1/cb/{user_id}/#"
-                    pub_topic    = f"iot/v1/s/{user_id}/IPCAM/connectipc"
+
+                    # Subscribe to userId topics, deviceId topics, and wildcard catch-all
+                    # so we see the response regardless of which topic it arrives on.
+                    sub_topics = [
+                        f"iot/v1/c/{user_id}/#",
+                        f"iot/v1/cb/{user_id}/#",
+                        f"iot/v1/c/{device_id}/#",
+                        "#",
+                    ]
+                    pub_topic = f"iot/v1/s/{device_id}/IPC/connectipc"
 
                     req_body = _json.dumps({
-                        "service": "IPCAM",
+                        "service": "IPC",           # JS uses "IPC", not "IPCAM"
                         "method":  "connectipc",
                         "seq":     seq,
-                        "srcAddr": f"0.{user_id}",
+                        "srcAddr": user_id,          # JS: srcAddr = userId (no "0." prefix)
                         "payload": {
                             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                            "deviceId":  cam.get("id"),
+                            "deviceId":  device_id,
                             "clientId":  (_mqtt_client_id_from_config or f"app-{user_id}"),
                         },
                     })
@@ -569,12 +326,11 @@ async def run(args: argparse.Namespace) -> None:
                         connect_rc_box[0] = rc
                         print(f"    MQTT on_connect rc={rc} ({'OK' if rc == 0 else 'FAILED'})")
                         if rc == 0:
-                            c.subscribe(sub_topic, qos=1)
-                            c.subscribe(sub_topic_cb, qos=1)
+                            for _t in sub_topics:
+                                c.subscribe(_t, qos=1)
+                                print(f"    MQTT subscribed to {_t}")
                             c.publish(pub_topic, req_body, qos=1)
-                            print(f"    MQTT subscribed to {sub_topic}")
-                            print(f"    MQTT subscribed to {sub_topic_cb}")
-                            print(f"    MQTT published connectipc seq={seq}")
+                            print(f"    MQTT published connectipc to {pub_topic} seq={seq}")
 
                     def _on_message(c, ud, msg):
                         try:
@@ -697,6 +453,8 @@ def main() -> None:
     parser.add_argument("--diag-mqtt", action="store_true",
                         help="Verbose MQTT diagnostics: show broker URL, raw messages, "
                              "and ALL topics received (use this when --live fails)")
+    parser.add_argument("--device", metavar="DEVICE_ID",
+                        help="Run tests on only the camera with this AiDot device UID")
 
     args = parser.parse_args()
 

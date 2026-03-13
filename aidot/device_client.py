@@ -295,15 +295,16 @@ async def _mqtt_get_playback_server_info(
     import threading
     import urllib.parse
 
-    seq       = str(random.randint(100_000, 999_999))
-    pub_topic = f"iot/v1/s/{user_id}/IPCAM/getPlaybackServerInfoReq"
-    sub_topic = f"iot/v1/c/{user_id}/#"
+    seq              = str(random.randint(100_000, 999_999))
+    pub_topic        = f"iot/v1/s/{dev_id}/IPC/getPlaybackServerInfoReq"
+    sub_topic        = f"iot/v1/c/{user_id}/#"
+    sub_topic_device = f"iot/v1/c/{dev_id}/#"
 
     request_body = json.dumps({
-        "service": "IPCAM",
+        "service": "IPC",
         "method":  "getPlaybackServerInfoReq",
         "seq":     seq,
-        "srcAddr": f"0.{user_id}",
+        "srcAddr": user_id,
         "payload": {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "deviceId":  dev_id,
@@ -327,6 +328,7 @@ async def _mqtt_get_playback_server_info(
             result_event.set()
             return
         client.subscribe(sub_topic, qos=1)
+        client.subscribe(sub_topic_device, qos=1)
         client.publish(pub_topic, request_body, qos=1)
 
     def on_message(client, userdata, msg):
@@ -445,15 +447,16 @@ async def _mqtt_get_live_server_info(
     import threading
     import urllib.parse
 
-    seq       = str(random.randint(100_000, 999_999))
-    pub_topic = f"iot/v1/s/{user_id}/IPCAM/connectipc"
-    sub_topic = f"iot/v1/c/{user_id}/#"
+    seq              = str(random.randint(100_000, 999_999))
+    pub_topic        = f"iot/v1/s/{dev_id}/IPC/connectipc"
+    sub_topic        = f"iot/v1/c/{user_id}/#"
+    sub_topic_device = f"iot/v1/c/{dev_id}/#"
 
     request_body = json.dumps({
-        "service": "IPCAM",
+        "service": "IPC",
         "method":  "connectipc",
         "seq":     seq,
-        "srcAddr": f"0.{user_id}",
+        "srcAddr": user_id,
         "payload": {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "deviceId":  dev_id,
@@ -477,6 +480,7 @@ async def _mqtt_get_live_server_info(
             result_event.set()
             return
         client.subscribe(sub_topic, qos=1)
+        client.subscribe(sub_topic_device, qos=1)
         client.publish(pub_topic, request_body, qos=1)
 
     def on_message(client, userdata, msg):
@@ -1129,16 +1133,12 @@ class DeviceClient(object):
 
                     code = body.get("code")
                     data = body.get("data") or {}
-                    _LOGGER.warning(
+                    _LOGGER.debug(
                         "_async_get_smarthome_auth POST /user/getUser desc=%r -> "
-                        "code=%s  data_keys=%s  body=%s",
+                        "code=%s  data_keys=%s",
                         desc_val, code,
                         list(data.keys()) if isinstance(data, dict) else data,
-                        body,
                     )
-                    print(f"    [getUser] desc={desc_val!r} code={code} "
-                          f"data_keys={list(data.keys()) if isinstance(data, dict) else data!r} "
-                          f"body={body!r}")
 
                     if isinstance(data, dict):
                         auth = data.get("authInfo") or data
