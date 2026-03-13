@@ -296,10 +296,10 @@ async def _mqtt_get_playback_server_info(
     import urllib.parse
 
     seq       = str(int(time.time() * 1000))[4:13]   # 9-digit JS-matching format
-    # Publish to serverV1/{user_id}/IPC/... — users can publish to their own
-    # serverV1/{userId} namespace; the server routes to the device via payload.deviceId.
-    # (Publishing to serverV1/{deviceId} triggers broker ACL violation.)
+    # Relay-server path: serverV1/{user_id}/IPC/...
     pub_topic  = f"iot/v1/s/{user_id}/IPC/getPlaybackServerInfoReq"
+    # Direct-to-device path per aidot/main.544c2d18.js IPC command convention.
+    pub_topic_direct = f"iot/v1/c/{dev_id}/getPlaybackServerInfoReq"
     sub_topics = [
         (f"iot/v1/c/{user_id}/#",  1),
         (f"iot/v1/cb/{dev_id}/#",  1),
@@ -335,6 +335,7 @@ async def _mqtt_get_playback_server_info(
         for _topic, _qos in sub_topics:
             client.subscribe(_topic, qos=_qos)
         client.publish(pub_topic, request_body, qos=1)
+        client.publish(pub_topic_direct, request_body, qos=1)
 
     def on_message(client, userdata, msg):
         try:
@@ -347,20 +348,14 @@ async def _mqtt_get_playback_server_info(
                     and pld.get("event") == "sleep_status_changed"
                     and "wakeup" in (pld.get("arguments") or [])):
                 client.publish(pub_topic, request_body, qos=1)
+                client.publish(pub_topic_direct, request_body, qos=1)
                 return
 
-            # Phase 1b: disKeepAliveState → send keepAlive heartbeat, resend.
+            # Phase 1b: disKeepAliveState → camera is awake and relay is ready.
+            # serverPubTopic is ACL-blocked for users; do not publish there.
             if method == "disKeepAliveState":
-                ka_topic   = body.get("serverPubTopic")
-                ka_payload = body.get("serverPubPayload")
-                if ka_topic and ka_payload:
-                    client.publish(
-                        ka_topic,
-                        ka_payload if isinstance(ka_payload, (bytes, str))
-                        else json.dumps(ka_payload),
-                        qos=1,
-                    )
                 client.publish(pub_topic, request_body, qos=1)
+                client.publish(pub_topic_direct, request_body, qos=1)
                 return
 
             # Phase 2: actual response with relay endpoint.
@@ -481,10 +476,12 @@ async def _mqtt_get_live_server_info(
     import urllib.parse
 
     seq       = str(int(time.time() * 1000))[4:13]   # 9-digit JS-matching format
-    # Publish to serverV1/{user_id}/IPC/... — users can publish to their own
-    # serverV1/{userId} namespace; the server routes to the device via payload.deviceId.
-    # (Publishing to serverV1/{deviceId} triggers broker ACL violation.)
+    # Relay-server path: serverV1/{user_id}/IPC/connectipc
+    # (Users can publish to their own serverV1/{userId} namespace.)
     pub_topic  = f"iot/v1/s/{user_id}/IPC/connectipc"
+    # Direct-to-device path: clientV1/{dev_id}/connectipc
+    # Per aidot/main.544c2d18.js all IPC commands use clientV1/{deviceId}/{method}.
+    pub_topic_direct = f"iot/v1/c/{dev_id}/connectipc"
     # Subscribe to both the user's response channel and the device broadcast channel.
     # The connectipc response arrives on clientV1/{userId}/#; the device broadcast
     # channel (broadcastV1/{deviceId}/#) delivers wakeupStatus events so the broker
@@ -523,7 +520,9 @@ async def _mqtt_get_live_server_info(
             return
         for _topic, _qos in sub_topics:
             client.subscribe(_topic, qos=_qos)
+        # Publish to both relay path and direct-to-device path.
         client.publish(pub_topic, request_body, qos=1)
+        client.publish(pub_topic_direct, request_body, qos=1)
 
     def on_message(client, userdata, msg):
         try:
@@ -537,21 +536,16 @@ async def _mqtt_get_live_server_info(
                     and pld.get("event") == "sleep_status_changed"
                     and "wakeup" in (pld.get("arguments") or [])):
                 client.publish(pub_topic, request_body, qos=1)
+                client.publish(pub_topic_direct, request_body, qos=1)
                 return
 
-            # Phase 1b: camera sent disKeepAliveState — it expects a keepAlive
-            # heartbeat back, then a fresh connectipc to complete relay setup.
+            # Phase 1b: camera sent disKeepAliveState — camera is awake and relay
+            # is ready. serverPubTopic is the relay server's keepAlive channel and
+            # is ACL-blocked for regular users (publishing there causes rc=7).
+            # Re-publish connectipc on both paths to complete the relay setup.
             if method == "disKeepAliveState":
-                ka_topic   = body.get("serverPubTopic")
-                ka_payload = body.get("serverPubPayload")
-                if ka_topic and ka_payload:
-                    client.publish(
-                        ka_topic,
-                        ka_payload if isinstance(ka_payload, (bytes, str))
-                        else json.dumps(ka_payload),
-                        qos=1,
-                    )
                 client.publish(pub_topic, request_body, qos=1)
+                client.publish(pub_topic_direct, request_body, qos=1)
                 return
 
             # Phase 2: actual connectipc response with relay endpoint.

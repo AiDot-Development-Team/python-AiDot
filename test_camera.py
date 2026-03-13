@@ -331,18 +331,19 @@ async def run(args: argparse.Namespace) -> None:
                         ]
 
                         # Probe matrix: (pub_topic, payload.clientId, label, timeout_s)
-                        # Test three payload.clientId variants on the primary topic to determine
-                        # whether the server routes the response based on this field.
+                        # Probe 1: relay-server path (serverV1/{userId}) — kept for baseline.
+                        # Probe 2-3: direct-to-device path (clientV1/{deviceId}) — this is
+                        # how the JS web app sends ALL IPC commands; the correct path per
+                        # aidot/main.544c2d18.js: every sendData call uses
+                        #   topic: clientV1 + "/" + devId + "/" + method
                         _primary = f"iot/v1/s/{user_id}/IPC/connectipc"
                         _probe_candidates = [
                             (_primary, user_id,
-                             "primary+clientId=userId", 60),
-                            (_primary, _mqtt_client_id_from_config,
-                             "primary+clientId=mqttClientId", 60),
-                            (_primary, f"app-{user_id}",
-                             "primary+clientId=app-userId", 30),
-                            (f"iot/v1/s/{device_id}/IPC/connectipc", _mqtt_client_id_from_config,
-                             "deviceId-topic (expect rc=7)", 10),
+                             "serverV1+clientId=userId", 60),
+                            (f"iot/v1/c/{device_id}/connectipc", user_id,
+                             "clientV1/{devId}/connectipc", 30),
+                            (f"iot/v1/c/{device_id}/IPC/connectipc", user_id,
+                             "clientV1/{devId}/IPC/connectipc", 30),
                         ]
 
                         mqtt_success  = False
@@ -444,20 +445,12 @@ async def run(args: argparse.Namespace) -> None:
                                               f"republishing connectipc")
                                         c.publish(_t, _rb, qos=1)
                                     if _mth == "disKeepAliveState":
-                                        _ka_topic   = _m2.get("serverPubTopic")
-                                        _ka_payload = _m2.get("serverPubPayload")
-                                        if _ka_topic and _ka_payload:
-                                            print(f"    [KEEP-ALIVE] Publishing heartbeat "
-                                                  f"to {_ka_topic}")
-                                            c.publish(
-                                                _ka_topic,
-                                                _ka_payload
-                                                if isinstance(_ka_payload, (bytes, str))
-                                                else _json.dumps(_ka_payload),
-                                                qos=1,
-                                            )
-                                        print(f"    [KEEP-ALIVE] Republishing connectipc "
-                                              f"after disKeepAliveState")
+                                        # serverPubTopic is the relay server's keepAlive
+                                        # channel — ACL-blocked for regular users (rc=7).
+                                        # Just republish connectipc now that the camera
+                                        # is confirmed awake/connected.
+                                        print(f"    [KEEP-ALIVE] Camera confirmed awake "
+                                              f"(disKeepAliveState) — republishing connectipc")
                                         c.publish(_t, _rb, qos=1)
                                 except Exception:
                                     pass
