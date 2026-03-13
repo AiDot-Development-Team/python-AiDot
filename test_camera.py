@@ -304,22 +304,28 @@ async def run(args: argparse.Namespace) -> None:
                             "payload": {"timestamp": "2018-03-14 17:30:00"},
                         })
 
-                        # Subscribe to user's own clientV1 and broadcastV1 namespaces.
-                        # Server routes the connectipc response to clientV1/{userId}/#.
-                        # Omit broadcastV1/{deviceId}/# — may cause rc=7 with the
-                        # server-assigned clientId on the production broker.
+                        # Subscribe broadly to catch the response wherever the server
+                        # sends it.  clientV1/{userId}/# is the primary candidate (JS
+                        # subscriptions); clientV1/{deviceId}/# catches responses the
+                        # server might route to the device namespace; iot/v1/# is a
+                        # wildcard to diagnose any unexpected routing.
                         _sub_topics = [
                             f"iot/v1/c/{user_id}/#",
                             f"iot/v1/cb/{user_id}/#",
+                            f"iot/v1/c/{device_id}/#",
+                            f"iot/v1/cb/{device_id}/#",
+                            "iot/v1/#",
                         ]
 
-                        # Primary: serverV1/{userId}/IPC/connectipc — users can publish
-                        # to their own serverV1/{userId}/... namespace; server routes to
-                        # the device via payload.deviceId (matches all other JS server-
-                        # routed commands: OTA, automation, security, scene).
-                        # Fallback: serverV1/{deviceId}/IPC/connectipc — kept as probe.
+                        # Topic candidates in priority order.
+                        # serverV1/{userId}/IPC/connectipc — ACL-allowed, uses userId
+                        #   namespace; server routes to device via payload.deviceId.
+                        # serverV1/{userId}/connectipc — same but without service prefix;
+                        #   some JS methods omit the service segment in the topic.
+                        # serverV1/{deviceId}/IPC/connectipc — kept as probe (expect rc=7).
                         _pub_topic_candidates = [
                             f"iot/v1/s/{user_id}/IPC/connectipc",
+                            f"iot/v1/s/{user_id}/connectipc",
                             f"iot/v1/s/{device_id}/IPC/connectipc",
                         ]
 
@@ -335,8 +341,12 @@ async def run(args: argparse.Namespace) -> None:
                                 "srcAddr": user_id,
                                 "payload": {
                                     "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                                    "deviceId":  device_id,
-                                    "clientId":  _client_id,
+                                    # Include both field names — JS uses "devId",
+                                    # mobile SDK may use "deviceId".
+                                    "devId":    device_id,
+                                    "deviceId": device_id,
+                                    "userId":   user_id,
+                                    "clientId": _client_id,
                                 },
                             })
                             print(f"\n  [Broker] wss://{_bhost}:{_bport}{_bpath}")
@@ -373,6 +383,12 @@ async def run(args: argparse.Namespace) -> None:
                                     c.publish(_t, _rb, qos=1)
                                     print(f"    MQTT published connectipc to {_t}")
 
+                            def _on_subscribe(c, ud, mid, granted_qos):
+                                # Log subscription ACK — rc=128 means broker rejected it
+                                for q in granted_qos:
+                                    _ok = "OK" if q != 128 else "REJECTED(128)"
+                                    print(f"    MQTT sub_ack mid={mid} qos={q} [{_ok}]")
+
                             def _on_message(c, ud, msg):
                                 try:
                                     _ps = msg.payload.decode("utf-8")
@@ -402,6 +418,7 @@ async def run(args: argparse.Namespace) -> None:
                                     mqttc.ws_set_options(path=_bpath)
                                 mqttc.username_pw_set(_cred_user, _cred_pwd)
                                 mqttc.on_connect    = _on_connect
+                                mqttc.on_subscribe  = _on_subscribe
                                 mqttc.on_message    = _on_message
                                 mqttc.on_disconnect = _on_disconnect
                                 try:
