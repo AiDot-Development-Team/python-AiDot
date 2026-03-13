@@ -1476,7 +1476,7 @@ class DeviceClient(object):
         smarthome_auth = await self._async_get_smarthome_auth()
         mqtt_user = (smarthome_auth or {}).get("mqttUser") or str(self.user_id)
         mqtt_pwd  = (smarthome_auth or {}).get("mqttPassword") or ""
-        client_id = f"app-{mqtt_user}"
+        client_id = (self._user_info.get("mqttClientId") or f"app-{mqtt_user}")
 
         # Step 1 - MQTT
         mqtt_url = await self._async_get_mqtt_url()
@@ -1589,7 +1589,7 @@ class DeviceClient(object):
         smarthome_auth = await self._async_get_smarthome_auth()
         mqtt_user = (smarthome_auth or {}).get("mqttUser") or str(self.user_id)
         mqtt_pwd  = (smarthome_auth or {}).get("mqttPassword") or ""
-        client_id = f"app-{mqtt_user}"
+        client_id = (self._user_info.get("mqttClientId") or f"app-{mqtt_user}")
 
         # Step 1 -- MQTT connectipc
         mqtt_url = await self._async_get_mqtt_url()

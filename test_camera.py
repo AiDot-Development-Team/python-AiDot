@@ -487,12 +487,8 @@ async def run(args: argparse.Namespace) -> None:
                     _mp = smarthome_auth.get("mqttPassword") or ""
                     print(f"    mqttPassword: <len={len(_mp)}>")
                     print(f"    raw keys: {list(smarthome_auth.get('raw', {}).keys())}")
-                    mqtt_user_for_diag = smarthome_auth.get("mqttUser") or str(dc.user_id)
-                    mqtt_pwd_used      = smarthome_auth.get("mqttPassword") or ""
                 else:
                     print("    FAILED — all strategies exhausted")
-                    mqtt_user_for_diag = _lid.get("id") or str(dc.user_id)
-                    mqtt_pwd_used      = ""
 
                 access_token = _lid.get("accessToken") or _lid.get("access_token") or ""
                 print(f"[DIAG] accessToken present: {bool(access_token)} len={len(access_token)}")
@@ -508,23 +504,7 @@ async def run(args: argparse.Namespace) -> None:
                     import json as _json
 
                     # Build credential candidates to try in order.
-                    _access_token   = _lid.get("accessToken") or _lid.get("access_token") or ""
                     _smarthome_uid  = _lid.get("id") or str(dc.user_id)
-                    _terminal_idx   = _lid.get("terminalIndex") or ""
-                    _raw_http_hdr   = srv_cfg.get("raw", {}).get("httpHeader") or ""
-                    _hdr_token = ""
-                    if isinstance(_raw_http_hdr, dict):
-                        _hdr_token = (_raw_http_hdr.get("token")
-                                      or _raw_http_hdr.get("access-token") or "")
-                    elif isinstance(_raw_http_hdr, str) and "{" in _raw_http_hdr:
-                        try:
-                            _hdr_obj   = _json.loads(_raw_http_hdr)
-                            _hdr_token = (_hdr_obj.get("token")
-                                          or _hdr_obj.get("access-token") or "")
-                        except Exception:
-                            pass
-
-                    _init_pwd   = _lid.get("initPassword") or ""
                     # mqttPassword is now populated by /commons/userConfig in async_post_login
                     _mqtt_pwd_from_config = _lid.get("mqttPassword") or ""
                     # mqttClientId = the server-assigned clientId from userConfig
@@ -533,86 +513,16 @@ async def run(args: argparse.Namespace) -> None:
                     _mqtt_client_id_from_config = _lid.get("mqttClientId") or ""
 
                     _cred_candidates = []
-                    # --- /commons/userConfig mqttPassword (highest priority) ---
-                    if _mqtt_pwd_from_config:
+                    if _mqtt_pwd_from_config and _mqtt_client_id_from_config:
                         print(f"    mqttPassword from userConfig: <len={len(_mqtt_pwd_from_config)}>")
                         print(f"    mqttClientId from userConfig: {_mqtt_client_id_from_config!r}")
                         _cred_candidates.append((_smarthome_uid, _mqtt_pwd_from_config,
-                                                 "userId+userConfigPwd"))
-                        # Same creds but with server-assigned clientId (terminalIndex-userId)
-                        if _mqtt_client_id_from_config:
-                            _cred_candidates.append((_smarthome_uid, _mqtt_pwd_from_config,
-                                                     "userId+userConfigPwd+mqttCid"))
-                        # Also try with the server-assigned mqttClientId as the MQTT username
-                        if _mqtt_client_id_from_config:
-                            _cred_candidates.append((_mqtt_client_id_from_config,
-                                                     _mqtt_pwd_from_config,
-                                                     "mqttClientId+userConfigPwd"))
-                        if _smarthome_uid != _smarthome_uid.lower():
-                            _cred_candidates.append((_smarthome_uid.lower(),
-                                                     _mqtt_pwd_from_config,
-                                                     "userId(lower)+userConfigPwd"))
+                                                 "userId+userConfigPwd+mqttCid"))
                     else:
-                        print("    mqttPassword from userConfig: MISSING — check _userConfigRaw above")
+                        print("    mqttPassword/mqttClientId from userConfig: MISSING — check _userConfigRaw above")
 
-                    # --- Fetch numeric smarthome ID from /user/getUser ---
-                    # The AuthInfo.associatedAccount might be the numeric long int ID,
-                    # not the UUID string.  /user/getUser returns:
-                    #   {"id": 1348043005373399042, "uuid": "5354ad296b...", ...}
-                    _smarthome_num_id = ""
-                    _smarthome_uuid   = _smarthome_uid  # UUID string (same as AiDot id)
-                    try:
-                        async with _ah.ClientSession() as _s2:
-                            async with _s2.post(
-                                f"{_smarthome_base}/user/getUser",
-                                headers=_leedarson_headers,
-                                json={},
-                                timeout=_ah.ClientTimeout(total=8),
-                            ) as _r2:
-                                _gu = await _r2.json(content_type=None)
-                        _gu_data = _gu.get("data") or {}
-                        if isinstance(_gu_data, dict) and _gu_data.get("id"):
-                            _smarthome_num_id = str(_gu_data["id"])  # e.g. "1348043005373399042"
-                        print(f"    smarthome numeric id: {_smarthome_num_id!r}")
-                    except Exception as _e:
-                        print(f"    getUser for numeric id EXCEPTION: {_e}")
-
-                    if _access_token:
-                        _cred_candidates.append((_smarthome_uid, _access_token, "userId+accessToken"))
-                    if _smarthome_num_id and _access_token:
-                        _cred_candidates.append((_smarthome_num_id, _access_token, "numId+accessToken"))
-                        _cred_candidates.append((f"app-{_smarthome_num_id}", _access_token, "app-numId+accessToken"))
-                    if mqtt_user_for_diag and mqtt_pwd_used:
-                        _cred_candidates.append((mqtt_user_for_diag, mqtt_pwd_used, "smarthome_auth"))
-                    if _hdr_token and _hdr_token != _access_token:
-                        _cred_candidates.append((_smarthome_uid, _hdr_token, "userId+httpHeader.token"))
-                    if _terminal_idx:
-                        _cred_candidates.append((_smarthome_uid, _terminal_idx, "userId+terminalIndex"))
-                        if _smarthome_num_id:
-                            _cred_candidates.append((_smarthome_num_id, _terminal_idx, "numId+terminalIndex"))
-                    if _access_token:
-                        _cred_candidates.append((_access_token, _access_token, "accessToken+accessToken"))
-                    if _tid and _access_token:
-                        _cred_candidates.append((f"{_smarthome_uid}@{_tid}", _access_token, "userId@tid+accessToken"))
-                        _cred_candidates.append((f"{_tid}:{_smarthome_uid}", _access_token, "tid:userId+accessToken"))
-                    _app_client_id = f"app-{_smarthome_uid}"
-                    if _access_token:
-                        _cred_candidates.append((_app_client_id, _access_token, "app-userId+accessToken"))
-                    # initPassword (4-char PIN stored in login_info) as MQTT password
-                    if _init_pwd and _access_token:
-                        _cred_candidates.append((_smarthome_uid, _init_pwd, "userId+initPassword"))
-                        if _smarthome_num_id:
-                            _cred_candidates.append((_smarthome_num_id, _init_pwd, "numId+initPassword"))
-                    _cred_candidates.append((_smarthome_uid, "", "userId+empty"))
-                    if _smarthome_num_id:
-                        _cred_candidates.append((_smarthome_num_id, "", "numId+empty"))
-
-                    # WebSocket paths to try — broker may not use /mqtt
-                    _ws_paths = ["/mqtt", "/", "/ws", "/mqtt/"]
-
-                    print(f"    MQTT will try {len(_cred_candidates)} credential combinations")
-                    for _cred_label in [c[2] for c in _cred_candidates]:
-                        print(f"      - {_cred_label}")
+                    # WebSocket path
+                    _ws_paths = ["/mqtt"]
 
                     user_id   = _smarthome_uid
                     seq       = str(_random.randint(100_000, 999_999))
@@ -628,7 +538,7 @@ async def run(args: argparse.Namespace) -> None:
                         "payload": {
                             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                             "deviceId":  cam.get("id"),
-                            "clientId":  f"diag-probe",
+                            "clientId":  (_mqtt_client_id_from_config or f"app-{user_id}"),
                         },
                     })
 
@@ -697,16 +607,7 @@ async def run(args: argparse.Namespace) -> None:
                                 connect_rc_box[0] = None
                                 messages_seen.clear()
                                 done_event.clear()
-                                # Choose MQTT client_id:
-                                # - For mqttClientId+userConfigPwd, use mqttClientId as
-                                #   both CONNECT clientIdentifier and username (as server assigned it)
-                                # - Otherwise use app-userId (per Consciot web-app reverse engineering)
-                                if (_cred_label in ("mqttClientId+userConfigPwd",
-                                                    "userId+userConfigPwd+mqttCid")
-                                        and _mqtt_client_id_from_config):
-                                    _client_id = _mqtt_client_id_from_config
-                                else:
-                                    _client_id = f"app-{_smarthome_uid}"
+                                _client_id = _mqtt_client_id_from_config
 
                                 def _run(_u=_cred_user, _p=_cred_pwd, _cid=_client_id,
                                          _wp=_try_path, _bh=_bhost, _pp=_bport,
