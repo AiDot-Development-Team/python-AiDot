@@ -277,15 +277,16 @@ async def run(args: argparse.Namespace) -> None:
                     device_id = cam.get("id") or ""
                     seq       = str(_random.randint(100_000, 999_999))
 
-                    # Subscribe to userId topics, deviceId topics, and wildcard catch-all
-                    # so we see the response regardless of which topic it arrives on.
+                    # Subscribe to userId and deviceId topic namespaces.
+                    # Do NOT subscribe to bare "#" — AiDot broker ACL will close the
+                    # connection (rc=7 / MQTT_ERR_CONN_LOST) on that subscription.
                     sub_topics = [
                         f"iot/v1/c/{user_id}/#",
                         f"iot/v1/cb/{user_id}/#",
                         f"iot/v1/c/{device_id}/#",
-                        "#",
                     ]
-                    pub_topic = f"iot/v1/s/{device_id}/IPC/connectipc"
+                    # serverV1 commands use userId in the path (not deviceId).
+                    pub_topic = f"iot/v1/s/{user_id}/IPC/connectipc"
 
                     req_body = _json.dumps({
                         "service": "IPC",           # JS uses "IPC", not "IPCAM"
