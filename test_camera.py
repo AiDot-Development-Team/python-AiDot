@@ -313,35 +313,39 @@ async def run(args: argparse.Namespace) -> None:
                             "payload": {"timestamp": "2018-03-14 17:30:00"},
                         })
 
-                        # Subscribe broadly to catch the response wherever the server
-                        # sends it.  clientV1/{userId}/# is the primary candidate (JS
-                        # subscriptions); clientV1/{deviceId}/# catches responses the
-                        # server might route to the device namespace; iot/v1/# is a
-                        # wildcard to diagnose any unexpected routing.
+                        # Known-good subscriptions from SUBACK analysis:
+                        #   mid=1  clientV1/{userId}/#        → OK
+                        #   mid=4  broadcastV1/{deviceId}/#   → OK
+                        # NEW: also subscribe to clientV1/{mqttClientId}/#  — the MQTT
+                        # connection clientId includes the terminal prefix (e.g. "3s1o43-5354ad...")
+                        # and differs from the plain userId.  If the server routes the
+                        # connectipc response based on payload.clientId rather than srcAddr, the
+                        # response would arrive here and we'd have been missing it.
                         _sub_topics = [
                             f"iot/v1/c/{user_id}/#",
-                            f"iot/v1/cb/{user_id}/#",
-                            f"iot/v1/c/{device_id}/#",
                             f"iot/v1/cb/{device_id}/#",
-                            "iot/v1/#",
+                            f"iot/v1/c/{_mqtt_client_id_from_config}/#",
                         ]
 
-                        # Topic candidates in priority order.
-                        # serverV1/{userId}/IPC/connectipc — ACL-allowed, uses userId
-                        #   namespace; server routes to device via payload.deviceId.
-                        # serverV1/{userId}/connectipc — same but without service prefix;
-                        #   some JS methods omit the service segment in the topic.
-                        # serverV1/{deviceId}/IPC/connectipc — kept as probe (expect rc=7).
-                        _pub_topic_candidates = [
-                            f"iot/v1/s/{user_id}/IPC/connectipc",
-                            f"iot/v1/s/{user_id}/connectipc",
-                            f"iot/v1/s/{device_id}/IPC/connectipc",
+                        # Probe matrix: (pub_topic, payload.clientId, label, timeout_s)
+                        # Test three payload.clientId variants on the primary topic to determine
+                        # whether the server routes the response based on this field.
+                        _primary = f"iot/v1/s/{user_id}/IPC/connectipc"
+                        _probe_candidates = [
+                            (_primary, user_id,
+                             "primary+clientId=userId", 30),
+                            (_primary, _mqtt_client_id_from_config,
+                             "primary+clientId=mqttClientId", 20),
+                            (_primary, f"app-{user_id}",
+                             "primary+clientId=app-userId", 20),
+                            (f"iot/v1/s/{device_id}/IPC/connectipc", _mqtt_client_id_from_config,
+                             "deviceId-topic (expect rc=7)", 10),
                         ]
 
                         mqtt_success  = False
                         winning_topic = None
 
-                        for _pub_topic in _pub_topic_candidates:
+                        for _pub_topic, _cid, _label, _tout in _probe_candidates:
                             _seq = str(int(time.time() * 1000))[4:13]
                             _req_body = _json.dumps({
                                 "service": "IPC",
@@ -350,22 +354,21 @@ async def run(args: argparse.Namespace) -> None:
                                 "srcAddr": user_id,
                                 "payload": {
                                     "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                                    # Include both field names — JS uses "devId",
-                                    # mobile SDK may use "deviceId".
                                     "devId":    device_id,
                                     "deviceId": device_id,
                                     "userId":   user_id,
-                                    "clientId": _client_id,
+                                    "clientId": _cid,
                                 },
                             })
                             print(f"\n  [Broker] wss://{_bhost}:{_bport}{_bpath}")
-                            print(f"    [probe] pub_topic={_pub_topic}")
+                            print(f"    [probe] {_label}")
+                            print(f"            pub_topic={_pub_topic}")
                             _connect_rc_box = [None]
                             _messages_seen  = []
                             _done_event     = _threading.Event()
 
                             def _on_connect(c, ud, flags, rc,
-                                            _t=_pub_topic, _rb=_req_body):
+                                            _t=_pub_topic, _rb=_req_body, _to=_tout):
                                 _connect_rc_box[0] = rc
                                 print(f"    MQTT on_connect rc={rc} "
                                       f"({'OK' if rc == 0 else 'FAILED'})")
@@ -416,7 +419,7 @@ async def run(args: argparse.Namespace) -> None:
                                     c.disconnect()
                                     _done_event.set()
 
-                            def _run():
+                            def _run(_tout=_tout):
                                 mqttc = _mqtt.Client(
                                     client_id=_client_id, transport=_bxport)
                                 mqttc.will_set(
@@ -433,7 +436,7 @@ async def run(args: argparse.Namespace) -> None:
                                 try:
                                     mqttc.connect(_bhost, _bport, keepalive=30)
                                     mqttc.loop_start()
-                                    _done_event.wait(timeout=20)
+                                    _done_event.wait(timeout=_tout)
                                 except Exception as e:
                                     print(f"    MQTT connect exception: {e}")
                                 finally:
@@ -464,6 +467,44 @@ async def run(args: argparse.Namespace) -> None:
                         elif not winning_topic:
                             print("\n    MQTT: connected but connectipc got no response "
                                   "on any topic variant")
+
+                # --- HTTP live-stream API probe ---
+                # Cloud playback uses /api/ipc/playbackController/playRecord (HTTP).
+                # A parallel HTTP endpoint may exist for live stream allocation and
+                # could bypass MQTT entirely.
+                import aiohttp as _aiohttp
+                _smarthome_api = f"https://{dc._region}-smarthome.arnoo.com:443"
+                _access_token = dc._user_info.get("accessToken") or ""
+                _http_headers = {
+                    "terminal":        "thirdPlatFormUser",
+                    "active-language": "en_US",
+                    "access-token":    _access_token,
+                    "token":           _access_token,
+                    "appKey":          "appa070",
+                    "Content-Type":    "application/json",
+                }
+                _http_endpoints = [
+                    "/api/ipc/liveController/connectipc",
+                    "/api/ipc/liveController/getLiveServerInfo",
+                    "/api/ipc/liveController/getStreamInfo",
+                    "/api/ipc/liveController/getLiveUrl",
+                    "/api/ipc/liveController/getPreviewUrl",
+                ]
+                print(f"\n[DIAG-HTTP] Probing live stream HTTP endpoints on {_smarthome_api}")
+                async with _aiohttp.ClientSession() as _sess:
+                    for _ep in _http_endpoints:
+                        _url = _smarthome_api + _ep
+                        try:
+                            async with _sess.post(
+                                _url,
+                                json={"deviceId": device_id},
+                                headers=_http_headers,
+                                timeout=_aiohttp.ClientTimeout(total=8),
+                            ) as _r:
+                                _rbody = await _r.json(content_type=None)
+                            print(f"    {_ep}  status={_r.status}  body={str(_rbody)[:300]}")
+                        except Exception as _he:
+                            print(f"    {_ep}  ERROR: {_he}")
 
             if args.live and not args.diag_mqtt:
                 print(f"\n[LIVE] Opening live stream for {cam.get('name', cam.get('id'))} ...")
