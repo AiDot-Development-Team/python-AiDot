@@ -277,140 +277,151 @@ async def run(args: argparse.Namespace) -> None:
                     device_id = cam.get("id") or ""
                     seq       = str(_random.randint(100_000, 999_999))
 
-                    # ACL allows only userId-scoped topics. Subscribing to a deviceId
-                    # namespace (iot/v1/c/{deviceId}/#) triggers rc=7 broker disconnect.
-                    # Responses arrive addressed to the user on iot/v1/c/{userId}/#.
-                    sub_topics = [
-                        f"iot/v1/c/{user_id}/#",
-                        f"iot/v1/cb/{user_id}/#",
-                    ]
-                    # connectipc addresses the specific camera; camera subscribes to
-                    # iot/v1/s/{deviceId}/#, so deviceId belongs in the path.
-                    pub_topic = f"iot/v1/s/{device_id}/IPC/connectipc"
+                    if not _cred_candidates:
+                        print("    Skipping MQTT test — no valid credentials available")
+                    else:
+                        # Broker connection parameters
+                        _parsed = _up.urlparse(mqtt_url)
+                        _bhost  = _parsed.hostname or mqtt_url
+                        _bport  = _parsed.port or 443
+                        _bpath  = _parsed.path or "/mqtt"
+                        _btls   = _parsed.scheme in ("wss", "mqtts")
+                        _bxport = "websockets" if _parsed.scheme in ("wss", "ws") else "tcp"
+                        _cred_user, _cred_pwd = _smarthome_uid, _mqtt_pwd_from_config
+                        _client_id = _mqtt_client_id_from_config
 
-                    req_body = _json.dumps({
-                        "service": "IPC",           # JS uses "IPC", not "IPCAM"
-                        "method":  "connectipc",
-                        "seq":     seq,
-                        "srcAddr": user_id,          # JS: srcAddr = userId (no "0." prefix)
-                        "payload": {
-                            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                            "deviceId":  device_id,
-                            "clientId":  (_mqtt_client_id_from_config or f"app-{user_id}"),
-                        },
-                    })
+                        # LWT mirrors the JS MQTT init() will message
+                        _lwt_topic   = f"iot/v1/cb/{user_id}/user/disconnect"
+                        _lwt_payload = _json.dumps({
+                            "service": "user",
+                            "method":  "disconnect",
+                            "seq":     str(_random.randint(100_000, 999_999)),
+                            "srcAddr": user_id,
+                            "payload": {"timestamp": "2018-03-14 17:30:00"},
+                        })
 
-                    # Build list of MQTT broker URLs to try.
-                    # Primary: whatever getServerUrlConfig returned.
-                    # Also try the regional broker used by the AiDot web app.
-                    _broker_urls = []
-                    if mqtt_url:
-                        _broker_urls.append(mqtt_url)
-                    _regional_mqtt = f"wss://{_lid.get('region') or 'us'}-mqtt.arnoo.com:8443/mqtt"
-                    if _regional_mqtt not in _broker_urls:
-                        _broker_urls.append(_regional_mqtt)
+                        _sub_topics = [
+                            f"iot/v1/c/{user_id}/#",
+                            f"iot/v1/cb/{user_id}/#",
+                        ]
 
-                    # Use first broker URL for initial path/transport/tls params.
-                    _first_parsed = _up.urlparse(_broker_urls[0])
-                    parsed    = _first_parsed
-                    host      = parsed.hostname or _broker_urls[0]
-                    port      = parsed.port or 443
-                    path      = parsed.path or "/mqtt"
-                    use_tls   = parsed.scheme in ("wss", "mqtts")
-                    transport = "websockets" if parsed.scheme in ("wss", "ws") else "tcp"
+                        # Probe each publish-topic variant; stop on first message received.
+                        # clientV1 first — matches JS pattern for all direct IPC device commands.
+                        _pub_topic_candidates = [
+                            f"iot/v1/c/{device_id}/connectipc",
+                            f"iot/v1/s/{device_id}/connectipc",
+                            f"iot/v1/s/{device_id}/IPC/connectipc",
+                        ]
 
-                    done_event    = _threading.Event()
-                    messages_seen = []
-                    connect_rc_box = [None]
+                        mqtt_success  = False
+                        winning_topic = None
 
-                    def _on_connect(c, ud, flags, rc):
-                        connect_rc_box[0] = rc
-                        print(f"    MQTT on_connect rc={rc} ({'OK' if rc == 0 else 'FAILED'})")
-                        if rc == 0:
-                            for _t in sub_topics:
-                                c.subscribe(_t, qos=1)
-                                print(f"    MQTT subscribed to {_t}")
-                            c.publish(pub_topic, req_body, qos=1)
-                            print(f"    MQTT published connectipc to {pub_topic} seq={seq}")
+                        for _pub_topic in _pub_topic_candidates:
+                            _req_body = _json.dumps({
+                                "service": "IPC",
+                                "method":  "connectipc",
+                                "seq":     str(_random.randint(100_000, 999_999)),
+                                "srcAddr": user_id,
+                                "payload": {
+                                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                    "deviceId":  device_id,
+                                    "clientId":  _client_id,
+                                },
+                            })
+                            print(f"\n  [Broker] wss://{_bhost}:{_bport}{_bpath}")
+                            print(f"    [probe] pub_topic={_pub_topic}")
+                            _connect_rc_box = [None]
+                            _messages_seen  = []
+                            _done_event     = _threading.Event()
 
-                    def _on_message(c, ud, msg):
-                        try:
-                            payload_str = msg.payload.decode("utf-8")
-                        except Exception:
-                            payload_str = repr(msg.payload[:200])
-                        messages_seen.append((msg.topic, payload_str))
-                        print(f"    MQTT <<< topic={msg.topic}")
-                        print(f"           payload={payload_str[:300]}")
+                            def _on_connect(c, ud, flags, rc,
+                                            _t=_pub_topic, _rb=_req_body):
+                                _connect_rc_box[0] = rc
+                                print(f"    MQTT on_connect rc={rc} "
+                                      f"({'OK' if rc == 0 else 'FAILED'})")
+                                if rc == 0:
+                                    for _st in _sub_topics:
+                                        c.subscribe(_st, qos=1)
+                                        print(f"    MQTT subscribed to {_st}")
+                                    # User presence announcement (mirrors JS init behavior)
+                                    c.publish(
+                                        f"iot/v1/cb/{user_id}/user/connect",
+                                        _json.dumps({
+                                            "service": "user",
+                                            "method":  "connect",
+                                            "seq":     str(_random.randint(100_000, 999_999)),
+                                            "srcAddr": user_id,
+                                            "payload": {
+                                                "timestamp": time.strftime(
+                                                    "%Y-%m-%d %H:%M:%S"),
+                                            },
+                                        }),
+                                        qos=1,
+                                    )
+                                    print("    MQTT published user/connect announcement")
+                                    c.publish(_t, _rb, qos=1)
+                                    print(f"    MQTT published connectipc to {_t}")
 
-                    def _on_disconnect(c, ud, rc):
-                        print(f"    MQTT disconnected rc={rc}")
+                            def _on_message(c, ud, msg):
+                                try:
+                                    _ps = msg.payload.decode("utf-8")
+                                except Exception:
+                                    _ps = repr(msg.payload[:200])
+                                _messages_seen.append((msg.topic, _ps))
+                                print(f"    MQTT <<< topic={msg.topic}")
+                                print(f"           payload={_ps[:300]}")
+                                _done_event.set()
 
-                    mqtt_success = False
-                    for _broker_url in _broker_urls:
-                        _bp = _up.urlparse(_broker_url)
-                        _bhost   = _bp.hostname or _broker_url
-                        _bport   = _bp.port or 443
-                        _bpath   = _bp.path or "/mqtt"
-                        _btls    = _bp.scheme in ("wss", "mqtts")
-                        _bxport  = "websockets" if _bp.scheme in ("wss", "ws") else "tcp"
-                        print(f"\n  [Broker] {_broker_url}")
+                            def _on_disconnect(c, ud, rc):
+                                print(f"    MQTT disconnected rc={rc}")
 
-                        for _cred_user, _cred_pwd, _cred_label in _cred_candidates:
-                            # For the first credential combo, also try all WS paths.
-                            _paths_to_try = _ws_paths if _cred_label == _cred_candidates[0][2] else [_bpath]
-                            for _try_path in _paths_to_try:
-                                _path_label = f" path={_try_path}" if _try_path != _bpath else ""
-                                print(f"\n    [MQTT attempt] {_cred_label}{_path_label}  user={_cred_user[:20]}...")
-                                connect_rc_box[0] = None
-                                messages_seen.clear()
-                                done_event.clear()
-                                _client_id = _mqtt_client_id_from_config
-
-                                def _run(_u=_cred_user, _p=_cred_pwd, _cid=_client_id,
-                                         _wp=_try_path, _bh=_bhost, _pp=_bport,
-                                         _tls=_btls, _tr=_bxport):
-                                    mqttc = _mqtt.Client(client_id=_cid, transport=_tr)
-                                    if _tls:
-                                        mqttc.tls_set(cert_reqs=_ssl.CERT_REQUIRED)
-                                    if _tr == "websockets":
-                                        mqttc.ws_set_options(path=_wp)
-                                    mqttc.username_pw_set(_u, _p)
-                                    mqttc.on_connect    = _on_connect
-                                    mqttc.on_message    = _on_message
-                                    mqttc.on_disconnect = _on_disconnect
+                            def _run():
+                                mqttc = _mqtt.Client(
+                                    client_id=_client_id, transport=_bxport)
+                                mqttc.will_set(
+                                    _lwt_topic, _lwt_payload, qos=1, retain=False)
+                                if _btls:
+                                    mqttc.tls_set(cert_reqs=_ssl.CERT_REQUIRED)
+                                if _bxport == "websockets":
+                                    mqttc.ws_set_options(path=_bpath)
+                                mqttc.username_pw_set(_cred_user, _cred_pwd)
+                                mqttc.on_connect    = _on_connect
+                                mqttc.on_message    = _on_message
+                                mqttc.on_disconnect = _on_disconnect
+                                try:
+                                    mqttc.connect(_bhost, _bport, keepalive=30)
+                                    mqttc.loop_start()
+                                    _done_event.wait(timeout=20)
+                                except Exception as e:
+                                    print(f"    MQTT connect exception: {e}")
+                                finally:
+                                    mqttc.loop_stop()
                                     try:
-                                        mqttc.connect(_bh, _pp, keepalive=30)
-                                        mqttc.loop_start()
-                                        done_event.wait(timeout=8)
-                                    except Exception as e:
-                                        print(f"    MQTT connect exception: {e}")
-                                    finally:
-                                        mqttc.loop_stop()
-                                        try:
-                                            mqttc.disconnect()
-                                        except Exception:
-                                            pass
+                                        mqttc.disconnect()
+                                    except Exception:
+                                        pass
 
-                                await asyncio.get_event_loop().run_in_executor(None, _run)
+                            await asyncio.get_event_loop().run_in_executor(
+                                None, _run)
 
-                                if connect_rc_box[0] == 0:
-                                    print(f"    *** MQTT CONNECTED with {_cred_label}{_path_label} ***")
-                                    mqtt_success = True
-                                    if messages_seen:
-                                        print(f"    MQTT: {len(messages_seen)} message(s) received")
-                                    else:
-                                        print("    MQTT: connected but no response to connectipc within 8s")
+                            if _connect_rc_box[0] == 0:
+                                mqtt_success = True
+                                if _messages_seen:
+                                    winning_topic = _pub_topic
+                                    print(f"\n    *** connectipc RESPONSE received ***")
+                                    print(f"    Winning pub_topic: {_pub_topic}")
                                     break
                                 else:
-                                    print(f"    rc={connect_rc_box[0]} -> skip")
+                                    print(f"    no response within 20s — next candidate")
+                            else:
+                                print(f"    connection failed rc={_connect_rc_box[0]}")
+                                break  # Credentials broken; no point probing other topics
 
-                            if mqtt_success:
-                                break
-                        if mqtt_success:
-                            break
-
-                    if not mqtt_success:
-                        print("\n    MQTT: all credential combinations failed (rc=4 or rc=5)")
+                        if not mqtt_success:
+                            print("\n    MQTT: connection failed — check credentials")
+                        elif not winning_topic:
+                            print("\n    MQTT: connected but connectipc got no response "
+                                  "on any topic variant")
 
             if args.live and not args.diag_mqtt:
                 print(f"\n[LIVE] Opening live stream for {cam.get('name', cam.get('id'))} ...")
