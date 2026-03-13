@@ -300,17 +300,20 @@ async def run(args: argparse.Namespace) -> None:
                             "payload": {"timestamp": "2018-03-14 17:30:00"},
                         })
 
+                        # iot/v1/c/{userId}/#   — confirmed ACL-allowed; response arrives here
+                        # iot/v1/cb/{userId}/#  — confirmed ACL-allowed; device broadcasts
+                        # iot/v1/cb/{deviceId}/# — JS subscribes to broadcastV1/{devId}/...
+                        #                          topics; response may arrive here
                         _sub_topics = [
                             f"iot/v1/c/{user_id}/#",
                             f"iot/v1/cb/{user_id}/#",
+                            f"iot/v1/cb/{device_id}/#",
                         ]
 
-                        # Probe each publish-topic variant; stop on first message received.
-                        # clientV1 first — matches JS pattern for all direct IPC device commands.
+                        # Only iot/v1/c/{deviceId}/connectipc is ACL-allowed for publish.
+                        # serverV1/{deviceId} publish causes rc=7 (broker ACL violation).
                         _pub_topic_candidates = [
                             f"iot/v1/c/{device_id}/connectipc",
-                            f"iot/v1/s/{device_id}/connectipc",
-                            f"iot/v1/s/{device_id}/IPC/connectipc",
                         ]
 
                         mqtt_success  = False
@@ -374,6 +377,11 @@ async def run(args: argparse.Namespace) -> None:
 
                             def _on_disconnect(c, ud, rc):
                                 print(f"    MQTT disconnected rc={rc}")
+                                if rc != 0:
+                                    # Stop paho's auto-reconnect loop on non-clean disconnect
+                                    # (e.g. rc=7 = broker ACL violation on publish).
+                                    c.disconnect()
+                                    _done_event.set()
 
                             def _run():
                                 mqttc = _mqtt.Client(
