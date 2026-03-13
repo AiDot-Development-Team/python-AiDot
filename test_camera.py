@@ -239,6 +239,15 @@ async def run(args: argparse.Namespace) -> None:
                         print(f"    {k!r}: {v!r}")
 
                 _lid = dc._user_info
+
+                # --- P2P UID probe ---
+                print(f"\n[DIAG] Fetching P2P UID for {cam.get('id')} ...")
+                _p2p_uid = await dc.async_get_p2p_uid()
+                if _p2p_uid:
+                    print(f"    P2P UID: {_p2p_uid!r}  (TUTK/LiveAndPlayBack path available)")
+                else:
+                    print(f"    P2P UID: None  (P2P not available; relay/connectipc path needed)")
+
                 mqtt_url = await dc._async_get_mqtt_url()
                 print(f"[DIAG] MQTT broker URL: {mqtt_url!r}")
 
