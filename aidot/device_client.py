@@ -278,7 +278,7 @@ async def _mqtt_get_playback_server_info(
     mqtt_password: str,
     dev_id: str,
     client_id: str,
-    timeout: float = 15.0,
+    timeout: float = 60.0,
 ) -> Optional[dict]:
     # Publish getPlaybackServerInfoReq over MQTT-over-WSS and return the
     # response payload dict, or None on timeout/error.
@@ -299,8 +299,11 @@ async def _mqtt_get_playback_server_info(
     # Publish to serverV1/{user_id}/IPC/... — users can publish to their own
     # serverV1/{userId} namespace; the server routes to the device via payload.deviceId.
     # (Publishing to serverV1/{deviceId} triggers broker ACL violation.)
-    pub_topic = f"iot/v1/s/{user_id}/IPC/getPlaybackServerInfoReq"
-    sub_topic = f"iot/v1/c/{user_id}/#"
+    pub_topic  = f"iot/v1/s/{user_id}/IPC/getPlaybackServerInfoReq"
+    sub_topics = [
+        (f"iot/v1/c/{user_id}/#",  1),
+        (f"iot/v1/cb/{dev_id}/#",  1),
+    ]
 
     request_body = json.dumps({
         "service": "IPC",
@@ -329,17 +332,19 @@ async def _mqtt_get_playback_server_info(
             _LOGGER.warning("MQTT broker rejected connection rc=%d", rc)
             result_event.set()
             return
-        client.subscribe(sub_topic, qos=1)
+        for _topic, _qos in sub_topics:
+            client.subscribe(_topic, qos=_qos)
         client.publish(pub_topic, request_body, qos=1)
 
     def on_message(client, userdata, msg):
         try:
             body = json.loads(msg.payload.decode("utf-8"))
-            if str(body.get("seq")) == seq:
-                pld = body.get("payload")
-                if pld and pld.get("serverIP"):
-                    result_box[0] = pld
-                    result_event.set()
+            pld  = body.get("payload") or {}
+            if not pld.get("serverIP"):
+                return
+            if str(body.get("seq")) == seq or result_box[0] is None:
+                result_box[0] = pld
+                result_event.set()
         except Exception:
             pass
 
@@ -429,13 +434,16 @@ async def _mqtt_get_live_server_info(
     mqtt_password: str,
     dev_id: str,
     client_id: str,
-    timeout: float = 15.0,
+    timeout: float = 60.0,
 ) -> Optional[dict]:
     # Publish connectipc over MQTT-over-WSS and return the response payload dict,
     # or None on timeout/error.
     # Expected response payload fields:
     #   serverIP, serverPort, sessionId, aesKey, heartbeat, tls
     # Requires: pip install paho-mqtt
+    #
+    # Timeout is 60 s by default: battery cameras may be sleeping and need
+    # ~20-30 s to wake up before the relay server can allocate an endpoint.
     try:
         import paho.mqtt.client as mqtt
     except ImportError as exc:
@@ -452,8 +460,15 @@ async def _mqtt_get_live_server_info(
     # Publish to serverV1/{user_id}/IPC/... — users can publish to their own
     # serverV1/{userId} namespace; the server routes to the device via payload.deviceId.
     # (Publishing to serverV1/{deviceId} triggers broker ACL violation.)
-    pub_topic = f"iot/v1/s/{user_id}/IPC/connectipc"
-    sub_topic = f"iot/v1/c/{user_id}/#"
+    pub_topic  = f"iot/v1/s/{user_id}/IPC/connectipc"
+    # Subscribe to both the user's response channel and the device broadcast channel.
+    # The connectipc response arrives on clientV1/{userId}/#; the device broadcast
+    # channel (broadcastV1/{deviceId}/#) delivers wakeupStatus events so the broker
+    # keeps the session alive while the sleeping battery camera boots up.
+    sub_topics = [
+        (f"iot/v1/c/{user_id}/#",  1),
+        (f"iot/v1/cb/{dev_id}/#",  1),
+    ]
 
     request_body = json.dumps({
         "service": "IPC",
@@ -482,17 +497,23 @@ async def _mqtt_get_live_server_info(
             _LOGGER.warning("MQTT (connectipc) broker rejected connection rc=%d", rc)
             result_event.set()
             return
-        client.subscribe(sub_topic, qos=1)
+        for _topic, _qos in sub_topics:
+            client.subscribe(_topic, qos=_qos)
         client.publish(pub_topic, request_body, qos=1)
 
     def on_message(client, userdata, msg):
         try:
             body = json.loads(msg.payload.decode("utf-8"))
-            if str(body.get("seq")) == seq:
-                pld = body.get("payload")
-                if pld and pld.get("serverIP"):
-                    result_box[0] = pld
-                    result_event.set()
+            pld  = body.get("payload") or {}
+            if not pld.get("serverIP"):
+                # Not a connectipc response (e.g. wakeupStatus, devActionResp).
+                # Keep waiting — the relay will respond after the camera is awake.
+                return
+            # Accept if the server echoed back our seq, or as a fallback accept
+            # any message with serverIP (the server may not always echo the seq).
+            if str(body.get("seq")) == seq or result_box[0] is None:
+                result_box[0] = pld
+                result_event.set()
         except Exception:
             pass
 

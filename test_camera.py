@@ -333,11 +333,11 @@ async def run(args: argparse.Namespace) -> None:
                         _primary = f"iot/v1/s/{user_id}/IPC/connectipc"
                         _probe_candidates = [
                             (_primary, user_id,
-                             "primary+clientId=userId", 30),
+                             "primary+clientId=userId", 60),
                             (_primary, _mqtt_client_id_from_config,
-                             "primary+clientId=mqttClientId", 20),
+                             "primary+clientId=mqttClientId", 60),
                             (_primary, f"app-{user_id}",
-                             "primary+clientId=app-userId", 20),
+                             "primary+clientId=app-userId", 30),
                             (f"iot/v1/s/{device_id}/IPC/connectipc", _mqtt_client_id_from_config,
                              "deviceId-topic (expect rc=7)", 10),
                         ]
@@ -406,10 +406,23 @@ async def run(args: argparse.Namespace) -> None:
                                     _ps = msg.payload.decode("utf-8")
                                 except Exception:
                                     _ps = repr(msg.payload[:200])
-                                _messages_seen.append((msg.topic, _ps))
                                 print(f"    MQTT <<< topic={msg.topic}")
                                 print(f"           payload={_ps[:300]}")
-                                _done_event.set()
+                                # Only treat as a successful connectipc response if
+                                # the payload actually contains serverIP — a wakeupStatus
+                                # or devActionResp message means the camera woke up but
+                                # the relay hasn't responded yet; keep waiting.
+                                _is_connectipc = False
+                                try:
+                                    _body = _json.loads(_ps)
+                                    _pld  = _body.get("payload") or {}
+                                    if _pld.get("serverIP") or _pld.get("serverPort"):
+                                        _is_connectipc = True
+                                except Exception:
+                                    pass
+                                _messages_seen.append((msg.topic, _ps, _is_connectipc))
+                                if _is_connectipc:
+                                    _done_event.set()
 
                             def _on_disconnect(c, ud, rc):
                                 print(f"    MQTT disconnected rc={rc}")
@@ -451,13 +464,22 @@ async def run(args: argparse.Namespace) -> None:
 
                             if _connect_rc_box[0] == 0:
                                 mqtt_success = True
-                                if _messages_seen:
+                                _got_real_response = any(
+                                    _is_ipc
+                                    for (_, _, _is_ipc) in _messages_seen
+                                )
+                                if _got_real_response:
                                     winning_topic = _pub_topic
                                     print(f"\n    *** connectipc RESPONSE received ***")
                                     print(f"    Winning pub_topic: {_pub_topic}")
                                     break
+                                elif _messages_seen:
+                                    print(f"    received {len(_messages_seen)} non-connectipc "
+                                          f"message(s) (wakeupStatus/devActionResp) — "
+                                          f"camera woke up but relay not yet ready; "
+                                          f"next candidate")
                                 else:
-                                    print(f"    no response within 20s — next candidate")
+                                    print(f"    no response within {_tout}s — next candidate")
                             else:
                                 print(f"    connection failed rc={_connect_rc_box[0]}")
                                 break  # Credentials broken; no point probing other topics
