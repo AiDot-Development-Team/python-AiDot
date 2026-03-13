@@ -288,11 +288,11 @@ async def run(args: argparse.Namespace) -> None:
                         _btls   = _parsed.scheme in ("wss", "mqtts")
                         _bxport = "websockets" if _parsed.scheme in ("wss", "ws") else "tcp"
                         _cred_user, _cred_pwd = _smarthome_uid, _mqtt_pwd_from_config
-                        # JS always uses "app-" + userId as the MQTT clientId.
-                        # The broker ACL grants serverV1/{deviceId} publish rights to
-                        # this format; the server-assigned mqttClientId does not have
-                        # that permission, which caused rc=7 in earlier tests.
-                        _client_id = f"app-{_smarthome_uid}"
+                        # Use the server-assigned clientId (broker requires this format).
+                        # The JS bundle uses "app-{userId}" but connects to an internal
+                        # dev broker (192.168.6.116), not global-us-mqtt.arnoo.com.
+                        # On the production broker "app-" causes rc=4 (bad credentials).
+                        _client_id = _mqtt_client_id_from_config
 
                         # LWT mirrors the JS MQTT init() will message
                         _lwt_topic   = f"iot/v1/cb/{user_id}/user/disconnect"
@@ -304,21 +304,23 @@ async def run(args: argparse.Namespace) -> None:
                             "payload": {"timestamp": "2018-03-14 17:30:00"},
                         })
 
-                        # JS subscribes clientV1/{userId}/# on connect.
-                        # Also subscribe broadcastV1/{userId}/# and broadcastV1/{deviceId}/#
-                        # since the JS subscribes broadcastV1/{devId}/# when viewing a device.
+                        # Subscribe to user's own clientV1 and broadcastV1 namespaces.
+                        # Server routes the connectipc response to clientV1/{userId}/#.
+                        # Omit broadcastV1/{deviceId}/# — may cause rc=7 with the
+                        # server-assigned clientId on the production broker.
                         _sub_topics = [
                             f"iot/v1/c/{user_id}/#",
                             f"iot/v1/cb/{user_id}/#",
-                            f"iot/v1/cb/{device_id}/#",
                         ]
 
-                        # Primary: serverV1/{deviceId}/IPC/connectipc — production path,
-                        # now expected to work with the corrected "app-" clientId.
-                        # Fallback: clientV1/{deviceId}/connectipc — direct device inbox.
+                        # Primary: serverV1/{userId}/IPC/connectipc — users can publish
+                        # to their own serverV1/{userId}/... namespace; server routes to
+                        # the device via payload.deviceId (matches all other JS server-
+                        # routed commands: OTA, automation, security, scene).
+                        # Fallback: serverV1/{deviceId}/IPC/connectipc — kept as probe.
                         _pub_topic_candidates = [
+                            f"iot/v1/s/{user_id}/IPC/connectipc",
                             f"iot/v1/s/{device_id}/IPC/connectipc",
-                            f"iot/v1/c/{device_id}/connectipc",
                         ]
 
                         mqtt_success  = False

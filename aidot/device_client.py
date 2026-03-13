@@ -295,11 +295,11 @@ async def _mqtt_get_playback_server_info(
     import threading
     import urllib.parse
 
-    # JS production code always uses "app-" + userId as the MQTT clientId.
-    mqtt_client_id = f"app-{user_id}"
-
     seq       = str(int(time.time() * 1000))[4:13]   # 9-digit JS-matching format
-    pub_topic = f"iot/v1/s/{dev_id}/IPC/getPlaybackServerInfoReq"
+    # Publish to serverV1/{user_id}/IPC/... — users can publish to their own
+    # serverV1/{userId} namespace; the server routes to the device via payload.deviceId.
+    # (Publishing to serverV1/{deviceId} triggers broker ACL violation.)
+    pub_topic = f"iot/v1/s/{user_id}/IPC/getPlaybackServerInfoReq"
     sub_topic = f"iot/v1/c/{user_id}/#"
 
     request_body = json.dumps({
@@ -310,7 +310,7 @@ async def _mqtt_get_playback_server_info(
         "payload": {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "deviceId":  dev_id,
-            "clientId":  mqtt_client_id,
+            "clientId":  client_id,
         },
     })
 
@@ -344,7 +344,7 @@ async def _mqtt_get_playback_server_info(
             pass
 
     def _run_mqtt():
-        mqttc = mqtt.Client(client_id=mqtt_client_id, transport=transport)
+        mqttc = mqtt.Client(client_id=client_id, transport=transport)
         if use_tls:
             mqttc.tls_set(cert_reqs=ssl.CERT_REQUIRED)
         if transport == "websockets":
@@ -448,12 +448,11 @@ async def _mqtt_get_live_server_info(
     import threading
     import urllib.parse
 
-    # JS production code always uses "app-" + userId as the MQTT clientId.
-    # The broker ACL ties serverV1/{deviceId} publish permission to this format.
-    mqtt_client_id = f"app-{user_id}"
-
     seq       = str(int(time.time() * 1000))[4:13]   # 9-digit JS-matching format
-    pub_topic = f"iot/v1/s/{dev_id}/IPC/connectipc"
+    # Publish to serverV1/{user_id}/IPC/... — users can publish to their own
+    # serverV1/{userId} namespace; the server routes to the device via payload.deviceId.
+    # (Publishing to serverV1/{deviceId} triggers broker ACL violation.)
+    pub_topic = f"iot/v1/s/{user_id}/IPC/connectipc"
     sub_topic = f"iot/v1/c/{user_id}/#"
 
     request_body = json.dumps({
@@ -464,7 +463,7 @@ async def _mqtt_get_live_server_info(
         "payload": {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "deviceId":  dev_id,
-            "clientId":  mqtt_client_id,
+            "clientId":  client_id,
         },
     })
 
@@ -498,7 +497,7 @@ async def _mqtt_get_live_server_info(
             pass
 
     def _run_mqtt():
-        mqttc = mqtt.Client(client_id=mqtt_client_id, transport=transport)
+        mqttc = mqtt.Client(client_id=client_id, transport=transport)
         if use_tls:
             mqttc.tls_set(cert_reqs=ssl.CERT_REQUIRED)
         if transport == "websockets":
@@ -1479,7 +1478,7 @@ class DeviceClient(object):
         smarthome_auth = await self._async_get_smarthome_auth()
         mqtt_user = (smarthome_auth or {}).get("mqttUser") or str(self.user_id)
         mqtt_pwd  = (smarthome_auth or {}).get("mqttPassword") or ""
-        client_id = f"app-{mqtt_user}"
+        client_id = (self._user_info.get("mqttClientId") or f"app-{mqtt_user}")
 
         # Step 1 - MQTT
         mqtt_url = await self._async_get_mqtt_url()
@@ -1592,7 +1591,7 @@ class DeviceClient(object):
         smarthome_auth = await self._async_get_smarthome_auth()
         mqtt_user = (smarthome_auth or {}).get("mqttUser") or str(self.user_id)
         mqtt_pwd  = (smarthome_auth or {}).get("mqttPassword") or ""
-        client_id = f"app-{mqtt_user}"
+        client_id = (self._user_info.get("mqttClientId") or f"app-{mqtt_user}")
 
         # Step 1 -- MQTT connectipc
         mqtt_url = await self._async_get_mqtt_url()
