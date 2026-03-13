@@ -296,9 +296,8 @@ async def _mqtt_get_playback_server_info(
     import urllib.parse
 
     seq              = str(random.randint(100_000, 999_999))
-    pub_topic        = f"iot/v1/s/{dev_id}/IPC/getPlaybackServerInfoReq"
-    sub_topic        = f"iot/v1/c/{user_id}/#"
-    sub_topic_device = f"iot/v1/c/{dev_id}/#"
+    pub_topic = f"iot/v1/s/{dev_id}/IPC/getPlaybackServerInfoReq"
+    sub_topic = f"iot/v1/c/{user_id}/#"
 
     request_body = json.dumps({
         "service": "IPC",
@@ -328,7 +327,6 @@ async def _mqtt_get_playback_server_info(
             result_event.set()
             return
         client.subscribe(sub_topic, qos=1)
-        client.subscribe(sub_topic_device, qos=1)
         client.publish(pub_topic, request_body, qos=1)
 
     def on_message(client, userdata, msg):
@@ -448,9 +446,8 @@ async def _mqtt_get_live_server_info(
     import urllib.parse
 
     seq              = str(random.randint(100_000, 999_999))
-    pub_topic        = f"iot/v1/s/{dev_id}/IPC/connectipc"
-    sub_topic        = f"iot/v1/c/{user_id}/#"
-    sub_topic_device = f"iot/v1/c/{dev_id}/#"
+    pub_topic = f"iot/v1/s/{dev_id}/IPC/connectipc"
+    sub_topic = f"iot/v1/c/{user_id}/#"
 
     request_body = json.dumps({
         "service": "IPC",
@@ -480,7 +477,6 @@ async def _mqtt_get_live_server_info(
             result_event.set()
             return
         client.subscribe(sub_topic, qos=1)
-        client.subscribe(sub_topic_device, qos=1)
         client.publish(pub_topic, request_body, qos=1)
 
     def on_message(client, userdata, msg):

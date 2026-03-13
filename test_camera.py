@@ -277,13 +277,12 @@ async def run(args: argparse.Namespace) -> None:
                     device_id = cam.get("id") or ""
                     seq       = str(_random.randint(100_000, 999_999))
 
-                    # Subscribe to userId and deviceId topic namespaces.
-                    # Do NOT subscribe to bare "#" — AiDot broker ACL will close the
-                    # connection (rc=7 / MQTT_ERR_CONN_LOST) on that subscription.
+                    # ACL allows only userId-scoped topics. Subscribing to a deviceId
+                    # namespace (iot/v1/c/{deviceId}/#) triggers rc=7 broker disconnect.
+                    # Responses arrive addressed to the user on iot/v1/c/{userId}/#.
                     sub_topics = [
                         f"iot/v1/c/{user_id}/#",
                         f"iot/v1/cb/{user_id}/#",
-                        f"iot/v1/c/{device_id}/#",
                     ]
                     # connectipc addresses the specific camera; camera subscribes to
                     # iot/v1/s/{deviceId}/#, so deviceId belongs in the path.
