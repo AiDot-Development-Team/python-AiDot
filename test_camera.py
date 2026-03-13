@@ -324,6 +324,9 @@ async def run(args: argparse.Namespace) -> None:
                         _sub_topics = [
                             f"iot/v1/c/{user_id}/#",
                             f"iot/v1/cb/{device_id}/#",
+                            # Probe: may be REJECTED, but relay might send
+                            # connectipc response here (camera's client channel)
+                            f"iot/v1/c/{device_id}/#",
                             f"iot/v1/c/{_mqtt_client_id_from_config}/#",
                         ]
 
@@ -401,13 +404,14 @@ async def run(args: argparse.Namespace) -> None:
                                     _ok = "OK" if q != 128 else "REJECTED(128)"
                                     print(f"    MQTT sub_ack mid={mid} qos={q} [{_ok}]")
 
-                            def _on_message(c, ud, msg):
+                            def _on_message(c, ud, msg,
+                                            _t=_pub_topic, _rb=_req_body):
                                 try:
                                     _ps = msg.payload.decode("utf-8")
                                 except Exception:
                                     _ps = repr(msg.payload[:200])
                                 print(f"    MQTT <<< topic={msg.topic}")
-                                print(f"           payload={_ps[:300]}")
+                                print(f"           payload={_ps[:800]}")
                                 # Only treat as a successful connectipc response if
                                 # the payload actually contains serverIP — a wakeupStatus
                                 # or devActionResp message means the camera woke up but
@@ -423,6 +427,40 @@ async def run(args: argparse.Namespace) -> None:
                                 _messages_seen.append((msg.topic, _ps, _is_connectipc))
                                 if _is_connectipc:
                                     _done_event.set()
+                                    return
+                                # Two-phase keepAlive handshake for battery cameras:
+                                # (a) sleep_status_changed wakeup  → resend connectipc
+                                # (b) disKeepAliveState            → send keepAlive
+                                #                                    heartbeat, then
+                                #                                    resend connectipc
+                                try:
+                                    _m2  = _json.loads(_ps)
+                                    _mth = _m2.get("method", "")
+                                    _pl2 = _m2.get("payload") or {}
+                                    if (_mth == "devEventNotif"
+                                            and _pl2.get("event") == "sleep_status_changed"
+                                            and "wakeup" in (_pl2.get("arguments") or [])):
+                                        print(f"    [WAKE] Camera woke up — "
+                                              f"republishing connectipc")
+                                        c.publish(_t, _rb, qos=1)
+                                    if _mth == "disKeepAliveState":
+                                        _ka_topic   = _m2.get("serverPubTopic")
+                                        _ka_payload = _m2.get("serverPubPayload")
+                                        if _ka_topic and _ka_payload:
+                                            print(f"    [KEEP-ALIVE] Publishing heartbeat "
+                                                  f"to {_ka_topic}")
+                                            c.publish(
+                                                _ka_topic,
+                                                _ka_payload
+                                                if isinstance(_ka_payload, (bytes, str))
+                                                else _json.dumps(_ka_payload),
+                                                qos=1,
+                                            )
+                                        print(f"    [KEEP-ALIVE] Republishing connectipc "
+                                              f"after disKeepAliveState")
+                                        c.publish(_t, _rb, qos=1)
+                                except Exception:
+                                    pass
 
                             def _on_disconnect(c, ud, rc):
                                 print(f"    MQTT disconnected rc={rc}")

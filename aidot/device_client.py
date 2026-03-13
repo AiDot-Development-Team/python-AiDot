@@ -338,8 +338,32 @@ async def _mqtt_get_playback_server_info(
 
     def on_message(client, userdata, msg):
         try:
-            body = json.loads(msg.payload.decode("utf-8"))
-            pld  = body.get("payload") or {}
+            body   = json.loads(msg.payload.decode("utf-8"))
+            method = body.get("method", "")
+            pld    = body.get("payload") or {}
+
+            # Phase 1a: battery camera woke up → resend request immediately.
+            if (method == "devEventNotif"
+                    and pld.get("event") == "sleep_status_changed"
+                    and "wakeup" in (pld.get("arguments") or [])):
+                client.publish(pub_topic, request_body, qos=1)
+                return
+
+            # Phase 1b: disKeepAliveState → send keepAlive heartbeat, resend.
+            if method == "disKeepAliveState":
+                ka_topic   = body.get("serverPubTopic")
+                ka_payload = body.get("serverPubPayload")
+                if ka_topic and ka_payload:
+                    client.publish(
+                        ka_topic,
+                        ka_payload if isinstance(ka_payload, (bytes, str))
+                        else json.dumps(ka_payload),
+                        qos=1,
+                    )
+                client.publish(pub_topic, request_body, qos=1)
+                return
+
+            # Phase 2: actual response with relay endpoint.
             if not pld.get("serverIP"):
                 return
             if str(body.get("seq")) == seq or result_box[0] is None:
@@ -503,11 +527,35 @@ async def _mqtt_get_live_server_info(
 
     def on_message(client, userdata, msg):
         try:
-            body = json.loads(msg.payload.decode("utf-8"))
-            pld  = body.get("payload") or {}
+            body   = json.loads(msg.payload.decode("utf-8"))
+            method = body.get("method", "")
+            pld    = body.get("payload") or {}
+
+            # Phase 1a: battery camera just woke up → resend connectipc so the
+            # relay sees an active request now that the camera is reachable.
+            if (method == "devEventNotif"
+                    and pld.get("event") == "sleep_status_changed"
+                    and "wakeup" in (pld.get("arguments") or [])):
+                client.publish(pub_topic, request_body, qos=1)
+                return
+
+            # Phase 1b: camera sent disKeepAliveState — it expects a keepAlive
+            # heartbeat back, then a fresh connectipc to complete relay setup.
+            if method == "disKeepAliveState":
+                ka_topic   = body.get("serverPubTopic")
+                ka_payload = body.get("serverPubPayload")
+                if ka_topic and ka_payload:
+                    client.publish(
+                        ka_topic,
+                        ka_payload if isinstance(ka_payload, (bytes, str))
+                        else json.dumps(ka_payload),
+                        qos=1,
+                    )
+                client.publish(pub_topic, request_body, qos=1)
+                return
+
+            # Phase 2: actual connectipc response with relay endpoint.
             if not pld.get("serverIP"):
-                # Not a connectipc response (e.g. wakeupStatus, devActionResp).
-                # Keep waiting — the relay will respond after the camera is awake.
                 return
             # Accept if the server echoed back our seq, or as a fallback accept
             # any message with serverIP (the server may not always echo the seq).
