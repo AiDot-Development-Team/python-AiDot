@@ -1498,17 +1498,25 @@ class DeviceClient(object):
             # Store the raw response so callers can inspect it for diagnostics.
             self._last_batch_response = body
 
-            if body.get("data"):
-                _LOGGER.debug("batchGetDeviceUserInfo response for %s (status=%d): %s",
-                              self.device_id, status, body)
+            # Server may return a bare JSON array OR {"data": [...]} / {"data": {}}
+            if isinstance(body, list):
+                data = body
+                _LOGGER.debug("batchGetDeviceUserInfo bare-list response for %s: %d items",
+                              self.device_id, len(data))
+            elif isinstance(body, dict):
+                data = body.get("data") or {}
+                if data:
+                    _LOGGER.debug("batchGetDeviceUserInfo response for %s (status=%d): %s",
+                                  self.device_id, status, body)
+                else:
+                    _LOGGER.warning(
+                        "batchGetDeviceUserInfo no data for %s (status=%d): %s",
+                        self.device_id, status, body,
+                    )
             else:
-                _LOGGER.warning(
-                    "batchGetDeviceUserInfo returned no data for %s (status=%d): %s",
-                    self.device_id, status, body,
-                )
+                data = {}
 
-            data = body.get("data") or {}
-            # Response is typically {"data": {"<deviceId>": {...}}} or a list.
+            # Find the entry for this device
             if isinstance(data, dict):
                 return data.get(self.device_id) or next(iter(data.values()), None)
             if isinstance(data, list):

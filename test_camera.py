@@ -259,10 +259,14 @@ async def run(args: argparse.Namespace) -> None:
                     all_device_ids=_all_camera_ids)
                 _raw_batch = getattr(dc, '_last_batch_response', None)
                 if _dev_user_info:
-                    print(f"    batchGetDeviceUserInfo for {cam.get('id')} (all fields):")
+                    _p2p = (_dev_user_info.get("p2pId") or _dev_user_info.get("uid")
+                            or _dev_user_info.get("tutk_uid"))
+                    print(f"    batchGetDeviceUserInfo data for {cam.get('id')}:")
                     print(f"    {_dui_json.dumps(_dev_user_info, indent=6, default=str)}")
+                    if not _p2p:
+                        print(f"    (no p2pId — TUTK P2P not supported by this camera)")
                 else:
-                    print(f"    batchGetDeviceUserInfo: no data for {cam.get('id')}")
+                    print(f"    batchGetDeviceUserInfo: call failed for {cam.get('id')}")
                     print(f"    raw server response: {_raw_batch}")
 
                 # --- P2P UID probe ---
