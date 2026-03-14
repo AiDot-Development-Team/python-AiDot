@@ -72,6 +72,11 @@ def on_frame(frame: VideoFrame) -> None:
 # --------------------------------------------------------------------------- #
 
 async def run(args: argparse.Namespace) -> None:
+    import logging as _logging
+    _logging.basicConfig(
+        level=_logging.WARNING,
+        format="%(name)s %(levelname)s: %(message)s",
+    )
     async with aiohttp.ClientSession() as http_session:
         client = AidotClient(
             session=http_session,
@@ -303,7 +308,7 @@ async def run(args: argparse.Namespace) -> None:
                         try:
                             async with _sess.post(
                                 _url,
-                                json={"deviceId": device_id},
+                                json={"deviceId": cam.get("id")},
                                 headers=_http_headers,
                                 timeout=_aiohttp.ClientTimeout(total=8),
                             ) as _r:
