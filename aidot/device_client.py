@@ -1444,11 +1444,86 @@ class DeviceClient(object):
 
     # -- Camera public methods ----------------------------------------------- #
 
+    @property
+    def _aidot_v21_base(self) -> str:
+        return f"https://prod-{self._region}-api.arnoo.com/v21"
+
+    def _aidot_headers(self) -> dict:
+        # Auth headers for the AiDot platform API (prod-{region}-api.arnoo.com).
+        # Mirrors AidotClient.async_session_get() header construction.
+        token   = (self._user_info.get("accessToken")
+                   or self._user_info.get("access_token") or "")
+        user_id = (self._user_info.get("id")
+                   or self._user_info.get("userId")
+                   or str(self.user_id))
+        return {
+            "appid":        "68",
+            "owner":        user_id,
+            "token":        token,
+            "terminal":     "app",
+            "locale":       "en-US",
+            "Content-Type": "application/json",
+        }
+
+    async def async_get_device_user_info(self) -> Optional[dict]:
+        """Fetch per-device user info from the AiDot v21 API.
+
+        POST /v21/devices/batchGetDeviceUserInfo
+        Returns the raw data dict for this device, or None on failure.
+        This is the same call the AiDot widget/app makes; the response includes
+        the TUTK p2pId and any per-device streaming credentials.
+        """
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self._aidot_v21_base}/devices/batchGetDeviceUserInfo",
+                    json={"deviceIds": [self.device_id]},
+                    headers=self._aidot_headers(),
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    body = await resp.json(content_type=None)
+
+            _LOGGER.debug("batchGetDeviceUserInfo response for %s: %s",
+                          self.device_id, body)
+            data = body.get("data") or {}
+            # Response is typically {"data": {"<deviceId>": {...}}} or a list.
+            if isinstance(data, dict):
+                return data.get(self.device_id) or next(iter(data.values()), None)
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and item.get("deviceId") == self.device_id:
+                        return item
+                return data[0] if data else None
+        except Exception as exc:
+            _LOGGER.error("async_get_device_user_info failed for %s: %s",
+                          self.device_id, exc)
+        return None
+
     async def async_get_p2p_uid(self) -> Optional[str]:
-        # Fetch the TUTK P2P UID for this camera from the AiDot cloud.
-        # POST /deviceController/getP2pId  body: deviceId=<device_id>
+        """Fetch the TUTK P2P UID for this camera.
+
+        Tries two sources in order:
+          1. POST /v21/devices/batchGetDeviceUserInfo  (AiDot platform API)
+          2. POST /deviceController/getP2pId           (Leedarson smarthome API)
+        """
         import aiohttp
 
+        # --- Source 1: AiDot v21 batchGetDeviceUserInfo ---
+        try:
+            dev_info = await self.async_get_device_user_info()
+            if isinstance(dev_info, dict):
+                uid = (dev_info.get("p2pId")
+                       or dev_info.get("uid")
+                       or dev_info.get("tutk_uid")
+                       or dev_info.get("tutkUid"))
+                if uid:
+                    _LOGGER.debug("async_get_p2p_uid: got UID from batchGetDeviceUserInfo: %s", uid)
+                    return str(uid)
+        except Exception as exc:
+            _LOGGER.debug("async_get_p2p_uid: batchGetDeviceUserInfo failed: %s", exc)
+
+        # --- Source 2: Leedarson smarthome /deviceController/getP2pId ---
         headers = {k: v for k, v in self._leedarson_headers().items()
                    if k != "Content-Type"}
         try:
@@ -1465,10 +1540,12 @@ class DeviceClient(object):
             if uid:
                 return str(uid)
             _LOGGER.warning(
-                "async_get_p2p_uid: empty UID for %s: %s", self.device_id, body
+                "async_get_p2p_uid: both sources returned empty UID for %s. "
+                "smarthome body=%s", self.device_id, body
             )
         except Exception as exc:
-            _LOGGER.error("async_get_p2p_uid failed for %s: %s", self.device_id, exc)
+            _LOGGER.error("async_get_p2p_uid: smarthome call failed for %s: %s",
+                          self.device_id, exc)
         return None
 
     async def async_get_cloud_recordings(

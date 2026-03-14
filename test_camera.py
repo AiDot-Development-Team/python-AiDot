@@ -240,13 +240,23 @@ async def run(args: argparse.Namespace) -> None:
 
                 _lid = dc._user_info
 
+                # --- batchGetDeviceUserInfo probe (AiDot v21 API) ---
+                print(f"\n[DIAG] Fetching batchGetDeviceUserInfo for {cam.get('id')} ...")
+                _dev_user_info = await dc.async_get_device_user_info()
+                if _dev_user_info:
+                    print(f"    batchGetDeviceUserInfo response (all fields):")
+                    import json as _dui_json
+                    print(f"    {_dui_json.dumps(_dev_user_info, indent=6, default=str)}")
+                else:
+                    print(f"    batchGetDeviceUserInfo: no data returned (check auth/endpoint)")
+
                 # --- P2P UID probe ---
                 print(f"\n[DIAG] Fetching P2P UID for {cam.get('id')} ...")
                 _p2p_uid = await dc.async_get_p2p_uid()
                 if _p2p_uid:
                     print(f"    P2P UID: {_p2p_uid!r}  (TUTK/LiveAndPlayBack path available)")
                 else:
-                    print(f"    P2P UID: None  (P2P not available; relay/connectipc path needed)")
+                    print(f"    P2P UID: None  (P2P not available; relay path needed)")
 
                 mqtt_url = await dc._async_get_mqtt_url()
                 print(f"[DIAG] MQTT broker URL: {mqtt_url!r}")
