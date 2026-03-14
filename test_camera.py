@@ -132,6 +132,11 @@ async def run(args: argparse.Namespace) -> None:
                 return
             print(f"    Filtered to device {args.device!r}")
 
+        # Collect all camera IDs upfront for batch API calls.
+        # The app sends all device IDs in a single batchGetDeviceUserInfo request
+        # (~260 bytes for 7 devices); sending only one may return an empty result.
+        _all_camera_ids = [c.get("id") for c in cameras if c.get("id")]
+
         # Run selected tests
         for cam in cameras:
             dc = client.get_device_client(cam)
@@ -241,14 +246,21 @@ async def run(args: argparse.Namespace) -> None:
                 _lid = dc._user_info
 
                 # --- batchGetDeviceUserInfo probe (AiDot v21 API) ---
-                print(f"\n[DIAG] Fetching batchGetDeviceUserInfo for {cam.get('id')} ...")
-                _dev_user_info = await dc.async_get_device_user_info()
+                # Send all camera IDs in one batch (mirrors app behaviour ~260B body).
+                import json as _dui_json
+                print(f"\n[DIAG] Fetching batchGetDeviceUserInfo "
+                      f"(batch of {len(_all_camera_ids)} device(s)) ...")
+                _dev_user_info = await dc.async_get_device_user_info(
+                    all_device_ids=_all_camera_ids)
+                # The warning-level logger in async_get_device_user_info now prints
+                # the full raw response when data is empty, so we also mirror it here
+                # for the human-readable test output.
                 if _dev_user_info:
-                    print(f"    batchGetDeviceUserInfo response (all fields):")
-                    import json as _dui_json
+                    print(f"    batchGetDeviceUserInfo for {cam.get('id')} (all fields):")
                     print(f"    {_dui_json.dumps(_dev_user_info, indent=6, default=str)}")
                 else:
-                    print(f"    batchGetDeviceUserInfo: no data returned (check auth/endpoint)")
+                    print(f"    batchGetDeviceUserInfo: no data for {cam.get('id')} "
+                          f"(see WARNING log above for full server response)")
 
                 # --- P2P UID probe ---
                 print(f"\n[DIAG] Fetching P2P UID for {cam.get('id')} ...")
@@ -258,278 +270,9 @@ async def run(args: argparse.Namespace) -> None:
                 else:
                     print(f"    P2P UID: None  (P2P not available; relay path needed)")
 
-                mqtt_url = await dc._async_get_mqtt_url()
-                print(f"[DIAG] MQTT broker URL: {mqtt_url!r}")
-
-                if not mqtt_url:
-                    print("    ERROR: Could not fetch MQTT broker URL — skipping MQTT diag")
-                else:
-                    import paho.mqtt.client as _mqtt
-                    import ssl as _ssl
-                    import threading as _threading
-                    import urllib.parse as _up
-                    import random as _random
-                    import json as _json
-
-                    # Build credential candidates to try in order.
-                    _smarthome_uid  = _lid.get("id") or str(dc.user_id)
-                    # mqttPassword is now populated by /commons/userConfig in async_post_login
-                    _mqtt_pwd_from_config = _lid.get("mqttPassword") or ""
-                    # mqttClientId = the server-assigned clientId from userConfig
-                    # (format: terminalIndex-userId, e.g. "2g3t66-5354ad...").
-                    # The broker may require this as the MQTT username or client_id.
-                    _mqtt_client_id_from_config = _lid.get("mqttClientId") or ""
-
-                    _cred_candidates = []
-                    if _mqtt_pwd_from_config and _mqtt_client_id_from_config:
-                        print(f"    mqttPassword from userConfig: <len={len(_mqtt_pwd_from_config)}>")
-                        print(f"    mqttClientId from userConfig: {_mqtt_client_id_from_config!r}")
-                        _cred_candidates.append((_smarthome_uid, _mqtt_pwd_from_config,
-                                                 "userId+userConfigPwd+mqttCid"))
-                    else:
-                        print("    mqttPassword/mqttClientId from userConfig: MISSING — check _userConfigRaw above")
-
-                    # WebSocket path
-                    _ws_paths = ["/mqtt"]
-
-                    user_id   = _smarthome_uid
-                    device_id = cam.get("id") or ""
-                    seq       = str(_random.randint(100_000, 999_999))
-
-                    if not _cred_candidates:
-                        print("    Skipping MQTT test — no valid credentials available")
-                    else:
-                        # Broker connection parameters
-                        _parsed = _up.urlparse(mqtt_url)
-                        _bhost  = _parsed.hostname or mqtt_url
-                        _bport  = _parsed.port or 443
-                        _bpath  = _parsed.path or "/mqtt"
-                        _btls   = _parsed.scheme in ("wss", "mqtts")
-                        _bxport = "websockets" if _parsed.scheme in ("wss", "ws") else "tcp"
-                        _cred_user, _cred_pwd = _smarthome_uid, _mqtt_pwd_from_config
-                        # Use the server-assigned clientId (broker requires this format).
-                        # The JS bundle uses "app-{userId}" but connects to an internal
-                        # dev broker (192.168.6.116), not global-us-mqtt.arnoo.com.
-                        # On the production broker "app-" causes rc=4 (bad credentials).
-                        _client_id = _mqtt_client_id_from_config
-
-                        # LWT mirrors the JS MQTT init() will message
-                        _lwt_topic   = f"iot/v1/cb/{user_id}/user/disconnect"
-                        _lwt_payload = _json.dumps({
-                            "service": "user",
-                            "method":  "disconnect",
-                            "seq":     str(_random.randint(100_000, 999_999)),
-                            "srcAddr": user_id,
-                            "payload": {"timestamp": "2018-03-14 17:30:00"},
-                        })
-
-                        # Known-good subscriptions from SUBACK analysis:
-                        #   mid=1  clientV1/{userId}/#        → OK
-                        #   mid=4  broadcastV1/{deviceId}/#   → OK
-                        # NEW: also subscribe to clientV1/{mqttClientId}/#  — the MQTT
-                        # connection clientId includes the terminal prefix (e.g. "3s1o43-5354ad...")
-                        # and differs from the plain userId.  If the server routes the
-                        # connectipc response based on payload.clientId rather than srcAddr, the
-                        # response would arrive here and we'd have been missing it.
-                        _sub_topics = [
-                            f"iot/v1/c/{user_id}/#",
-                            f"iot/v1/cb/{device_id}/#",
-                            # Probe: may be REJECTED, but relay might send
-                            # connectipc response here (camera's client channel)
-                            f"iot/v1/c/{device_id}/#",
-                            f"iot/v1/c/{_mqtt_client_id_from_config}/#",
-                        ]
-
-                        # Probe matrix: (pub_topic, payload.clientId, label, timeout_s)
-                        # Probe 1: relay-server path (serverV1/{userId}) — kept for baseline.
-                        # Probe 2-3: direct-to-device path (clientV1/{deviceId}) — this is
-                        # how the JS web app sends ALL IPC commands; the correct path per
-                        # aidot/main.544c2d18.js: every sendData call uses
-                        #   topic: clientV1 + "/" + devId + "/" + method
-                        _primary = f"iot/v1/s/{user_id}/IPC/connectipc"
-                        _probe_candidates = [
-                            (_primary, user_id,
-                             "serverV1+clientId=userId", 60),
-                            (f"iot/v1/c/{device_id}/connectipc", user_id,
-                             "clientV1/{devId}/connectipc", 30),
-                            (f"iot/v1/c/{device_id}/IPC/connectipc", user_id,
-                             "clientV1/{devId}/IPC/connectipc", 30),
-                        ]
-
-                        mqtt_success  = False
-                        winning_topic = None
-
-                        for _pub_topic, _cid, _label, _tout in _probe_candidates:
-                            _seq = str(int(time.time() * 1000))[4:13]
-                            _req_body = _json.dumps({
-                                "service": "IPC",
-                                "method":  "connectipc",
-                                "seq":     _seq,
-                                "srcAddr": user_id,
-                                "payload": {
-                                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                                    "devId":    device_id,
-                                    "deviceId": device_id,
-                                    "userId":   user_id,
-                                    "clientId": _cid,
-                                },
-                            })
-                            print(f"\n  [Broker] wss://{_bhost}:{_bport}{_bpath}")
-                            print(f"    [probe] {_label}")
-                            print(f"            pub_topic={_pub_topic}")
-                            _connect_rc_box = [None]
-                            _messages_seen  = []
-                            _done_event     = _threading.Event()
-
-                            def _on_connect(c, ud, flags, rc,
-                                            _t=_pub_topic, _rb=_req_body, _to=_tout):
-                                _connect_rc_box[0] = rc
-                                print(f"    MQTT on_connect rc={rc} "
-                                      f"({'OK' if rc == 0 else 'FAILED'})")
-                                if rc == 0:
-                                    for _st in _sub_topics:
-                                        c.subscribe(_st, qos=1)
-                                        print(f"    MQTT subscribed to {_st}")
-                                    # User presence announcement (mirrors JS init behavior)
-                                    c.publish(
-                                        f"iot/v1/cb/{user_id}/user/connect",
-                                        _json.dumps({
-                                            "service": "user",
-                                            "method":  "connect",
-                                            "seq":     str(_random.randint(100_000, 999_999)),
-                                            "srcAddr": user_id,
-                                            "payload": {
-                                                "timestamp": time.strftime(
-                                                    "%Y-%m-%d %H:%M:%S"),
-                                            },
-                                        }),
-                                        qos=1,
-                                    )
-                                    print("    MQTT published user/connect announcement")
-                                    c.publish(_t, _rb, qos=1)
-                                    print(f"    MQTT published connectipc to {_t}")
-
-                            def _on_subscribe(c, ud, mid, granted_qos):
-                                # Log subscription ACK — rc=128 means broker rejected it
-                                for q in granted_qos:
-                                    _ok = "OK" if q != 128 else "REJECTED(128)"
-                                    print(f"    MQTT sub_ack mid={mid} qos={q} [{_ok}]")
-
-                            def _on_message(c, ud, msg,
-                                            _t=_pub_topic, _rb=_req_body):
-                                try:
-                                    _ps = msg.payload.decode("utf-8")
-                                except Exception:
-                                    _ps = repr(msg.payload[:200])
-                                print(f"    MQTT <<< topic={msg.topic}")
-                                print(f"           payload={_ps[:800]}")
-                                # Only treat as a successful connectipc response if
-                                # the payload actually contains serverIP — a wakeupStatus
-                                # or devActionResp message means the camera woke up but
-                                # the relay hasn't responded yet; keep waiting.
-                                _is_connectipc = False
-                                try:
-                                    _body = _json.loads(_ps)
-                                    _pld  = _body.get("payload") or {}
-                                    if _pld.get("serverIP") or _pld.get("serverPort"):
-                                        _is_connectipc = True
-                                except Exception:
-                                    pass
-                                _messages_seen.append((msg.topic, _ps, _is_connectipc))
-                                if _is_connectipc:
-                                    _done_event.set()
-                                    return
-                                # Two-phase keepAlive handshake for battery cameras:
-                                # (a) sleep_status_changed wakeup  → resend connectipc
-                                # (b) disKeepAliveState            → send keepAlive
-                                #                                    heartbeat, then
-                                #                                    resend connectipc
-                                try:
-                                    _m2  = _json.loads(_ps)
-                                    _mth = _m2.get("method", "")
-                                    _pl2 = _m2.get("payload") or {}
-                                    if (_mth == "devEventNotif"
-                                            and _pl2.get("event") == "sleep_status_changed"
-                                            and "wakeup" in (_pl2.get("arguments") or [])):
-                                        print(f"    [WAKE] Camera woke up — "
-                                              f"republishing connectipc")
-                                        c.publish(_t, _rb, qos=1)
-                                    if _mth == "disKeepAliveState":
-                                        # serverPubTopic is the relay server's keepAlive
-                                        # channel — ACL-blocked for regular users (rc=7).
-                                        # Just republish connectipc now that the camera
-                                        # is confirmed awake/connected.
-                                        print(f"    [KEEP-ALIVE] Camera confirmed awake "
-                                              f"(disKeepAliveState) — republishing connectipc")
-                                        c.publish(_t, _rb, qos=1)
-                                except Exception:
-                                    pass
-
-                            def _on_disconnect(c, ud, rc):
-                                print(f"    MQTT disconnected rc={rc}")
-                                if rc != 0:
-                                    # Stop paho's auto-reconnect loop on non-clean disconnect
-                                    # (e.g. rc=7 = broker ACL violation on publish).
-                                    c.disconnect()
-                                    _done_event.set()
-
-                            def _run(_tout=_tout):
-                                mqttc = _mqtt.Client(
-                                    client_id=_client_id, transport=_bxport)
-                                mqttc.will_set(
-                                    _lwt_topic, _lwt_payload, qos=1, retain=False)
-                                if _btls:
-                                    mqttc.tls_set(cert_reqs=_ssl.CERT_REQUIRED)
-                                if _bxport == "websockets":
-                                    mqttc.ws_set_options(path=_bpath)
-                                mqttc.username_pw_set(_cred_user, _cred_pwd)
-                                mqttc.on_connect    = _on_connect
-                                mqttc.on_subscribe  = _on_subscribe
-                                mqttc.on_message    = _on_message
-                                mqttc.on_disconnect = _on_disconnect
-                                try:
-                                    mqttc.connect(_bhost, _bport, keepalive=30)
-                                    mqttc.loop_start()
-                                    _done_event.wait(timeout=_tout)
-                                except Exception as e:
-                                    print(f"    MQTT connect exception: {e}")
-                                finally:
-                                    mqttc.loop_stop()
-                                    try:
-                                        mqttc.disconnect()
-                                    except Exception:
-                                        pass
-
-                            await asyncio.get_event_loop().run_in_executor(
-                                None, _run)
-
-                            if _connect_rc_box[0] == 0:
-                                mqtt_success = True
-                                _got_real_response = any(
-                                    _is_ipc
-                                    for (_, _, _is_ipc) in _messages_seen
-                                )
-                                if _got_real_response:
-                                    winning_topic = _pub_topic
-                                    print(f"\n    *** connectipc RESPONSE received ***")
-                                    print(f"    Winning pub_topic: {_pub_topic}")
-                                    break
-                                elif _messages_seen:
-                                    print(f"    received {len(_messages_seen)} non-connectipc "
-                                          f"message(s) (wakeupStatus/devActionResp) — "
-                                          f"camera woke up but relay not yet ready; "
-                                          f"next candidate")
-                                else:
-                                    print(f"    no response within {_tout}s — next candidate")
-                            else:
-                                print(f"    connection failed rc={_connect_rc_box[0]}")
-                                break  # Credentials broken; no point probing other topics
-
-                        if not mqtt_success:
-                            print("\n    MQTT: connection failed — check credentials")
-                        elif not winning_topic:
-                            print("\n    MQTT: connected but connectipc got no response "
-                                  "on any topic variant")
+                # MQTT connectipc probes removed — "connectipc" is not a real protocol
+                # command (0 occurrences in aidot/main.544c2d18.js). The actual
+                # streaming protocol is TUTK IOTC P2P via the p2pId obtained above.
 
                 # --- HTTP live-stream API probe ---
                 # Cloud playback uses /api/ipc/playbackController/playRecord (HTTP).

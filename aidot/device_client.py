@@ -6,6 +6,7 @@ import logging
 import random
 import socket
 import struct
+import threading
 import time
 import asyncio
 from dataclasses import dataclass
@@ -269,128 +270,6 @@ def _parse_video_payload(data: bytes) -> List[VideoFrame]:
     return frames
 
 # --------------------------------------------------------------------------- #
-# MQTT helper - playback server discovery
-# --------------------------------------------------------------------------- #
-
-async def _mqtt_get_playback_server_info(
-    mqtt_url: str,
-    user_id: str,
-    mqtt_password: str,
-    dev_id: str,
-    client_id: str,
-    timeout: float = 60.0,
-) -> Optional[dict]:
-    # Publish getPlaybackServerInfoReq over MQTT-over-WSS and return the
-    # response payload dict, or None on timeout/error.
-    # Requires: pip install paho-mqtt
-    try:
-        import paho.mqtt.client as mqtt
-    except ImportError as exc:
-        raise ImportError(
-            "paho-mqtt is required for cloud playback. "
-            "Install it with:  pip install paho-mqtt"
-        ) from exc
-
-    import ssl
-    import threading
-    import urllib.parse
-
-    seq       = str(int(time.time() * 1000))[4:13]   # 9-digit JS-matching format
-    # Relay-server path: serverV1/{user_id}/IPC/...
-    pub_topic  = f"iot/v1/s/{user_id}/IPC/getPlaybackServerInfoReq"
-    # Direct-to-device path per aidot/main.544c2d18.js IPC command convention.
-    pub_topic_direct = f"iot/v1/c/{dev_id}/getPlaybackServerInfoReq"
-    sub_topics = [
-        (f"iot/v1/c/{user_id}/#",  1),
-        (f"iot/v1/cb/{dev_id}/#",  1),
-    ]
-
-    request_body = json.dumps({
-        "service": "IPC",
-        "method":  "getPlaybackServerInfoReq",
-        "seq":     seq,
-        "srcAddr": user_id,
-        "payload": {
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "deviceId":  dev_id,
-            "clientId":  client_id,
-        },
-    })
-
-    result_event = threading.Event()
-    result_box: List[Optional[dict]] = [None]
-
-    parsed    = urllib.parse.urlparse(mqtt_url)
-    host      = parsed.hostname or mqtt_url
-    port      = parsed.port or (443 if parsed.scheme in ("wss", "mqtts") else 1883)
-    path      = parsed.path or "/mqtt"
-    use_tls   = parsed.scheme in ("wss", "mqtts")
-    transport = "websockets" if parsed.scheme in ("wss", "ws") else "tcp"
-
-    def on_connect(client, userdata, flags, rc):
-        if rc != 0:
-            _LOGGER.warning("MQTT broker rejected connection rc=%d", rc)
-            result_event.set()
-            return
-        for _topic, _qos in sub_topics:
-            client.subscribe(_topic, qos=_qos)
-        client.publish(pub_topic, request_body, qos=1)
-        client.publish(pub_topic_direct, request_body, qos=1)
-
-    def on_message(client, userdata, msg):
-        try:
-            body   = json.loads(msg.payload.decode("utf-8"))
-            method = body.get("method", "")
-            pld    = body.get("payload") or {}
-
-            # Phase 1a: battery camera woke up → resend request immediately.
-            if (method == "devEventNotif"
-                    and pld.get("event") == "sleep_status_changed"
-                    and "wakeup" in (pld.get("arguments") or [])):
-                client.publish(pub_topic, request_body, qos=1)
-                client.publish(pub_topic_direct, request_body, qos=1)
-                return
-
-            # Phase 1b: disKeepAliveState → camera is awake and relay is ready.
-            # serverPubTopic is ACL-blocked for users; do not publish there.
-            if method == "disKeepAliveState":
-                client.publish(pub_topic, request_body, qos=1)
-                client.publish(pub_topic_direct, request_body, qos=1)
-                return
-
-            # Phase 2: actual response with relay endpoint.
-            if not pld.get("serverIP"):
-                return
-            if str(body.get("seq")) == seq or result_box[0] is None:
-                result_box[0] = pld
-                result_event.set()
-        except Exception:
-            pass
-
-    def _run_mqtt():
-        mqttc = mqtt.Client(client_id=client_id, transport=transport)
-        if use_tls:
-            mqttc.tls_set(cert_reqs=ssl.CERT_REQUIRED)
-        if transport == "websockets":
-            mqttc.ws_set_options(path=path)
-        mqttc.username_pw_set(user_id, mqtt_password)
-        mqttc.on_connect = on_connect
-        mqttc.on_message = on_message
-        try:
-            mqttc.connect(host, port, keepalive=30)
-            mqttc.loop_start()
-            result_event.wait(timeout=timeout)
-        finally:
-            mqttc.loop_stop()
-            try:
-                mqttc.disconnect()
-            except Exception:
-                pass
-
-    await asyncio.get_event_loop().run_in_executor(None, _run_mqtt)
-    return result_box[0]
-
-# --------------------------------------------------------------------------- #
 # AES helpers (live stream)
 #
 # Source: AESUtils.java in Leedarson Android SDK.
@@ -439,148 +318,6 @@ def _aes_ecb_encrypt(key_str: str, data: bytes) -> bytes:
     return enc.update(padded) + enc.finalize()
 
 
-# --------------------------------------------------------------------------- #
-# MQTT helper - live stream server discovery (connectipc)
-#
-# Source: iOS LDSXplayer -startRealPlay, LDSTCPManager, TCP_API in the
-# Leedarson iOS SDK binary.  The request mirrors _mqtt_get_playback_server_info
-# but uses method="connectipc" and receives AES/session credentials in return.
-# --------------------------------------------------------------------------- #
-
-async def _mqtt_get_live_server_info(
-    mqtt_url: str,
-    user_id: str,
-    mqtt_password: str,
-    dev_id: str,
-    client_id: str,
-    timeout: float = 60.0,
-) -> Optional[dict]:
-    # Publish connectipc over MQTT-over-WSS and return the response payload dict,
-    # or None on timeout/error.
-    # Expected response payload fields:
-    #   serverIP, serverPort, sessionId, aesKey, heartbeat, tls
-    # Requires: pip install paho-mqtt
-    #
-    # Timeout is 60 s by default: battery cameras may be sleeping and need
-    # ~20-30 s to wake up before the relay server can allocate an endpoint.
-    try:
-        import paho.mqtt.client as mqtt
-    except ImportError as exc:
-        raise ImportError(
-            "paho-mqtt is required for live streaming. "
-            "Install it with:  pip install paho-mqtt"
-        ) from exc
-
-    import ssl
-    import threading
-    import urllib.parse
-
-    seq       = str(int(time.time() * 1000))[4:13]   # 9-digit JS-matching format
-    # Relay-server path: serverV1/{user_id}/IPC/connectipc
-    # (Users can publish to their own serverV1/{userId} namespace.)
-    pub_topic  = f"iot/v1/s/{user_id}/IPC/connectipc"
-    # Direct-to-device path: clientV1/{dev_id}/connectipc
-    # Per aidot/main.544c2d18.js all IPC commands use clientV1/{deviceId}/{method}.
-    pub_topic_direct = f"iot/v1/c/{dev_id}/connectipc"
-    # Subscribe to both the user's response channel and the device broadcast channel.
-    # The connectipc response arrives on clientV1/{userId}/#; the device broadcast
-    # channel (broadcastV1/{deviceId}/#) delivers wakeupStatus events so the broker
-    # keeps the session alive while the sleeping battery camera boots up.
-    sub_topics = [
-        (f"iot/v1/c/{user_id}/#",  1),
-        (f"iot/v1/cb/{dev_id}/#",  1),
-    ]
-
-    request_body = json.dumps({
-        "service": "IPC",
-        "method":  "connectipc",
-        "seq":     seq,
-        "srcAddr": user_id,
-        "payload": {
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "deviceId":  dev_id,
-            "clientId":  client_id,
-        },
-    })
-
-    result_event = threading.Event()
-    result_box: List[Optional[dict]] = [None]
-
-    parsed    = urllib.parse.urlparse(mqtt_url)
-    host      = parsed.hostname or mqtt_url
-    port      = parsed.port or (443 if parsed.scheme in ("wss", "mqtts") else 1883)
-    path      = parsed.path or "/mqtt"
-    use_tls   = parsed.scheme in ("wss", "mqtts")
-    transport = "websockets" if parsed.scheme in ("wss", "ws") else "tcp"
-
-    def on_connect(client, userdata, flags, rc):
-        if rc != 0:
-            _LOGGER.warning("MQTT (connectipc) broker rejected connection rc=%d", rc)
-            result_event.set()
-            return
-        for _topic, _qos in sub_topics:
-            client.subscribe(_topic, qos=_qos)
-        # Publish to both relay path and direct-to-device path.
-        client.publish(pub_topic, request_body, qos=1)
-        client.publish(pub_topic_direct, request_body, qos=1)
-
-    def on_message(client, userdata, msg):
-        try:
-            body   = json.loads(msg.payload.decode("utf-8"))
-            method = body.get("method", "")
-            pld    = body.get("payload") or {}
-
-            # Phase 1a: battery camera just woke up → resend connectipc so the
-            # relay sees an active request now that the camera is reachable.
-            if (method == "devEventNotif"
-                    and pld.get("event") == "sleep_status_changed"
-                    and "wakeup" in (pld.get("arguments") or [])):
-                client.publish(pub_topic, request_body, qos=1)
-                client.publish(pub_topic_direct, request_body, qos=1)
-                return
-
-            # Phase 1b: camera sent disKeepAliveState — camera is awake and relay
-            # is ready. serverPubTopic is the relay server's keepAlive channel and
-            # is ACL-blocked for regular users (publishing there causes rc=7).
-            # Re-publish connectipc on both paths to complete the relay setup.
-            if method == "disKeepAliveState":
-                client.publish(pub_topic, request_body, qos=1)
-                client.publish(pub_topic_direct, request_body, qos=1)
-                return
-
-            # Phase 2: actual connectipc response with relay endpoint.
-            if not pld.get("serverIP"):
-                return
-            # Accept if the server echoed back our seq, or as a fallback accept
-            # any message with serverIP (the server may not always echo the seq).
-            if str(body.get("seq")) == seq or result_box[0] is None:
-                result_box[0] = pld
-                result_event.set()
-        except Exception:
-            pass
-
-    def _run_mqtt():
-        mqttc = mqtt.Client(client_id=client_id, transport=transport)
-        if use_tls:
-            mqttc.tls_set(cert_reqs=ssl.CERT_REQUIRED)
-        if transport == "websockets":
-            mqttc.ws_set_options(path=path)
-        mqttc.username_pw_set(user_id, mqtt_password)
-        mqttc.on_connect = on_connect
-        mqttc.on_message = on_message
-        try:
-            mqttc.connect(host, port, keepalive=30)
-            mqttc.loop_start()
-            result_event.wait(timeout=timeout)
-        finally:
-            mqttc.loop_stop()
-            try:
-                mqttc.disconnect()
-            except Exception:
-                pass
-
-    await asyncio.get_event_loop().run_in_executor(None, _run_mqtt)
-    return result_box[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -784,6 +521,251 @@ class CloudPlaybackSession:
                 pass
             self._writer = None
             self._reader = None
+
+# --------------------------------------------------------------------------- #
+# TutkStreamSession
+#
+# TUTK IOTC P2P live-stream session for Leedarson/AiDot cameras.
+# Use DeviceClient.async_open_live_stream() to obtain an instance.
+#
+# Protocol source: classes.jar.decompiled.zip / TutkManager.java
+#   IOTC_Connect_ByUID_Parallel(uid, sid) → nSID
+#   avClientStart2(nSID, "admin", "admin123", ...) → avIndex
+#   avSendIOCtrl(avIndex, 511, ...) → start video (IOTYPE_USER_IPCAM_START)
+#   avRecvFrameData2(avIndex, ...) → frame data loop
+#
+# Requires: libIOTCAPIs.so + libAVAPIs.so from the TUTK SDK.
+# Obtain them from the TUTK SDK distribution or an extracted AiDot APK.
+# --------------------------------------------------------------------------- #
+
+class TutkStreamSession:
+    """TUTK IOTC P2P live-stream session."""
+
+    _IOTYPE_USER_IPCAM_START = 511  # avSendIOCtrl type to begin video
+    _IOTYPE_USER_IPCAM_STOP  = 512
+
+    def __init__(
+        self,
+        uid: str,
+        on_frame: Callable[["VideoFrame"], None],
+        iotc_lib_path: str = "libIOTCAPIs.so",
+        av_lib_path: str = "libAVAPIs.so",
+    ) -> None:
+        self._uid           = uid
+        self._on_frame      = on_frame
+        self._iotc_lib_path = iotc_lib_path
+        self._av_lib_path   = av_lib_path
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event    = threading.Event()
+        self._sid           = -1
+        self._av_index      = -1
+
+    async def start(self) -> bool:
+        """Load native libs, connect P2P, and start the frame-receive thread."""
+        return await asyncio.get_event_loop().run_in_executor(
+            None, self._start_sync)
+
+    def _start_sync(self) -> bool:
+        import ctypes
+
+        try:
+            iotc = ctypes.CDLL(self._iotc_lib_path)
+            av   = ctypes.CDLL(self._av_lib_path)
+        except OSError as exc:
+            _LOGGER.error(
+                "TutkStreamSession: cannot load TUTK native libraries "
+                "(%s, %s): %s. "
+                "Obtain them from the TUTK SDK or an extracted AiDot APK.",
+                self._iotc_lib_path, self._av_lib_path, exc,
+            )
+            return False
+
+        # --- Declare function signatures ------------------------------------ #
+        iotc.IOTC_Initialize2.restype  = ctypes.c_int
+        iotc.IOTC_Initialize2.argtypes = [ctypes.c_int]
+
+        iotc.IOTC_Get_SessionID.restype  = ctypes.c_int
+        iotc.IOTC_Get_SessionID.argtypes = []
+
+        iotc.IOTC_Connect_ByUID_Parallel.restype  = ctypes.c_int
+        iotc.IOTC_Connect_ByUID_Parallel.argtypes = [ctypes.c_char_p, ctypes.c_int]
+
+        iotc.IOTC_Session_Close.restype  = ctypes.c_int
+        iotc.IOTC_Session_Close.argtypes = [ctypes.c_int]
+
+        av.AVAPIs_Initialize.restype  = ctypes.c_int
+        av.AVAPIs_Initialize.argtypes = [ctypes.c_int]
+
+        av.avClientStart2.restype  = ctypes.c_int
+        av.avClientStart2.argtypes = [
+            ctypes.c_int,                        # nSID
+            ctypes.c_char_p,                     # account
+            ctypes.c_char_p,                     # password
+            ctypes.c_int,                        # timeout_ms
+            ctypes.POINTER(ctypes.c_uint),       # pSerialNumber (NULL OK)
+            ctypes.c_int,                        # channelId
+        ]
+
+        av.avClientStop.restype  = ctypes.c_int
+        av.avClientStop.argtypes = [ctypes.c_int]
+
+        av.avSendIOCtrl.restype  = ctypes.c_int
+        av.avSendIOCtrl.argtypes = [
+            ctypes.c_int,    # nAVIndex
+            ctypes.c_uint,   # nIOCtrlType
+            ctypes.c_char_p, # cabIOCtrlData
+            ctypes.c_int,    # nIOCtrlDataSize
+        ]
+
+        # FRAMEINFO_t — TUTK SDK v3.x layout (codec_id, flags, onlineNum,
+        # frameSize, frameNo, timestamp). Adjust if your SDK version differs.
+        class FrameInfo(ctypes.Structure):
+            _fields_ = [
+                ("codec_id",   ctypes.c_uint),
+                ("flags",      ctypes.c_uint),
+                ("onlineNum",  ctypes.c_uint),
+                ("frameSize",  ctypes.c_uint),
+                ("frameNo",    ctypes.c_uint),
+                ("timestamp",  ctypes.c_uint),
+            ]
+
+        av.avRecvFrameData2.restype  = ctypes.c_int
+        av.avRecvFrameData2.argtypes = [
+            ctypes.c_int,                        # nAVIndex
+            ctypes.c_char_p,                     # abFrameData
+            ctypes.POINTER(ctypes.c_int),        # pnFrameDataMaxSize
+            ctypes.POINTER(ctypes.c_int),        # pnActualFrameSize
+            ctypes.POINTER(ctypes.c_int),        # pnExpectedFrameSize
+            ctypes.POINTER(FrameInfo),           # psFrameInfo
+            ctypes.POINTER(ctypes.c_int),        # pnFrameInfoBufSize
+            ctypes.POINTER(ctypes.c_int),        # pnActualFrameInfoSize
+            ctypes.POINTER(ctypes.c_int),        # pnFrameIndex
+        ]
+
+        # --- Initialize IOTC (idempotent) ----------------------------------- #
+        ret = iotc.IOTC_Initialize2(1)
+        if ret < 0:
+            _LOGGER.debug("IOTC_Initialize2 returned %d (may already be initialized)", ret)
+
+        ret = av.AVAPIs_Initialize(1)
+        if ret < 0:
+            _LOGGER.debug("AVAPIs_Initialize returned %d (may already be initialized)", ret)
+
+        # --- Connect P2P ---------------------------------------------------- #
+        sid = iotc.IOTC_Get_SessionID()
+        if sid < 0:
+            _LOGGER.error("TUTK: IOTC_Get_SessionID failed: %d", sid)
+            return False
+
+        _LOGGER.debug("TUTK: connecting to uid=%s (sid=%d)", self._uid, sid)
+        ret = iotc.IOTC_Connect_ByUID_Parallel(self._uid.encode(), sid)
+        if ret < 0:
+            _LOGGER.error(
+                "TUTK: IOTC_Connect_ByUID_Parallel(%s) failed: %d",
+                self._uid, ret,
+            )
+            return False
+        self._sid = ret
+
+        # --- Start AV client ------------------------------------------------ #
+        # Credentials are hardcoded in TutkManager.java: "admin" / "admin123"
+        av_index = av.avClientStart2(
+            self._sid, b"admin", b"admin123", 5000, None, 0)
+        if av_index < 0:
+            _LOGGER.error("TUTK: avClientStart2 failed: %d", av_index)
+            iotc.IOTC_Session_Close(self._sid)
+            self._sid = -1
+            return False
+        self._av_index = av_index
+
+        # --- Send IOTYPE_USER_IPCAM_START (511) ----------------------------- #
+        # 8-byte body: all zeros selects default resolution/fps/quality.
+        start_body = (ctypes.c_uint8 * 8)(*([0] * 8))
+        av.avSendIOCtrl(
+            self._av_index,
+            self._IOTYPE_USER_IPCAM_START,
+            ctypes.cast(start_body, ctypes.c_char_p),
+            8,
+        )
+
+        # --- Launch frame-receive thread ------------------------------------ #
+        self._thread = threading.Thread(
+            target=self._recv_loop,
+            args=(av, iotc, FrameInfo),
+            daemon=True,
+            name=f"tutk-recv-{self._uid[:8]}",
+        )
+        self._thread.start()
+        return True
+
+    def _recv_loop(self, av, iotc, FrameInfo) -> None:
+        import ctypes
+
+        BUF_SIZE     = 131072   # 128 KB per frame — adjust if cameras send larger
+        frame_buf    = ctypes.create_string_buffer(BUF_SIZE)
+        frame_info   = FrameInfo()
+        max_sz       = ctypes.c_int(BUF_SIZE)
+        actual_sz    = ctypes.c_int(0)
+        expected_sz  = ctypes.c_int(0)
+        info_buf_sz  = ctypes.c_int(ctypes.sizeof(FrameInfo))
+        actual_info  = ctypes.c_int(0)
+        frame_idx    = ctypes.c_int(0)
+
+        _LOGGER.debug("TUTK: recv loop started (avIndex=%d)", self._av_index)
+
+        while not self._stop_event.is_set():
+            ret = av.avRecvFrameData2(
+                self._av_index,
+                frame_buf,
+                ctypes.byref(max_sz),
+                ctypes.byref(actual_sz),
+                ctypes.byref(expected_sz),
+                ctypes.byref(frame_info),
+                ctypes.byref(info_buf_sz),
+                ctypes.byref(actual_info),
+                ctypes.byref(frame_idx),
+            )
+            if ret == -1:
+                # AV_ER_DATA_NOREADY — no frame yet; busy-wait is ok here
+                continue
+            if ret < 0:
+                _LOGGER.error("TUTK: avRecvFrameData2 returned %d — stopping", ret)
+                break
+
+            raw = bytes(frame_buf.raw[: actual_sz.value])
+            vf  = VideoFrame(
+                frame_type   = frame_info.codec_id,
+                audio_codec  = 0,
+                timestamp    = frame_info.timestamp,
+                is_key_frame = bool(frame_info.flags & 0x1),
+                data         = raw,
+            )
+            try:
+                self._on_frame(vf)
+            except Exception as exc:
+                _LOGGER.error("TUTK: on_frame callback raised: %s", exc)
+
+        # Teardown
+        if self._av_index >= 0:
+            try:
+                av.avClientStop(self._av_index)
+            except Exception:
+                pass
+        if self._sid >= 0:
+            try:
+                iotc.IOTC_Session_Close(self._sid)
+            except Exception:
+                pass
+        _LOGGER.debug("TUTK: recv loop exited")
+
+    async def stop(self) -> None:
+        """Signal the receive thread to stop and wait for it."""
+        self._stop_event.set()
+        if self._thread is not None:
+            await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self._thread.join(timeout=5.0)
+            )
+
 
 # --------------------------------------------------------------------------- #
 # LiveStreamSession
@@ -1465,27 +1447,49 @@ class DeviceClient(object):
             "Content-Type": "application/json",
         }
 
-    async def async_get_device_user_info(self) -> Optional[dict]:
+    async def async_get_device_user_info(
+        self,
+        all_device_ids: Optional[List[str]] = None,
+    ) -> Optional[dict]:
         """Fetch per-device user info from the AiDot v21 API.
 
         POST /v21/devices/batchGetDeviceUserInfo
         Returns the raw data dict for this device, or None on failure.
         This is the same call the AiDot widget/app makes; the response includes
         the TUTK p2pId and any per-device streaming credentials.
+
+        Args:
+            all_device_ids: All device IDs to include in the batch request.
+                The app sends all device IDs in a single call (~260 bytes for
+                7 devices). Sending only one ID may cause the server to return
+                an empty result. Pass the full list from the account's device
+                listing if available.
         """
         import aiohttp
+        ids = all_device_ids or [self.device_id]
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     f"{self._aidot_v21_base}/devices/batchGetDeviceUserInfo",
-                    json={"deviceIds": [self.device_id]},
+                    json={"deviceIds": ids},
                     headers=self._aidot_headers(),
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
                     body = await resp.json(content_type=None)
+                    status = resp.status
 
-            _LOGGER.debug("batchGetDeviceUserInfo response for %s: %s",
-                          self.device_id, body)
+            # Always log the full response so we can see server errors (e.g.
+            # auth failures return {"code":1,"message":"Unauthorized"} with
+            # data=null, which previously surfaced only as "no data returned").
+            if body.get("data"):
+                _LOGGER.debug("batchGetDeviceUserInfo response for %s (status=%d): %s",
+                              self.device_id, status, body)
+            else:
+                _LOGGER.warning(
+                    "batchGetDeviceUserInfo returned no data for %s (status=%d): %s",
+                    self.device_id, status, body,
+                )
+
             data = body.get("data") or {}
             # Response is typically {"data": {"<deviceId>": {...}}} or a list.
             if isinstance(data, dict):
@@ -1716,86 +1720,48 @@ class DeviceClient(object):
     async def async_open_live_stream(
         self,
         on_frame: Callable[[VideoFrame], None],
-        timeout: float = 15.0,
-    ) -> Optional[LiveStreamSession]:
-        # Open a live-stream session and begin delivering VideoFrame objects.
-        # on_frame: called in the asyncio event loop for each decoded frame.
-        # Returns a running LiveStreamSession, or None if the handshake fails.
+        timeout: float = 60.0,
+    ) -> Optional[TutkStreamSession]:
+        # Open a TUTK IOTC P2P live-stream session.
+        # on_frame: called from the receive thread for each decoded VideoFrame.
+        # Returns a running TutkStreamSession, or None on failure.
         #
-        # Two-step handshake from iOS LDSXplayer -startRealPlay:
-        #   1. MQTT connectipc  -> serverIP, serverPort, sessionId, aesKey, heartbeat, tls
-        #   2. TLS TCP LOGIN + STREAM_REQ (AES-256/ECB/PKCS7 on all payloads)
+        # Protocol: TUTK IOTC P2P (confirmed from classes.jar.decompiled.zip).
+        #   p2pId (TUTK UID) ← POST /v21/devices/batchGetDeviceUserInfo
+        #   IOTC_Connect_ByUID_Parallel(uid) → nSID
+        #   avClientStart2(nSID, "admin", "admin123") → avIndex
+        #   avSendIOCtrl(avIndex, 511, ...) → start video stream
+        #   avRecvFrameData2(avIndex, ...) → frame loop
+        #
+        # Requires libIOTCAPIs.so + libAVAPIs.so from the TUTK SDK.
 
-        # Fetch MQTT credentials from the Leedarson smarthome /user/login endpoint.
-        # The AiDot platform login does NOT return mqttUser/mqttPassword.
-        smarthome_auth = await self._async_get_smarthome_auth()
-        mqtt_user = (smarthome_auth or {}).get("mqttUser") or str(self.user_id)
-        mqtt_pwd  = (smarthome_auth or {}).get("mqttPassword") or ""
-        client_id = (self._user_info.get("mqttClientId") or f"app-{mqtt_user}")
-
-        # Step 1 -- MQTT connectipc
-        mqtt_url = await self._async_get_mqtt_url()
-        if not mqtt_url:
+        uid = await self.async_get_p2p_uid()
+        if not uid:
             _LOGGER.error(
-                "async_open_live_stream: cannot determine MQTT URL for %s",
+                "async_open_live_stream: p2pId not available for %s. "
+                "Ensure batchGetDeviceUserInfo returns data (check auth/request "
+                "format) or that the smarthome getP2pId endpoint is reachable.",
                 self.device_id,
             )
             return None
 
-        _LOGGER.debug("Live stream step 1: MQTT connectipc for %s", self.device_id)
-        srv_info = await _mqtt_get_live_server_info(
-            mqtt_url, mqtt_user, mqtt_pwd,
-            self.device_id, client_id, timeout=timeout,
-        )
-        if not srv_info:
-            _LOGGER.error(
-                "async_open_live_stream: MQTT connectipc response empty for %s. "
-                "Camera may be offline or may not support this streaming path.",
-                self.device_id,
-            )
-            return None
-
-        server_ip   = srv_info.get("serverIP")
-        server_port = srv_info.get("serverPort")
-        session_id  = srv_info.get("sessionId") or ""
-        aes_key     = srv_info.get("aesKey") or ""
-        heartbeat   = int(srv_info.get("heartbeat") or 15)
-        use_tls     = bool(srv_info.get("tls", True))
-
-        if not server_ip or not server_port:
-            _LOGGER.error(
-                "async_open_live_stream: incomplete server info for %s: %s",
-                self.device_id, srv_info,
-            )
-            return None
-
-        if not aes_key:
-            _LOGGER.warning(
-                "async_open_live_stream: no aesKey in response for %s -- "
-                "AES encryption disabled",
-                self.device_id,
-            )
-
-        # Step 2 -- TLS TCP
         _LOGGER.debug(
-            "Live stream step 2: TCP to %s:%d tls=%s heartbeat=%ds for %s",
-            server_ip, server_port, use_tls, heartbeat, self.device_id,
-        )
-        session = LiveStreamSession(
-            server_ip=server_ip,
-            server_port=int(server_port),
-            session_id=session_id,
-            aes_key=aes_key,
-            heartbeat_interval=heartbeat,
-            use_tls=use_tls,
-            on_frame=on_frame,
-        )
-        if not await session.start():
+            "async_open_live_stream: TUTK P2P uid=%s for %s", uid, self.device_id)
+        session = TutkStreamSession(uid=uid, on_frame=on_frame)
+        try:
+            ok = await asyncio.wait_for(session.start(), timeout=timeout)
+        except asyncio.TimeoutError:
+            _LOGGER.error(
+                "async_open_live_stream: TUTK connect timed out after %.0fs for %s",
+                timeout, self.device_id,
+            )
+            return None
+        if not ok:
             return None
 
         _LOGGER.info(
-            "Live stream session open for %s -> %s:%d",
-            self.device_id, server_ip, server_port,
+            "TUTK live stream session open for %s (uid=%s)",
+            self.device_id, uid,
         )
         return session
 
