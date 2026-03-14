@@ -541,8 +541,10 @@ class CloudPlaybackSession:
 class TutkStreamSession:
     """TUTK IOTC P2P live-stream session."""
 
-    _IOTYPE_USER_IPCAM_START = 511  # avSendIOCtrl type to begin video
-    _IOTYPE_USER_IPCAM_STOP  = 512
+    _IOTYPE_INNER_SND_DATA_DELAY = 255   # TutkManager.java: sent before START
+    _IOTYPE_USER_IPCAM_START     = 511   # AVIOCTRLDEFs: IOTYPE_USER_IPCAM_START
+    _IOTYPE_USER_IPCAM_STOP      = 767   # AVIOCTRLDEFs: IOTYPE_USER_IPCAM_STOP
+    _IOTYPE_USER_IPCAM_AUDIOSTART = 768  # AVIOCTRLDEFs: IOTYPE_USER_IPCAM_AUDIOSTART
 
     def __init__(
         self,
@@ -587,14 +589,18 @@ class TutkStreamSession:
         iotc.IOTC_Get_SessionID.restype  = ctypes.c_int
         iotc.IOTC_Get_SessionID.argtypes = []
 
+        iotc.IOTC_Set_Max_Session_Number.restype  = None
+        iotc.IOTC_Set_Max_Session_Number.argtypes = [ctypes.c_int]
+
         iotc.IOTC_Connect_ByUID_Parallel.restype  = ctypes.c_int
         iotc.IOTC_Connect_ByUID_Parallel.argtypes = [ctypes.c_char_p, ctypes.c_int]
 
-        iotc.IOTC_Session_Close.restype  = ctypes.c_int
+        iotc.IOTC_Session_Close.restype  = None
         iotc.IOTC_Session_Close.argtypes = [ctypes.c_int]
 
-        av.AVAPIs_Initialize.restype  = ctypes.c_int
-        av.AVAPIs_Initialize.argtypes = [ctypes.c_int]
+        # TutkManager.java: AVAPIs.avInitialize(32)
+        av.avInitialize.restype  = ctypes.c_int
+        av.avInitialize.argtypes = [ctypes.c_int]
 
         av.avClientStart2.restype  = ctypes.c_int
         av.avClientStart2.argtypes = [
@@ -602,8 +608,9 @@ class TutkStreamSession:
             ctypes.c_char_p,                     # account
             ctypes.c_char_p,                     # password
             ctypes.c_int,                        # timeout_ms
-            ctypes.POINTER(ctypes.c_uint),       # pSerialNumber (NULL OK)
-            ctypes.c_int,                        # channelId
+            ctypes.POINTER(ctypes.c_int),        # srvType[] (out)
+            ctypes.c_int,                        # reserved=0
+            ctypes.POINTER(ctypes.c_int),        # nSend[] (out)
         ]
 
         av.avClientStop.restype  = ctypes.c_int
@@ -633,23 +640,27 @@ class TutkStreamSession:
         av.avRecvFrameData2.argtypes = [
             ctypes.c_int,                        # nAVIndex
             ctypes.c_char_p,                     # abFrameData
-            ctypes.POINTER(ctypes.c_int),        # pnFrameDataMaxSize
-            ctypes.POINTER(ctypes.c_int),        # pnActualFrameSize
-            ctypes.POINTER(ctypes.c_int),        # pnExpectedFrameSize
-            ctypes.POINTER(FrameInfo),           # psFrameInfo
-            ctypes.POINTER(ctypes.c_int),        # pnFrameInfoBufSize
-            ctypes.POINTER(ctypes.c_int),        # pnActualFrameInfoSize
-            ctypes.POINTER(ctypes.c_int),        # pnFrameIndex
+            ctypes.c_int,                        # nFrameDataMaxSize (by value)
+            ctypes.POINTER(ctypes.c_int),        # pnActualFrameSize (out)
+            ctypes.POINTER(ctypes.c_int),        # pnExpectedFrameSize (out)
+            ctypes.c_char_p,                     # pFrameInfo (byte buffer)
+            ctypes.c_int,                        # nFrameInfoBufSize (by value)
+            ctypes.POINTER(ctypes.c_int),        # pnActualFrameInfoSize (out)
+            ctypes.POINTER(ctypes.c_int),        # pnFrameIndex (out)
         ]
 
         # --- Initialize IOTC (idempotent) ----------------------------------- #
-        ret = iotc.IOTC_Initialize2(1)
+        # TutkManager.java: IOTC_Initialize2(0) then IOTC_Set_Max_Session_Number(10)
+        # then avInitialize(32)
+        ret = iotc.IOTC_Initialize2(0)
         if ret < 0:
             _LOGGER.debug("IOTC_Initialize2 returned %d (may already be initialized)", ret)
+        else:
+            iotc.IOTC_Set_Max_Session_Number(10)
 
-        ret = av.AVAPIs_Initialize(1)
+        ret = av.avInitialize(32)
         if ret < 0:
-            _LOGGER.debug("AVAPIs_Initialize returned %d (may already be initialized)", ret)
+            _LOGGER.debug("avInitialize returned %d (may already be initialized)", ret)
 
         # --- Connect P2P ---------------------------------------------------- #
         sid = iotc.IOTC_Get_SessionID()
@@ -668,9 +679,13 @@ class TutkStreamSession:
         self._sid = ret
 
         # --- Start AV client ------------------------------------------------ #
-        # Credentials are hardcoded in TutkManager.java: "admin" / "admin123"
+        # TutkManager.java: avClientStart2(nSID, account, pwd, 2000, srvType, 0, nSend)
+        # Credentials: "admin" / "admin123" (hardcoded in TutkManager.java)
+        srv_type = ctypes.c_int(0)
+        n_send   = ctypes.c_int(0)
         av_index = av.avClientStart2(
-            self._sid, b"admin", b"admin123", 5000, None, 0)
+            self._sid, b"admin", b"admin123", 2000,
+            ctypes.byref(srv_type), 0, ctypes.byref(n_send))
         if av_index < 0:
             _LOGGER.error("TUTK: avClientStart2 failed: %d", av_index)
             iotc.IOTC_Session_Close(self._sid)
@@ -678,15 +693,16 @@ class TutkStreamSession:
             return False
         self._av_index = av_index
 
-        # --- Send IOTYPE_USER_IPCAM_START (511) ----------------------------- #
-        # 8-byte body: all zeros selects default resolution/fps/quality.
-        start_body = (ctypes.c_uint8 * 8)(*([0] * 8))
-        av.avSendIOCtrl(
-            self._av_index,
-            self._IOTYPE_USER_IPCAM_START,
-            ctypes.cast(start_body, ctypes.c_char_p),
-            8,
-        )
+        # --- Send IOCtrl commands per TutkManager.java ---------------------- #
+        # 1. IOTYPE_INNER_SND_DATA_DELAY (255) — 2-byte body
+        av.avSendIOCtrl(self._av_index, self._IOTYPE_INNER_SND_DATA_DELAY,
+                        (ctypes.c_uint8 * 2)(), 2)
+        # 2. IOTYPE_USER_IPCAM_START (511) — 8-byte body (all zeros = default stream)
+        av.avSendIOCtrl(self._av_index, self._IOTYPE_USER_IPCAM_START,
+                        (ctypes.c_uint8 * 8)(), 8)
+        # 3. IOTYPE_USER_IPCAM_AUDIOSTART (768) — 8-byte body
+        av.avSendIOCtrl(self._av_index, self._IOTYPE_USER_IPCAM_AUDIOSTART,
+                        (ctypes.c_uint8 * 8)(), 8)
 
         # --- Launch frame-receive thread ------------------------------------ #
         self._thread = threading.Thread(
@@ -701,13 +717,16 @@ class TutkStreamSession:
     def _recv_loop(self, av, iotc, FrameInfo) -> None:
         import ctypes
 
-        BUF_SIZE     = 131072   # 128 KB per frame — adjust if cameras send larger
+        # avRecvFrameData2 signature (from AVAPIs.java / TUTK SDK):
+        #   (nAVIndex, abFrameData, nFrameDataMaxSize,
+        #    *pnActualFrameSize, *pnExpectedFrameSize,
+        #    pFrameInfo, nFrameInfoBufSize,
+        #    *pnActualFrameInfoSize, *pnFrameIndex)
+        BUF_SIZE     = 131072   # 128 KB — matches TutkManager.VIDEO_BUF_SIZE (100000)
         frame_buf    = ctypes.create_string_buffer(BUF_SIZE)
-        frame_info   = FrameInfo()
-        max_sz       = ctypes.c_int(BUF_SIZE)
+        info_buf     = ctypes.create_string_buffer(ctypes.sizeof(FrameInfo))
         actual_sz    = ctypes.c_int(0)
         expected_sz  = ctypes.c_int(0)
-        info_buf_sz  = ctypes.c_int(ctypes.sizeof(FrameInfo))
         actual_info  = ctypes.c_int(0)
         frame_idx    = ctypes.c_int(0)
 
@@ -717,27 +736,29 @@ class TutkStreamSession:
             ret = av.avRecvFrameData2(
                 self._av_index,
                 frame_buf,
-                ctypes.byref(max_sz),
+                BUF_SIZE,
                 ctypes.byref(actual_sz),
                 ctypes.byref(expected_sz),
-                ctypes.byref(frame_info),
-                ctypes.byref(info_buf_sz),
+                info_buf,
+                ctypes.sizeof(FrameInfo),
                 ctypes.byref(actual_info),
                 ctypes.byref(frame_idx),
             )
-            if ret == -1:
-                # AV_ER_DATA_NOREADY — no frame yet; busy-wait is ok here
+            if ret == -20012:
+                # AV_ER_DATA_NOREADY — no frame yet; brief sleep per TutkManager (2ms)
+                time.sleep(0.002)
                 continue
             if ret < 0:
                 _LOGGER.error("TUTK: avRecvFrameData2 returned %d — stopping", ret)
                 break
 
-            raw = bytes(frame_buf.raw[: actual_sz.value])
+            raw      = bytes(frame_buf.raw[: actual_sz.value])
+            fi       = FrameInfo.from_buffer_copy(info_buf)
             vf  = VideoFrame(
-                frame_type   = frame_info.codec_id,
+                frame_type   = fi.codec_id,
                 audio_codec  = 0,
-                timestamp    = frame_info.timestamp,
-                is_key_frame = bool(frame_info.flags & 0x1),
+                timestamp    = fi.timestamp,
+                is_key_frame = bool(fi.flags & 0x1),
                 data         = raw,
             )
             try:
@@ -1432,18 +1453,14 @@ class DeviceClient(object):
 
     def _aidot_headers(self) -> dict:
         # Auth headers for the AiDot platform API (prod-{region}-api.arnoo.com).
-        # Mirrors AidotClient.async_session_get() header construction.
-        token   = (self._user_info.get("accessToken")
-                   or self._user_info.get("access_token") or "")
-        user_id = (self._user_info.get("id")
-                   or self._user_info.get("userId")
-                   or str(self.user_id))
+        # Matches AidotClient.async_session_get(): CONF_APP_ID="Appid", APP_ID,
+        # CONF_TOKEN="Token", CONF_TERMINAL="Terminal" (see login_const.py/const.py).
+        token = (self._user_info.get("accessToken")
+                 or self._user_info.get("access_token") or "")
         return {
-            "appid":        "68",
-            "owner":        user_id,
-            "token":        token,
-            "terminal":     "app",
-            "locale":       "en-US",
+            "Appid":        "1383974540041977857",
+            "Token":        token,
+            "Terminal":     "app",
             "Content-Type": "application/json",
         }
 
@@ -1478,9 +1495,9 @@ class DeviceClient(object):
                     body = await resp.json(content_type=None)
                     status = resp.status
 
-            # Always log the full response so we can see server errors (e.g.
-            # auth failures return {"code":1,"message":"Unauthorized"} with
-            # data=null, which previously surfaced only as "no data returned").
+            # Store the raw response so callers can inspect it for diagnostics.
+            self._last_batch_response = body
+
             if body.get("data"):
                 _LOGGER.debug("batchGetDeviceUserInfo response for %s (status=%d): %s",
                               self.device_id, status, body)

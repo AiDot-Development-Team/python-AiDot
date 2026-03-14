@@ -257,15 +257,13 @@ async def run(args: argparse.Namespace) -> None:
                       f"(batch of {len(_all_camera_ids)} device(s)) ...")
                 _dev_user_info = await dc.async_get_device_user_info(
                     all_device_ids=_all_camera_ids)
-                # The warning-level logger in async_get_device_user_info now prints
-                # the full raw response when data is empty, so we also mirror it here
-                # for the human-readable test output.
+                _raw_batch = getattr(dc, '_last_batch_response', None)
                 if _dev_user_info:
                     print(f"    batchGetDeviceUserInfo for {cam.get('id')} (all fields):")
                     print(f"    {_dui_json.dumps(_dev_user_info, indent=6, default=str)}")
                 else:
-                    print(f"    batchGetDeviceUserInfo: no data for {cam.get('id')} "
-                          f"(see WARNING log above for full server response)")
+                    print(f"    batchGetDeviceUserInfo: no data for {cam.get('id')}")
+                    print(f"    raw server response: {_raw_batch}")
 
                 # --- P2P UID probe ---
                 print(f"\n[DIAG] Fetching P2P UID for {cam.get('id')} ...")
@@ -275,47 +273,6 @@ async def run(args: argparse.Namespace) -> None:
                 else:
                     print(f"    P2P UID: None  (P2P not available; relay path needed)")
 
-                # MQTT connectipc probes removed — "connectipc" is not a real protocol
-                # command (0 occurrences in aidot/main.544c2d18.js). The actual
-                # streaming protocol is TUTK IOTC P2P via the p2pId obtained above.
-
-                # --- HTTP live-stream API probe ---
-                # Cloud playback uses /api/ipc/playbackController/playRecord (HTTP).
-                # A parallel HTTP endpoint may exist for live stream allocation and
-                # could bypass MQTT entirely.
-                import aiohttp as _aiohttp
-                _smarthome_api = f"https://{dc._region}-smarthome.arnoo.com:443"
-                _access_token = dc._user_info.get("accessToken") or ""
-                _http_headers = {
-                    "terminal":        "thirdPlatFormUser",
-                    "active-language": "en_US",
-                    "access-token":    _access_token,
-                    "token":           _access_token,
-                    "appKey":          "appa070",
-                    "Content-Type":    "application/json",
-                }
-                _http_endpoints = [
-                    "/api/ipc/liveController/connectipc",
-                    "/api/ipc/liveController/getLiveServerInfo",
-                    "/api/ipc/liveController/getStreamInfo",
-                    "/api/ipc/liveController/getLiveUrl",
-                    "/api/ipc/liveController/getPreviewUrl",
-                ]
-                print(f"\n[DIAG-HTTP] Probing live stream HTTP endpoints on {_smarthome_api}")
-                async with _aiohttp.ClientSession() as _sess:
-                    for _ep in _http_endpoints:
-                        _url = _smarthome_api + _ep
-                        try:
-                            async with _sess.post(
-                                _url,
-                                json={"deviceId": cam.get("id")},
-                                headers=_http_headers,
-                                timeout=_aiohttp.ClientTimeout(total=8),
-                            ) as _r:
-                                _rbody = await _r.json(content_type=None)
-                            print(f"    {_ep}  status={_r.status}  body={str(_rbody)[:300]}")
-                        except Exception as _he:
-                            print(f"    {_ep}  ERROR: {_he}")
 
             if args.live and not args.diag_mqtt:
                 print(f"\n[LIVE] Opening live stream for {cam.get('name', cam.get('id'))} ...")
