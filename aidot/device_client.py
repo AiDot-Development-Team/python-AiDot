@@ -996,49 +996,146 @@ class LiveStreamSession:
 
 # --------------------------------------------------------------------------- #
 # MQTT helpers (playback provisioning + live-stream discovery)
+#
+# Uses paho-mqtt with WebSocket transport (paho is installed by default in
+# Home Assistant and is widely available; no aiomqtt dependency needed).
+# Paho callbacks are bridged to asyncio via asyncio.Queue +
+# loop.call_soon_threadsafe so all async code stays on the event loop.
 # --------------------------------------------------------------------------- #
 
-async def _mqtt_connect(
+def _paho_build_client(
     mqtt_url: str,
     mqtt_user: str,
     mqtt_pwd: str,
     client_id: str,
 ):
-    """Return a connected aiomqtt.Client (context manager already entered).
+    """Construct and return a configured (not yet connected) paho Client."""
+    import paho.mqtt.client as _paho
+    import ssl as _ssl
+    from urllib.parse import urlparse
 
-    The caller is responsible for closing the client.  Returns None on error.
-    Supports both ``wss://`` and ``ws://`` broker URLs.
-    """
+    parsed   = urlparse(mqtt_url)
+    hostname = parsed.hostname or mqtt_url
+    port     = parsed.port or (8443 if parsed.scheme in ("wss", "https") else 1883)
+    tls      = parsed.scheme in ("wss", "https", "mqtts")
+    path     = parsed.path or "/mqtt"
+
+    # paho ≥2.0 requires explicit callback_api_version; use VERSION2 (current).
     try:
-        import aiomqtt
-        from urllib.parse import urlparse
-        parsed = urlparse(mqtt_url)
-        hostname = parsed.hostname or mqtt_url
-        port     = parsed.port or (8443 if parsed.scheme in ("wss", "https") else 1883)
-        tls      = parsed.scheme in ("wss", "https", "mqtts")
-
-        import ssl as _ssl
-        tls_ctx = None
-        if tls:
-            tls_ctx = _ssl.create_default_context()
-            tls_ctx.check_hostname = False
-            tls_ctx.verify_mode    = _ssl.CERT_NONE
-
-        client = aiomqtt.Client(
-            hostname=hostname,
-            port=port,
-            username=mqtt_user or None,
-            password=mqtt_pwd or None,
-            identifier=client_id,
-            tls_context=tls_ctx,
+        client = _paho.Client(
+            callback_api_version=_paho.CallbackAPIVersion.VERSION2,
+            client_id=client_id,
             transport="websockets",
-            websocket_path=parsed.path or "/mqtt",
         )
-        await client.__aenter__()
-        return client
+    except AttributeError:
+        # paho <2.0 fallback
+        client = _paho.Client(client_id=client_id, transport="websockets")
+
+    client.ws_set_options(path=path)
+
+    if mqtt_user:
+        client.username_pw_set(mqtt_user, mqtt_pwd or "")
+
+    if tls:
+        ctx = _ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode    = _ssl.CERT_NONE
+        client.tls_set_context(ctx)
+
+    return client, hostname, port
+
+
+async def _mqtt_session(
+    mqtt_url: str,
+    mqtt_user: str,
+    mqtt_pwd: str,
+    client_id: str,
+    subscribe_topics: list,
+    publish_items: list,          # list of (topic, payload_str)
+    duration: float,
+    on_message=None,
+) -> list:
+    """Connect via paho over WebSocket, subscribe, publish, collect messages.
+
+    Returns a list of (topic, payload_str) tuples received within *duration*.
+    *on_message(topic, payload_str)* is called immediately for each message.
+    """
+    loop      = asyncio.get_event_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    connected: asyncio.Future = loop.create_future()
+
+    client, hostname, port = _paho_build_client(mqtt_url, mqtt_user, mqtt_pwd, client_id)
+
+    def _on_connect(c, userdata, flags, reason_code, properties=None):
+        # VERSION2: reason_code is a ReasonCode object; rc 0 == success
+        rc = reason_code if isinstance(reason_code, int) else reason_code.value
+        if not connected.done():
+            loop.call_soon_threadsafe(connected.set_result, rc)
+
+    def _on_message(c, userdata, msg):
+        topic   = msg.topic
+        payload = (msg.payload.decode("utf-8", errors="replace")
+                   if isinstance(msg.payload, (bytes, bytearray))
+                   else str(msg.payload))
+        loop.call_soon_threadsafe(queue.put_nowait, (topic, payload))
+
+    def _on_disconnect(c, userdata, disconnect_flags=None, reason_code=None, properties=None):
+        loop.call_soon_threadsafe(queue.put_nowait, None)   # sentinel
+
+    client.on_connect    = _on_connect
+    client.on_message    = _on_message
+    client.on_disconnect = _on_disconnect
+
+    try:
+        client.connect_async(hostname, port)
+        client.loop_start()
+
+        try:
+            rc = await asyncio.wait_for(connected, timeout=10)
+        except asyncio.TimeoutError:
+            _LOGGER.debug("_mqtt_session: connect timeout for %s", mqtt_url)
+            return []
+
+        if rc != 0:
+            _LOGGER.debug("_mqtt_session: connect refused rc=%d for %s", rc, mqtt_url)
+            return []
+
+        for topic in subscribe_topics:
+            client.subscribe(topic)
+
+        for pub_topic, pub_payload in publish_items:
+            client.publish(pub_topic, pub_payload)
+
+        collected = []
+        deadline  = loop.time() + duration
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
+            if item is None:        # disconnect sentinel
+                break
+            topic, payload = item
+            collected.append(item)
+            if on_message:
+                try:
+                    on_message(topic, payload)
+                except Exception:
+                    pass
+        return collected
+
     except Exception as exc:
-        _LOGGER.debug("_mqtt_connect failed for %s: %s", mqtt_url, exc)
-        return None
+        _LOGGER.debug("_mqtt_session error: %s", exc)
+        return []
+    finally:
+        client.loop_stop()
+        try:
+            client.disconnect()
+        except Exception:
+            pass
 
 
 async def _mqtt_get_playback_server_info(
@@ -1057,60 +1154,45 @@ async def _mqtt_get_playback_server_info(
     Response arrives on iot/v1/c/{userId}/PlayBack/getPlaybackServerInfoResp
     (or on the device callback topic).
     """
-    import aiomqtt
-
-    user_id  = mqtt_user or "0"
+    user_id   = mqtt_user or "0"
+    seq       = str(random.randint(100000, 999999))
     pub_topic = f"iot/v1/s/{user_id}/PlayBack/getPlaybackServerInfoReq"
-    sub_topic = f"iot/v1/cb/{device_id}/#"
-    sub_user  = f"iot/v1/c/{user_id}/#"
-
-    seq = str(random.randint(100000, 999999))
-    payload_str = json.dumps({
-        "method":   "getPlaybackServerInfoReq",
-        "service":  "PlayBack",
-        "devId":    device_id,
-        "srcAddr":  f"0.{user_id}",
-        "seq":      seq,
-        "tst":      int(time.time() * 1000),
-        "payload":  {},
+    payload   = json.dumps({
+        "method":  "getPlaybackServerInfoReq",
+        "service": "PlayBack",
+        "devId":   device_id,
+        "srcAddr": f"0.{user_id}",
+        "seq":     seq,
+        "tst":     int(time.time() * 1000),
+        "payload": {},
     })
 
-    client = await _mqtt_connect(mqtt_url, mqtt_user, mqtt_pwd, client_id)
-    if client is None:
-        return None
+    result_holder: list = []
 
-    try:
-        await client.subscribe(sub_topic)
-        await client.subscribe(sub_user)
-        await client.publish(pub_topic, payload_str)
-
-        deadline = asyncio.get_event_loop().time() + timeout
-        async with client.messages() as messages:
-            async for msg in messages:
-                if asyncio.get_event_loop().time() > deadline:
-                    break
-                try:
-                    body = json.loads(msg.payload)
-                except Exception:
-                    continue
-                method = body.get("method", "")
-                if "PlaybackServerInfo" not in method and "getPlaybackServer" not in method:
-                    continue
-                pl = body.get("payload") or body.get("data") or {}
-                if pl.get("serverIP") or pl.get("serverIp"):
-                    pl["serverIP"] = pl.get("serverIP") or pl.get("serverIp")
-                    return pl
-    except asyncio.TimeoutError:
-        pass
-    except Exception as exc:
-        _LOGGER.debug("_mqtt_get_playback_server_info error: %s", exc)
-    finally:
+    def _check(topic, raw):
         try:
-            await client.__aexit__(None, None, None)
+            body   = json.loads(raw)
+            method = body.get("method", "")
+            if "PlaybackServerInfo" not in method and "getPlaybackServer" not in method:
+                return
+            pl = body.get("payload") or body.get("data") or {}
+            if pl.get("serverIP") or pl.get("serverIp"):
+                pl["serverIP"] = pl.get("serverIP") or pl.get("serverIp")
+                result_holder.append(pl)
         except Exception:
             pass
 
-    return None
+    await _mqtt_session(
+        mqtt_url, mqtt_user, mqtt_pwd, client_id,
+        subscribe_topics=[
+            f"iot/v1/cb/{device_id}/#",
+            f"iot/v1/c/{user_id}/#",
+        ],
+        publish_items=[(pub_topic, payload)],
+        duration=timeout,
+        on_message=_check,
+    )
+    return result_holder[0] if result_holder else None
 
 
 async def _mqtt_listen(
@@ -1125,58 +1207,22 @@ async def _mqtt_listen(
     """Subscribe to all device/user MQTT topics and collect messages for *duration* seconds.
 
     Returns a list of (topic, payload_str) tuples.
-    If *on_message* is provided it is called with (topic, payload_str) for each message.
+    *on_message(topic, payload_str)* is called for each message as it arrives.
     """
-    import aiomqtt
-
-    user_id   = mqtt_user or "0"
-    topics    = [
-        f"iot/v1/cb/{device_id}/#",
-        f"iot/v1/c/{user_id}/#",
-        f"lds/v1/cb/{device_id}/#",
-        f"lds/v1/c/{user_id}/#",
-        f"iot/v1/s/{user_id}/#",
-    ]
-
-    client = await _mqtt_connect(mqtt_url, mqtt_user, mqtt_pwd, client_id)
-    if client is None:
-        _LOGGER.warning("_mqtt_listen: could not connect to %s", mqtt_url)
-        return []
-
-    collected = []
-    try:
-        for t in topics:
-            try:
-                await client.subscribe(t)
-            except Exception as exc:
-                _LOGGER.debug("_mqtt_listen: subscribe %s failed: %s", t, exc)
-
-        deadline = asyncio.get_event_loop().time() + duration
-        async with client.messages() as messages:
-            async for msg in messages:
-                if asyncio.get_event_loop().time() > deadline:
-                    break
-                topic   = str(msg.topic)
-                payload = msg.payload.decode("utf-8", errors="replace") if isinstance(msg.payload, (bytes, bytearray)) else str(msg.payload)
-                collected.append((topic, payload))
-                if on_message:
-                    try:
-                        on_message(topic, payload)
-                    except Exception:
-                        pass
-    except asyncio.TimeoutError:
-        pass
-    except aiomqtt.MqttError as exc:
-        _LOGGER.debug("_mqtt_listen MqttError: %s", exc)
-    except Exception as exc:
-        _LOGGER.debug("_mqtt_listen error: %s", exc)
-    finally:
-        try:
-            await client.__aexit__(None, None, None)
-        except Exception:
-            pass
-
-    return collected
+    user_id = mqtt_user or "0"
+    return await _mqtt_session(
+        mqtt_url, mqtt_user, mqtt_pwd, client_id,
+        subscribe_topics=[
+            f"iot/v1/cb/{device_id}/#",
+            f"iot/v1/c/{user_id}/#",
+            f"lds/v1/cb/{device_id}/#",
+            f"lds/v1/c/{user_id}/#",
+            f"iot/v1/s/{user_id}/#",
+        ],
+        publish_items=[],
+        duration=duration,
+        on_message=on_message,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -2053,57 +2099,38 @@ class DeviceClient(object):
         results = {}
 
         # --- MQTT probe -------------------------------------------------------
-        client_conn = await _mqtt_connect(mqtt_url, mqtt_user, mqtt_pwd, client_id + "-probe")
-        if client_conn is not None:
+        publish_items = []
+        for service, method in pub_candidates:
+            pub_topic = f"iot/v1/s/{user_id}/{service}/{method}"
+            body = json.dumps({
+                "method":  method,
+                "service": service,
+                "devId":   self.device_id,
+                "srcAddr": f"0.{user_id}",
+                "seq":     seq,
+                "tst":     int(time.time() * 1000),
+                "payload": {"deviceId": self.device_id},
+            })
+            publish_items.append((pub_topic, body))
+
+        def _capture(topic, raw):
             try:
-                sub_topics = [
-                    f"iot/v1/cb/{self.device_id}/#",
-                    f"iot/v1/c/{user_id}/#",
-                    f"lds/v1/cb/{self.device_id}/#",
-                    f"lds/v1/c/{user_id}/#",
-                ]
-                for t in sub_topics:
-                    try:
-                        await client_conn.subscribe(t)
-                    except Exception:
-                        pass
+                results[f"mqtt:{topic}"] = json.loads(raw)
+            except Exception:
+                results[f"mqtt:{topic}"] = raw
 
-                for service, method in pub_candidates:
-                    pub_topic = f"iot/v1/s/{user_id}/{service}/{method}"
-                    body = json.dumps({
-                        "method":  method,
-                        "service": service,
-                        "devId":   self.device_id,
-                        "srcAddr": f"0.{user_id}",
-                        "seq":     seq,
-                        "tst":     int(time.time() * 1000),
-                        "payload": {"deviceId": self.device_id},
-                    })
-                    try:
-                        await client_conn.publish(pub_topic, body)
-                        _LOGGER.debug("async_get_live_stream_info: published %s", pub_topic)
-                    except Exception as exc:
-                        _LOGGER.debug("async_get_live_stream_info: publish %s failed: %s", pub_topic, exc)
-
-                # Collect responses for 5 seconds.
-                try:
-                    deadline = asyncio.get_event_loop().time() + 5
-                    async with client_conn.messages() as messages:
-                        async for msg in messages:
-                            if asyncio.get_event_loop().time() > deadline:
-                                break
-                            try:
-                                body_r = json.loads(msg.payload)
-                                results[f"mqtt:{msg.topic}"] = body_r
-                            except Exception:
-                                results[f"mqtt:{msg.topic}"] = str(msg.payload)
-                except Exception as exc:
-                    _LOGGER.debug("async_get_live_stream_info: MQTT receive error: %s", exc)
-            finally:
-                try:
-                    await client_conn.__aexit__(None, None, None)
-                except Exception:
-                    pass
+        await _mqtt_session(
+            mqtt_url, mqtt_user, mqtt_pwd, client_id + "-probe",
+            subscribe_topics=[
+                f"iot/v1/cb/{self.device_id}/#",
+                f"iot/v1/c/{user_id}/#",
+                f"lds/v1/cb/{self.device_id}/#",
+                f"lds/v1/c/{user_id}/#",
+            ],
+            publish_items=publish_items,
+            duration=5.0,
+            on_message=_capture,
+        )
 
         # --- HTTP probe -------------------------------------------------------
         v32_paths = [
