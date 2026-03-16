@@ -13,6 +13,10 @@ Optional flags:
   --live              Open live stream via MQTT connectipc + TCP
   --diag-mqtt         Verbose MQTT diagnostics: show broker URL, raw messages,
                       and ALL topics received (use this when --live fails)
+  --diag-live         Probe live-stream provisioning API (MQTT + HTTP) and
+                      passively sniff MQTT for 60s — open the AiDot app and
+                      start a live view for one of your cameras while this runs
+                      so the provisioning traffic is captured.
 """
 
 import argparse
@@ -308,6 +312,69 @@ async def run(args: argparse.Namespace) -> None:
                         print(f"    GET {_vpath}  -> ERROR: {_ve}")
 
 
+            if args.diag_live:
+                # ----------------------------------------------------------- #
+                # MQTT live-stream sniffer + HTTP provisioning probe
+                # ----------------------------------------------------------- #
+                print(f"\n[DIAG-LIVE] Live-stream provisioning probe for {cam.get('name')} ...")
+
+                # Fetch MQTT credentials
+                _sm_auth = await dc._async_get_smarthome_auth()
+                _mqtt_user = (_sm_auth or {}).get("mqttUser") or str(dc.user_id)
+                _mqtt_pwd  = (_sm_auth or {}).get("mqttPassword") or ""
+                _mqtt_cid  = (dc._user_info.get("mqttClientId") or f"app-{_mqtt_user}")
+                _mqtt_url  = await dc._async_get_mqtt_url()
+
+                print(f"    MQTT broker : {_mqtt_url}")
+                print(f"    MQTT user   : {_mqtt_user}")
+                print(f"    MQTT pwd    : {'<present>' if _mqtt_pwd else '<MISSING>'}")
+
+                # Step A: probe provisioning API (HTTP + MQTT requests)
+                print(f"\n[DIAG-LIVE] Probing provisioning API (active probe) ...")
+                _probe_result = await dc.async_get_live_stream_info()
+                if _probe_result:
+                    import json as _dlj
+                    for _k, _v in sorted(_probe_result.items()):
+                        _vstr = _dlj.dumps(_v, indent=8, default=str) if isinstance(_v, dict) else repr(_v)
+                        print(f"  [{_k}]")
+                        print(f"    {_vstr}")
+                else:
+                    print("    (no provisioning responses received)")
+
+                # Step B: passive MQTT sniff — user should open app live view now
+                if _mqtt_url and (_mqtt_user or _mqtt_pwd):
+                    from aidot.device_client import _mqtt_listen
+                    _sniff_secs = args.diag_live_seconds
+                    print(f"\n[DIAG-LIVE] Passive MQTT sniff for {_sniff_secs}s ...")
+                    print(f"    >>> NOW open the AiDot app and start a LIVE VIEW for this camera <<<")
+                    print(f"    >>> All MQTT messages will be printed below <<<\n")
+
+                    _seen = []
+                    def _on_msg(topic, payload):
+                        _seen.append((topic, payload))
+                        import json as _j
+                        try:
+                            _p = _j.loads(payload)
+                            _pstr = _j.dumps(_p, indent=6, default=str)
+                        except Exception:
+                            _pstr = repr(payload[:500])
+                        print(f"  MQTT  topic={topic}")
+                        print(f"        {_pstr}")
+
+                    await _mqtt_listen(
+                        _mqtt_url, _mqtt_user, _mqtt_pwd,
+                        _mqtt_cid + "-sniff",
+                        cam.get("id", ""),
+                        duration=_sniff_secs,
+                        on_message=_on_msg,
+                    )
+                    print(f"\n    Sniff complete. {len(_seen)} message(s) captured.")
+                    if not _seen:
+                        print("    (no MQTT messages received — check broker URL / credentials)")
+                else:
+                    print("\n    MQTT credentials missing — cannot sniff.")
+                    print("    Run --diag-mqtt first to diagnose authentication.")
+
             if args.live and not args.diag_mqtt:
                 print(f"\n[LIVE] Opening live stream for {cam.get('name', cam.get('id'))} ...")
                 print("    (Ctrl+C to stop early)")
@@ -350,13 +417,18 @@ def main() -> None:
     parser.add_argument("--diag-mqtt", action="store_true",
                         help="Verbose MQTT diagnostics: show broker URL, raw messages, "
                              "and ALL topics received (use this when --live fails)")
+    parser.add_argument("--diag-live", action="store_true",
+                        help="Probe live-stream provisioning API and sniff MQTT for "
+                             "--diag-live-seconds seconds (open app live view during sniff)")
+    parser.add_argument("--diag-live-seconds", type=int, default=60,
+                        help="How many seconds to sniff MQTT during --diag-live (default: 60)")
     parser.add_argument("--device", metavar="DEVICE_ID",
                         help="Run tests on only the camera with this AiDot device UID")
 
     args = parser.parse_args()
 
     # Default: run all tests if no specific flag given
-    if not any([args.p2p, args.list_recordings, args.play, args.live, args.diag_mqtt]):
+    if not any([args.p2p, args.list_recordings, args.play, args.live, args.diag_mqtt, args.diag_live]):
         args.p2p             = True
         args.list_recordings = True
         args.play            = True

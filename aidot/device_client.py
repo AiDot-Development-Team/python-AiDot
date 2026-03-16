@@ -995,6 +995,191 @@ class LiveStreamSession:
 
 
 # --------------------------------------------------------------------------- #
+# MQTT helpers (playback provisioning + live-stream discovery)
+# --------------------------------------------------------------------------- #
+
+async def _mqtt_connect(
+    mqtt_url: str,
+    mqtt_user: str,
+    mqtt_pwd: str,
+    client_id: str,
+):
+    """Return a connected aiomqtt.Client (context manager already entered).
+
+    The caller is responsible for closing the client.  Returns None on error.
+    Supports both ``wss://`` and ``ws://`` broker URLs.
+    """
+    try:
+        import aiomqtt
+        from urllib.parse import urlparse
+        parsed = urlparse(mqtt_url)
+        hostname = parsed.hostname or mqtt_url
+        port     = parsed.port or (8443 if parsed.scheme in ("wss", "https") else 1883)
+        tls      = parsed.scheme in ("wss", "https", "mqtts")
+
+        import ssl as _ssl
+        tls_ctx = None
+        if tls:
+            tls_ctx = _ssl.create_default_context()
+            tls_ctx.check_hostname = False
+            tls_ctx.verify_mode    = _ssl.CERT_NONE
+
+        client = aiomqtt.Client(
+            hostname=hostname,
+            port=port,
+            username=mqtt_user or None,
+            password=mqtt_pwd or None,
+            identifier=client_id,
+            tls_context=tls_ctx,
+            transport="websockets",
+            websocket_path=parsed.path or "/mqtt",
+        )
+        await client.__aenter__()
+        return client
+    except Exception as exc:
+        _LOGGER.debug("_mqtt_connect failed for %s: %s", mqtt_url, exc)
+        return None
+
+
+async def _mqtt_get_playback_server_info(
+    mqtt_url: str,
+    mqtt_user: str,
+    mqtt_pwd: str,
+    device_id: str,
+    client_id: str,
+    timeout: float = 15.0,
+) -> Optional[dict]:
+    """Publish getPlaybackServerInfoReq and return the payload dict, or None.
+
+    MQTT topics from IConstants.java / MqttManage.java:
+      publish : iot/v1/s/{userId}/{service}/{method}
+      subscribe: iot/v1/cb/{deviceId}/#
+    Response arrives on iot/v1/c/{userId}/PlayBack/getPlaybackServerInfoResp
+    (or on the device callback topic).
+    """
+    import aiomqtt
+
+    user_id  = mqtt_user or "0"
+    pub_topic = f"iot/v1/s/{user_id}/PlayBack/getPlaybackServerInfoReq"
+    sub_topic = f"iot/v1/cb/{device_id}/#"
+    sub_user  = f"iot/v1/c/{user_id}/#"
+
+    seq = str(random.randint(100000, 999999))
+    payload_str = json.dumps({
+        "method":   "getPlaybackServerInfoReq",
+        "service":  "PlayBack",
+        "devId":    device_id,
+        "srcAddr":  f"0.{user_id}",
+        "seq":      seq,
+        "tst":      int(time.time() * 1000),
+        "payload":  {},
+    })
+
+    client = await _mqtt_connect(mqtt_url, mqtt_user, mqtt_pwd, client_id)
+    if client is None:
+        return None
+
+    try:
+        await client.subscribe(sub_topic)
+        await client.subscribe(sub_user)
+        await client.publish(pub_topic, payload_str)
+
+        deadline = asyncio.get_event_loop().time() + timeout
+        async with client.messages() as messages:
+            async for msg in messages:
+                if asyncio.get_event_loop().time() > deadline:
+                    break
+                try:
+                    body = json.loads(msg.payload)
+                except Exception:
+                    continue
+                method = body.get("method", "")
+                if "PlaybackServerInfo" not in method and "getPlaybackServer" not in method:
+                    continue
+                pl = body.get("payload") or body.get("data") or {}
+                if pl.get("serverIP") or pl.get("serverIp"):
+                    pl["serverIP"] = pl.get("serverIP") or pl.get("serverIp")
+                    return pl
+    except asyncio.TimeoutError:
+        pass
+    except Exception as exc:
+        _LOGGER.debug("_mqtt_get_playback_server_info error: %s", exc)
+    finally:
+        try:
+            await client.__aexit__(None, None, None)
+        except Exception:
+            pass
+
+    return None
+
+
+async def _mqtt_listen(
+    mqtt_url: str,
+    mqtt_user: str,
+    mqtt_pwd: str,
+    client_id: str,
+    device_id: str,
+    duration: float = 60.0,
+    on_message=None,
+) -> list:
+    """Subscribe to all device/user MQTT topics and collect messages for *duration* seconds.
+
+    Returns a list of (topic, payload_str) tuples.
+    If *on_message* is provided it is called with (topic, payload_str) for each message.
+    """
+    import aiomqtt
+
+    user_id   = mqtt_user or "0"
+    topics    = [
+        f"iot/v1/cb/{device_id}/#",
+        f"iot/v1/c/{user_id}/#",
+        f"lds/v1/cb/{device_id}/#",
+        f"lds/v1/c/{user_id}/#",
+        f"iot/v1/s/{user_id}/#",
+    ]
+
+    client = await _mqtt_connect(mqtt_url, mqtt_user, mqtt_pwd, client_id)
+    if client is None:
+        _LOGGER.warning("_mqtt_listen: could not connect to %s", mqtt_url)
+        return []
+
+    collected = []
+    try:
+        for t in topics:
+            try:
+                await client.subscribe(t)
+            except Exception as exc:
+                _LOGGER.debug("_mqtt_listen: subscribe %s failed: %s", t, exc)
+
+        deadline = asyncio.get_event_loop().time() + duration
+        async with client.messages() as messages:
+            async for msg in messages:
+                if asyncio.get_event_loop().time() > deadline:
+                    break
+                topic   = str(msg.topic)
+                payload = msg.payload.decode("utf-8", errors="replace") if isinstance(msg.payload, (bytes, bytearray)) else str(msg.payload)
+                collected.append((topic, payload))
+                if on_message:
+                    try:
+                        on_message(topic, payload)
+                    except Exception:
+                        pass
+    except asyncio.TimeoutError:
+        pass
+    except aiomqtt.MqttError as exc:
+        _LOGGER.debug("_mqtt_listen MqttError: %s", exc)
+    except Exception as exc:
+        _LOGGER.debug("_mqtt_listen error: %s", exc)
+    finally:
+        try:
+            await client.__aexit__(None, None, None)
+        except Exception:
+            pass
+
+    return collected
+
+
+# --------------------------------------------------------------------------- #
 # DeviceClient
 # --------------------------------------------------------------------------- #
 
@@ -1830,6 +2015,148 @@ class DeviceClient(object):
             self.device_id, uid,
         )
         return session
+
+    async def async_get_live_stream_info(self) -> Optional[dict]:
+        """Probe MQTT and HTTP for the live-stream provisioning response.
+
+        Returns a dict with whatever keys the server provides (e.g. serverIP,
+        serverPort, serverProtocol, accessToken, channelArn, signalingEndpoint,
+        etc.), or None if nothing was returned.
+
+        This is used by --diag-live to discover the provisioning API before we
+        know the exact shape of the WebRTC/KVS response.
+        """
+        import aiohttp
+
+        smarthome_auth = await self._async_get_smarthome_auth()
+        mqtt_user = (smarthome_auth or {}).get("mqttUser") or str(self.user_id)
+        mqtt_pwd  = (smarthome_auth or {}).get("mqttPassword") or ""
+        client_id = (self._user_info.get("mqttClientId") or f"app-{mqtt_user}")
+        user_id   = str(self.user_id)
+
+        mqtt_url = await self._async_get_mqtt_url()
+        if not mqtt_url:
+            _LOGGER.warning("async_get_live_stream_info: no MQTT URL for %s", self.device_id)
+            return None
+
+        seq = str(random.randint(100000, 999999))
+
+        # Known service/method names for live-stream provisioning (try all).
+        pub_candidates = [
+            ("LiveAndPlayBack",  "start"),
+            ("IPC",              "getLiveInfo"),
+            ("IPC",              "startLive"),
+            ("IPC",              "getSignalingChannelReq"),
+            ("PlayBack",         "getPlaybackServerInfoReq"),
+        ]
+
+        results = {}
+
+        # --- MQTT probe -------------------------------------------------------
+        client_conn = await _mqtt_connect(mqtt_url, mqtt_user, mqtt_pwd, client_id + "-probe")
+        if client_conn is not None:
+            try:
+                sub_topics = [
+                    f"iot/v1/cb/{self.device_id}/#",
+                    f"iot/v1/c/{user_id}/#",
+                    f"lds/v1/cb/{self.device_id}/#",
+                    f"lds/v1/c/{user_id}/#",
+                ]
+                for t in sub_topics:
+                    try:
+                        await client_conn.subscribe(t)
+                    except Exception:
+                        pass
+
+                for service, method in pub_candidates:
+                    pub_topic = f"iot/v1/s/{user_id}/{service}/{method}"
+                    body = json.dumps({
+                        "method":  method,
+                        "service": service,
+                        "devId":   self.device_id,
+                        "srcAddr": f"0.{user_id}",
+                        "seq":     seq,
+                        "tst":     int(time.time() * 1000),
+                        "payload": {"deviceId": self.device_id},
+                    })
+                    try:
+                        await client_conn.publish(pub_topic, body)
+                        _LOGGER.debug("async_get_live_stream_info: published %s", pub_topic)
+                    except Exception as exc:
+                        _LOGGER.debug("async_get_live_stream_info: publish %s failed: %s", pub_topic, exc)
+
+                # Collect responses for 5 seconds.
+                try:
+                    deadline = asyncio.get_event_loop().time() + 5
+                    async with client_conn.messages() as messages:
+                        async for msg in messages:
+                            if asyncio.get_event_loop().time() > deadline:
+                                break
+                            try:
+                                body_r = json.loads(msg.payload)
+                                results[f"mqtt:{msg.topic}"] = body_r
+                            except Exception:
+                                results[f"mqtt:{msg.topic}"] = str(msg.payload)
+                except Exception as exc:
+                    _LOGGER.debug("async_get_live_stream_info: MQTT receive error: %s", exc)
+            finally:
+                try:
+                    await client_conn.__aexit__(None, None, None)
+                except Exception:
+                    pass
+
+        # --- HTTP probe -------------------------------------------------------
+        v32_paths = [
+            f"/devices/{self.device_id}/live",
+            f"/devices/{self.device_id}/stream",
+            f"/devices/{self.device_id}/signal",
+            f"/devices/{self.device_id}/webrtc",
+            f"/livestream/{self.device_id}",
+        ]
+        try:
+            async with aiohttp.ClientSession() as session:
+                for path in v32_paths:
+                    for method_fn in ("get", "post"):
+                        url = f"{self._aidot_v32_base}{path}"
+                        try:
+                            kw = dict(headers=self._aidot_headers(), timeout=aiohttp.ClientTimeout(total=8))
+                            if method_fn == "post":
+                                kw["json"] = {"deviceId": self.device_id}
+                            fn = getattr(session, method_fn)
+                            async with fn(url, **kw) as resp:
+                                body_r = await resp.json(content_type=None)
+                            results[f"http:{method_fn.upper()}:{path}:status={resp.status}"] = body_r
+                            if resp.status < 400:
+                                break
+                        except Exception as exc:
+                            results[f"http:{method_fn.upper()}:{path}"] = f"ERROR: {exc}"
+        except Exception as exc:
+            _LOGGER.debug("async_get_live_stream_info: HTTP probe error: %s", exc)
+
+        return results if results else None
+
+    async def async_open_kvs_stream(
+        self,
+        on_frame: Callable[[VideoFrame], None],
+    ) -> None:
+        """Placeholder: open a WebRTC/AWS KVS live stream for this camera.
+
+        NOT YET IMPLEMENTED.  Run ``test_camera.py --diag-live`` to capture
+        the provisioning API response, then implement based on findings.
+
+        Expected flow (AWS KVS WebRTC):
+          1. Call provisioning API → KVS channel ARN + AWS temp credentials
+          2. Describe/create KVS signaling channel
+          3. Get signaling channel WSS endpoint + ICE server config
+          4. Connect as viewer via WSS signaling channel
+          5. Exchange SDP offer/answer with the camera
+          6. Receive H.264/H.265 video via SRTP; decode with aiortc
+        """
+        raise NotImplementedError(
+            "async_open_kvs_stream is not yet implemented. "
+            "Run test_camera.py --diag-live while opening a live view in the AiDot "
+            "app to capture the provisioning API, then file an issue or PR."
+        )
 
     # -- Existing methods (unchanged) ---------------------------------------- #
 
