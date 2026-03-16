@@ -316,64 +316,103 @@ async def run(args: argparse.Namespace) -> None:
                 # ----------------------------------------------------------- #
                 # MQTT live-stream sniffer + HTTP provisioning probe
                 # ----------------------------------------------------------- #
+                import json as _dlj
+                import logging as _dl_logging
+
+                # Raise log level so MQTT connection events are visible
+                _dl_logging.getLogger("aidot.device_client").setLevel(_dl_logging.INFO)
+                _dl_logging.basicConfig(
+                    level=_dl_logging.INFO,
+                    format="%(name)s %(levelname)s: %(message)s",
+                )
+
                 print(f"\n[DIAG-LIVE] Live-stream provisioning probe for {cam.get('name')} ...")
 
                 # Fetch MQTT credentials
                 _sm_auth = await dc._async_get_smarthome_auth()
                 _mqtt_user = (_sm_auth or {}).get("mqttUser") or str(dc.user_id)
                 _mqtt_pwd  = (_sm_auth or {}).get("mqttPassword") or ""
-                _mqtt_cid  = (dc._user_info.get("mqttClientId") or f"app-{_mqtt_user}")
+                # Use the EXACT authorised clientId from the server config
+                _mqtt_cid  = (dc._user_info.get("mqttClientId") or
+                              (dc._user_info.get("_userConfigRaw") or {}).get("mqtt", {}).get("clientId") or
+                              f"app-{_mqtt_user}")
                 _mqtt_url  = await dc._async_get_mqtt_url()
 
-                print(f"    MQTT broker : {_mqtt_url}")
-                print(f"    MQTT user   : {_mqtt_user}")
-                print(f"    MQTT pwd    : {'<present>' if _mqtt_pwd else '<MISSING>'}")
+                print(f"    MQTT broker   : {_mqtt_url}")
+                print(f"    MQTT user     : {_mqtt_user}")
+                print(f"    MQTT clientId : {_mqtt_cid}")
+                print(f"    MQTT pwd      : {'<present>' if _mqtt_pwd else '<MISSING>'}")
 
-                # Step A: probe provisioning API (HTTP + MQTT requests)
-                print(f"\n[DIAG-LIVE] Probing provisioning API (active probe) ...")
+                # Step A: connection test — try all known WebSocket paths
+                from aidot.device_client import _mqtt_session_with_status
+                _live_topics = [
+                    f"iot/v1/cb/{cam.get('id')}/#",
+                    f"iot/v1/c/{_mqtt_user}/#",
+                    f"lds/v1/cb/{cam.get('id')}/#",
+                    f"lds/v1/c/{_mqtt_user}/#",
+                ]
+
+                print(f"\n[DIAG-LIVE] Testing MQTT connection (5s) ...")
+                _test_msgs, _test_status = await _mqtt_session_with_status(
+                    _mqtt_url, _mqtt_user, _mqtt_pwd, _mqtt_cid,
+                    _live_topics, [], 5.0,
+                )
+                if _test_status.get("connected"):
+                    print(f"    Connection OK  rc={_test_status['rc']} ({_test_status['rc_str']})")
+                elif _test_status.get("error"):
+                    print(f"    Connection FAILED: {_test_status['error']}")
+                    # Print last paho log lines for diagnosis
+                    for _logline in _test_status.get("log", [])[-10:]:
+                        print(f"      paho: {_logline}")
+                else:
+                    print(f"    Connection REFUSED  rc={_test_status['rc']} ({_test_status['rc_str']})")
+                    for _logline in _test_status.get("log", [])[-10:]:
+                        print(f"      paho: {_logline}")
+
+                # Step B: HTTP provisioning probe
+                print(f"\n[DIAG-LIVE] Probing HTTP provisioning endpoints ...")
                 _probe_result = await dc.async_get_live_stream_info()
                 if _probe_result:
-                    import json as _dlj
                     for _k, _v in sorted(_probe_result.items()):
                         _vstr = _dlj.dumps(_v, indent=8, default=str) if isinstance(_v, dict) else repr(_v)
-                        print(f"  [{_k}]")
-                        print(f"    {_vstr}")
+                        print(f"  [{_k}]  {_vstr}")
                 else:
-                    print("    (no provisioning responses received)")
+                    print("    (no provisioning responses received from HTTP endpoints)")
 
-                # Step B: passive MQTT sniff — user should open app live view now
-                if _mqtt_url and (_mqtt_user or _mqtt_pwd):
-                    from aidot.device_client import _mqtt_listen
-                    _sniff_secs = args.diag_live_seconds
-                    print(f"\n[DIAG-LIVE] Passive MQTT sniff for {_sniff_secs}s ...")
-                    print(f"    >>> NOW open the AiDot app and start a LIVE VIEW for this camera <<<")
-                    print(f"    >>> All MQTT messages will be printed below <<<\n")
-
-                    _seen = []
-                    def _on_msg(topic, payload):
-                        _seen.append((topic, payload))
-                        import json as _j
-                        try:
-                            _p = _j.loads(payload)
-                            _pstr = _j.dumps(_p, indent=6, default=str)
-                        except Exception:
-                            _pstr = repr(payload[:500])
-                        print(f"  MQTT  topic={topic}")
-                        print(f"        {_pstr}")
-
-                    await _mqtt_listen(
-                        _mqtt_url, _mqtt_user, _mqtt_pwd,
-                        _mqtt_cid + "-sniff",
-                        cam.get("id", ""),
-                        duration=_sniff_secs,
-                        on_message=_on_msg,
-                    )
-                    print(f"\n    Sniff complete. {len(_seen)} message(s) captured.")
-                    if not _seen:
-                        print("    (no MQTT messages received — check broker URL / credentials)")
+                # Step C: passive MQTT sniff — keep running even if connection fails
+                # so user has the full window to open the app
+                _sniff_secs = args.diag_live_seconds
+                print(f"\n[DIAG-LIVE] Passive MQTT sniff for {_sniff_secs}s ...")
+                if _test_status.get("connected"):
+                    print(f"    >>> MQTT connected OK — now open the AiDot app")
+                    print(f"    >>> and start a LIVE VIEW for this camera <<<")
                 else:
-                    print("\n    MQTT credentials missing — cannot sniff.")
-                    print("    Run --diag-mqtt first to diagnose authentication.")
+                    print(f"    >>> MQTT connection failed (see above) — check credentials <<<")
+                    print(f"    >>> Will still wait {_sniff_secs}s in case connection recovers <<<")
+                print()
+
+                _seen = []
+                def _on_msg(topic, payload):
+                    _seen.append((topic, payload))
+                    try:
+                        _p = _dlj.loads(payload)
+                        _pstr = _dlj.dumps(_p, indent=6, default=str)
+                    except Exception:
+                        _pstr = repr(payload[:500])
+                    print(f"  MQTT  topic={topic}")
+                    print(f"        {_pstr}")
+
+                _sniff_msgs, _sniff_status = await _mqtt_session_with_status(
+                    _mqtt_url, _mqtt_user, _mqtt_pwd, _mqtt_cid + "-2",
+                    _live_topics, [], float(_sniff_secs), _on_msg,
+                )
+                print(f"\n    Sniff complete. {len(_seen)} message(s) captured.")
+                if _sniff_status.get("connected"):
+                    print(f"    MQTT connected OK during sniff.")
+                elif _sniff_status.get("error"):
+                    print(f"    MQTT sniff connection error: {_sniff_status['error']}")
+                    for _logline in _sniff_status.get("log", [])[-10:]:
+                        print(f"      paho: {_logline}")
 
             if args.live and not args.diag_mqtt:
                 print(f"\n[LIVE] Opening live stream for {cam.get('name', cam.get('id'))} ...")

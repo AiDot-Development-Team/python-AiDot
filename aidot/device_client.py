@@ -997,21 +997,34 @@ class LiveStreamSession:
 # --------------------------------------------------------------------------- #
 # MQTT helpers (playback provisioning + live-stream discovery)
 #
-# Uses paho-mqtt with WebSocket transport (paho is installed by default in
-# Home Assistant and is widely available; no aiomqtt dependency needed).
-# Paho callbacks are bridged to asyncio via asyncio.Queue +
-# loop.call_soon_threadsafe so all async code stays on the event loop.
+# Uses paho-mqtt with WebSocket transport.  The synchronous paho loop runs in
+# a thread-pool executor so it never blocks the asyncio event loop.
+# Threading primitives (threading.Event, queue.Queue) replace the complex
+# asyncio Future/call_soon_threadsafe bridge that had VERSION2 ReasonCode
+# compatibility issues.
 # --------------------------------------------------------------------------- #
 
-def _paho_build_client(
+def _mqtt_session_sync(
     mqtt_url: str,
     mqtt_user: str,
     mqtt_pwd: str,
     client_id: str,
-):
-    """Construct and return a configured (not yet connected) paho Client."""
+    subscribe_topics: list,
+    publish_items: list,
+    duration: float,
+    on_message=None,
+) -> tuple:
+    """Synchronous paho MQTT session (runs in a thread executor).
+
+    Returns (messages, status_dict) where:
+      messages    = list of (topic, payload_str) tuples received
+      status_dict = {"connected": bool, "rc": int, "rc_str": str,
+                     "error": str|None, "log": [str, ...]}
+    """
     import paho.mqtt.client as _paho
     import ssl as _ssl
+    import threading
+    import queue as _queue
     from urllib.parse import urlparse
 
     parsed   = urlparse(mqtt_url)
@@ -1020,7 +1033,11 @@ def _paho_build_client(
     tls      = parsed.scheme in ("wss", "https", "mqtts")
     path     = parsed.path or "/mqtt"
 
-    # paho ≥2.0 requires explicit callback_api_version; use VERSION2 (current).
+    msg_q   = _queue.Queue()
+    conn_ev = threading.Event()
+    status  = {"connected": False, "rc": None, "rc_str": "", "error": None, "log": []}
+
+    # Build client — handle paho ≥2.0 (VERSION2) and <2.0
     try:
         client = _paho.Client(
             callback_api_version=_paho.CallbackAPIVersion.VERSION2,
@@ -1028,21 +1045,114 @@ def _paho_build_client(
             transport="websockets",
         )
     except AttributeError:
-        # paho <2.0 fallback
         client = _paho.Client(client_id=client_id, transport="websockets")
 
     client.ws_set_options(path=path)
-
     if mqtt_user:
         client.username_pw_set(mqtt_user, mqtt_pwd or "")
-
     if tls:
         ctx = _ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode    = _ssl.CERT_NONE
         client.tls_set_context(ctx)
 
-    return client, hostname, port
+    def _on_connect(c, ud, flags, reason_code, props=None):
+        # paho ≥2 passes ReasonCode; paho <2 passes int
+        try:
+            rc = int(reason_code)
+        except (TypeError, ValueError):
+            rc = -1
+        status["connected"] = (rc == 0)
+        status["rc"]        = rc
+        status["rc_str"]    = str(reason_code)
+        conn_ev.set()
+
+    def _on_message(c, ud, msg):
+        payload = (msg.payload.decode("utf-8", errors="replace")
+                   if isinstance(msg.payload, (bytes, bytearray))
+                   else str(msg.payload))
+        msg_q.put((msg.topic, payload))
+
+    def _on_disconnect(c, ud, disconnect_flags=None, reason_code=None, props=None):
+        msg_q.put(None)   # sentinel to unblock the receive loop
+
+    def _on_log(c, ud, level, buf):
+        status["log"].append(buf)
+        _LOGGER.debug("paho: %s", buf)
+
+    client.on_connect    = _on_connect
+    client.on_message    = _on_message
+    client.on_disconnect = _on_disconnect
+    client.on_log        = _on_log
+
+    import time as _time
+
+    try:
+        client.connect(hostname, port, keepalive=60)
+    except Exception as exc:
+        status["error"] = str(exc)
+        _LOGGER.warning("_mqtt_session: connect() raised: %s", exc)
+        return [], status
+
+    client.loop_start()
+
+    if not conn_ev.wait(timeout=15):
+        status["error"] = f"connect timeout to {hostname}:{port}"
+        _LOGGER.warning("_mqtt_session: %s", status["error"])
+        client.loop_stop()
+        try:
+            client.disconnect()
+        except Exception:
+            pass
+        return [], status
+
+    if not status["connected"]:
+        _LOGGER.warning(
+            "_mqtt_session: broker refused rc=%s (%s) for %s:%d",
+            status["rc"], status["rc_str"], hostname, port,
+        )
+        client.loop_stop()
+        try:
+            client.disconnect()
+        except Exception:
+            pass
+        return [], status
+
+    _LOGGER.info("_mqtt_session: connected to %s:%d clientId=%s", hostname, port, client_id)
+
+    for topic in subscribe_topics:
+        client.subscribe(topic)
+        _LOGGER.debug("_mqtt_session: subscribed %s", topic)
+
+    for pub_topic, pub_payload in publish_items:
+        client.publish(pub_topic, pub_payload)
+        _LOGGER.debug("_mqtt_session: published %s", pub_topic)
+
+    collected = []
+    deadline  = _time.monotonic() + duration
+    while True:
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            item = msg_q.get(timeout=min(remaining, 1.0))
+        except _queue.Empty:
+            continue
+        if item is None:   # disconnect sentinel
+            break
+        collected.append(item)
+        if on_message:
+            try:
+                on_message(*item)
+            except Exception:
+                pass
+
+    client.loop_stop()
+    try:
+        client.disconnect()
+    except Exception:
+        pass
+    return collected, status
 
 
 async def _mqtt_session(
@@ -1051,91 +1161,44 @@ async def _mqtt_session(
     mqtt_pwd: str,
     client_id: str,
     subscribe_topics: list,
-    publish_items: list,          # list of (topic, payload_str)
+    publish_items: list,
     duration: float,
     on_message=None,
 ) -> list:
-    """Connect via paho over WebSocket, subscribe, publish, collect messages.
+    """Async wrapper: runs _mqtt_session_sync in a thread executor.
 
-    Returns a list of (topic, payload_str) tuples received within *duration*.
-    *on_message(topic, payload_str)* is called immediately for each message.
+    Returns list of (topic, payload_str) tuples.
     """
-    loop      = asyncio.get_event_loop()
-    queue: asyncio.Queue = asyncio.Queue()
-    connected: asyncio.Future = loop.create_future()
+    loop = asyncio.get_running_loop()
+    messages, status = await loop.run_in_executor(
+        None,
+        _mqtt_session_sync,
+        mqtt_url, mqtt_user, mqtt_pwd, client_id,
+        subscribe_topics, publish_items, duration, on_message,
+    )
+    if status.get("error"):
+        _LOGGER.warning("_mqtt_session failed: %s", status["error"])
+    return messages
 
-    client, hostname, port = _paho_build_client(mqtt_url, mqtt_user, mqtt_pwd, client_id)
 
-    def _on_connect(c, userdata, flags, reason_code, properties=None):
-        # VERSION2: reason_code is a ReasonCode object; rc 0 == success
-        rc = reason_code if isinstance(reason_code, int) else reason_code.value
-        if not connected.done():
-            loop.call_soon_threadsafe(connected.set_result, rc)
-
-    def _on_message(c, userdata, msg):
-        topic   = msg.topic
-        payload = (msg.payload.decode("utf-8", errors="replace")
-                   if isinstance(msg.payload, (bytes, bytearray))
-                   else str(msg.payload))
-        loop.call_soon_threadsafe(queue.put_nowait, (topic, payload))
-
-    def _on_disconnect(c, userdata, disconnect_flags=None, reason_code=None, properties=None):
-        loop.call_soon_threadsafe(queue.put_nowait, None)   # sentinel
-
-    client.on_connect    = _on_connect
-    client.on_message    = _on_message
-    client.on_disconnect = _on_disconnect
-
-    try:
-        client.connect_async(hostname, port)
-        client.loop_start()
-
-        try:
-            rc = await asyncio.wait_for(connected, timeout=10)
-        except asyncio.TimeoutError:
-            _LOGGER.debug("_mqtt_session: connect timeout for %s", mqtt_url)
-            return []
-
-        if rc != 0:
-            _LOGGER.debug("_mqtt_session: connect refused rc=%d for %s", rc, mqtt_url)
-            return []
-
-        for topic in subscribe_topics:
-            client.subscribe(topic)
-
-        for pub_topic, pub_payload in publish_items:
-            client.publish(pub_topic, pub_payload)
-
-        collected = []
-        deadline  = loop.time() + duration
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                break
-            try:
-                item = await asyncio.wait_for(queue.get(), timeout=remaining)
-            except asyncio.TimeoutError:
-                break
-            if item is None:        # disconnect sentinel
-                break
-            topic, payload = item
-            collected.append(item)
-            if on_message:
-                try:
-                    on_message(topic, payload)
-                except Exception:
-                    pass
-        return collected
-
-    except Exception as exc:
-        _LOGGER.debug("_mqtt_session error: %s", exc)
-        return []
-    finally:
-        client.loop_stop()
-        try:
-            client.disconnect()
-        except Exception:
-            pass
+async def _mqtt_session_with_status(
+    mqtt_url: str,
+    mqtt_user: str,
+    mqtt_pwd: str,
+    client_id: str,
+    subscribe_topics: list,
+    publish_items: list,
+    duration: float,
+    on_message=None,
+) -> tuple:
+    """Like _mqtt_session but also returns the status dict for diagnostics."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        _mqtt_session_sync,
+        mqtt_url, mqtt_user, mqtt_pwd, client_id,
+        subscribe_topics, publish_items, duration, on_message,
+    )
 
 
 async def _mqtt_get_playback_server_info(
