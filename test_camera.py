@@ -236,8 +236,7 @@ async def run(args: argparse.Namespace) -> None:
                 # --------------------------------------------------------------- #
                 print(f"\n[DIAG] All raw device fields for {cam.get('name')}:")
                 for _dk, _dv in cam.items():
-                    if _dk != "product":
-                        print(f"    {_dk} = {_dv!r}")
+                    print(f"    {_dk} = {_dv!r}")
 
                 # Dump ALL user_info keys
                 print(f"\n[DIAG] All user_info keys ({len(dc._user_info)} total):")
@@ -276,6 +275,37 @@ async def run(args: argparse.Namespace) -> None:
                     print(f"    P2P UID: {_p2p_uid!r}  (TUTK/LiveAndPlayBack path available)")
                 else:
                     print(f"    P2P UID: None  (P2P not available; relay path needed)")
+
+                # --- v32 IPC device detail probe ---
+                # Android app's NewLiveFragment.w5() parses a device property JSON
+                # string to get the TUTK UID. Probe v32 IPC endpoints directly so
+                # we can see the raw response and identify which field carries it.
+                import aiohttp as _v32_aiohttp
+                _v32_base = dc._aidot_v32_base
+                _v32_headers = dc._aidot_headers()
+                print(f"\n[DIAG] Probing v32 IPC device detail endpoints "
+                      f"({_v32_base}) ...")
+                _v32_paths = [
+                    f"/devices/{cam.get('id')}",
+                    f"/devices/{cam.get('id')}/info",
+                    f"/devices/{cam.get('id')}/detail",
+                ]
+                for _vpath in _v32_paths:
+                    try:
+                        async with _v32_aiohttp.ClientSession() as _vs:
+                            async with _vs.get(
+                                f"{_v32_base}{_vpath}",
+                                headers=_v32_headers,
+                                timeout=_v32_aiohttp.ClientTimeout(total=10),
+                            ) as _vr:
+                                _vstatus = _vr.status
+                                _vbody = await _vr.json(content_type=None)
+                        print(f"    GET {_vpath}  -> HTTP {_vstatus}")
+                        print(f"    {_dui_json.dumps(_vbody, indent=6, default=str)}")
+                        if _vstatus < 400:
+                            break   # got a real response; no need to try remaining paths
+                    except Exception as _ve:
+                        print(f"    GET {_vpath}  -> ERROR: {_ve}")
 
 
             if args.live and not args.diag_mqtt:

@@ -1451,6 +1451,10 @@ class DeviceClient(object):
     def _aidot_v21_base(self) -> str:
         return f"https://prod-{self._region}-api.arnoo.com/v21"
 
+    @property
+    def _aidot_v32_base(self) -> str:
+        return f"https://prod-{self._region}-api.arnoo.com/v32/api/ipc"
+
     def _aidot_headers(self) -> dict:
         # Auth headers for the AiDot platform API (prod-{region}-api.arnoo.com).
         # Matches AidotClient.async_session_get(): CONF_APP_ID="Appid", APP_ID,
@@ -1567,14 +1571,51 @@ class DeviceClient(object):
 
             uid = body.get("data") or body.get("uid")
             if uid:
+                _LOGGER.debug("async_get_p2p_uid: got UID from getP2pId: %s", uid)
                 return str(uid)
-            _LOGGER.warning(
-                "async_get_p2p_uid: both sources returned empty UID for %s. "
-                "smarthome body=%s", self.device_id, body
-            )
+            _LOGGER.debug("async_get_p2p_uid: getP2pId returned no UID for %s. body=%s",
+                          self.device_id, body)
         except Exception as exc:
-            _LOGGER.error("async_get_p2p_uid: smarthome call failed for %s: %s",
+            _LOGGER.debug("async_get_p2p_uid: smarthome call failed for %s: %s",
                           self.device_id, exc)
+
+        # --- Source 3: AiDot v32 IPC device detail ---
+        # Android app's NewLiveFragment.w5() parses a JSON string from the device
+        # object to obtain the TUTK UID. The v32 IPC endpoint may return it directly.
+        # Known paths from iOS HTTP traffic: /v32/api/ipc/devices/{id}
+        for path in (
+            f"/devices/{self.device_id}",
+            f"/devices/{self.device_id}/info",
+            f"/devices/{self.device_id}/detail",
+        ):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"{self._aidot_v32_base}{path}",
+                        headers=self._aidot_headers(),
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        body = await resp.json(content_type=None)
+
+                data = body.get("data") or body if isinstance(body, dict) else {}
+                uid = (data.get("p2pId") or data.get("tutkUid")
+                       or data.get("tutk_uid") or data.get("uid")
+                       or data.get("iotcUid") or data.get("p2pUID"))
+                if uid:
+                    _LOGGER.debug("async_get_p2p_uid: got UID from v32%s: %s", path, uid)
+                    return str(uid)
+                _LOGGER.debug("async_get_p2p_uid: v32%s returned no UID for %s. body=%s",
+                              path, self.device_id, body)
+                # If we got a 200-level response (not 404/405), don't try other paths
+                break
+            except Exception as exc:
+                _LOGGER.debug("async_get_p2p_uid: v32%s failed for %s: %s",
+                              path, self.device_id, exc)
+
+        _LOGGER.warning(
+            "async_get_p2p_uid: all three sources returned empty UID for %s",
+            self.device_id,
+        )
         return None
 
     async def async_get_cloud_recordings(
