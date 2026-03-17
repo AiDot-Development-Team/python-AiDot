@@ -394,20 +394,55 @@ async def run(args: argparse.Namespace) -> None:
                     print(f"\n    All WebSocket paths failed.  Check credentials / network.")
                     print(f"    (sniff will still run in case broker is intermittent)")
 
-                # Step B: HTTP + MQTT active probe (uses diag clientId internally)
-                print(f"\n[DIAG-LIVE] Probing HTTP/MQTT provisioning endpoints ...")
+                # Step B: Fetch ICE server config (STUN/TURN credentials for WebRTC)
+                # Protocol confirmed: liveType=2 uses WebRTC-over-MQTT DataChannel.
+                # ICE config provides per-device TURN credentials from the Arnoo cluster.
+                print(f"\n[DIAG-LIVE] Fetching ICE server config (STUN/TURN credentials) ...")
+                _ice_cfg = await dc.async_get_ice_config(cam.get("id"))
+                if _ice_cfg:
+                    _app_entries = _ice_cfg.get("app") or []
+                    _dev_entries = _ice_cfg.get("dev") or []
+                    print(f"    ICE config received:  {len(_app_entries)} app entry, {len(_dev_entries)} dev entr{'y' if len(_dev_entries)==1 else 'ies'}")
+                    for _e in _app_entries:
+                        print(f"      app  id={_e.get('id','?')}  token={_e.get('token','?')}  ttl={_e.get('ttl','?')}")
+                        for _u in (_e.get("uris") or []):
+                            print(f"           uri: {_u}")
+                    for _e in _dev_entries:
+                        if _e.get("id") == cam.get("id"):
+                            print(f"      dev  id={_e.get('id','?')}  token={_e.get('token','?')}  ttl={_e.get('ttl','?')}  *** this camera ***")
+                        else:
+                            print(f"      dev  id={_e.get('id','?')}  token={_e.get('token','?')}")
+                        for _u in (_e.get("uris") or []):
+                            print(f"           uri: {_u}")
+                else:
+                    print(f"    (no ICE config received — will need passive sniff to capture getIceConfigResp)")
+                    print(f"    Note: ICE config may only be delivered while the app is active; the passive")
+                    print(f"    sniff below will capture it if the AiDot app fetches it during the window.")
+
+                # Step B2: HTTP/MQTT broad probe (all return HTTP 500 for this camera model)
+                # Kept for documentation; none of these endpoints work for liveType=2 cameras.
+                print(f"\n[DIAG-LIVE] Probing HTTP/MQTT provisioning endpoints (expect all 500s for liveType=2) ...")
                 _probe_result = await dc.async_get_live_stream_info()
                 if _probe_result:
-                    for _k, _v in sorted(_probe_result.items()):
-                        if isinstance(_v, dict):
-                            _vstr = _dlj.dumps(_v, indent=8, default=str)
-                        elif isinstance(_v, str) and _v.startswith("ERROR"):
-                            continue   # skip noisy errors
-                        else:
-                            _vstr = repr(_v)
-                        print(f"  [{_k}]  {_vstr}")
+                    _non_error = {k: v for k, v in _probe_result.items()
+                                  if not (isinstance(v, str) and v.startswith("ERROR"))}
+                    _mqtt_results = {k: v for k, v in _non_error.items() if k.startswith("mqtt:")}
+                    _http_non500 = {k: v for k, v in _non_error.items()
+                                    if k.startswith("http:") and "status=500" not in k}
+                    if _mqtt_results:
+                        print(f"  MQTT responses:")
+                        for _k, _v in sorted(_mqtt_results.items()):
+                            _vstr = _dlj.dumps(_v, indent=8, default=str) if isinstance(_v, dict) else repr(_v)
+                            print(f"  [{_k}]  {_vstr}")
+                    if _http_non500:
+                        print(f"  HTTP non-500 responses:")
+                        for _k, _v in sorted(_http_non500.items()):
+                            _vstr = _dlj.dumps(_v, indent=8, default=str) if isinstance(_v, dict) else repr(_v)
+                            print(f"  [{_k}]  {_vstr}")
+                    if not _mqtt_results and not _http_non500:
+                        print(f"    (all HTTP endpoints returned 500 / no MQTT responses — expected for liveType=2)")
                 else:
-                    print("    (no provisioning responses received)")
+                    print("    (no responses received)")
 
                 # Step C: passive MQTT sniff — always runs full duration
                 # Uses _diag_cid (not _mqtt_cid) so we don't kick the real app.

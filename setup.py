@@ -16,6 +16,10 @@ setuptools.setup(
         "requests",
         "aiohttp",
     ],
+    extras_require={
+        # Required for liveType=2 cameras (WebRTC-over-MQTT DataChannel streaming)
+        "webrtc": ["aiortc>=1.9.0"],
+    },
     classifiers=(
         "Programming Language :: Python :: 3.12",
         "License :: OSI Approved :: MIT License",

@@ -2153,6 +2153,94 @@ class DeviceClient(object):
         )
         return session
 
+    async def async_get_ice_config(self, device_id: str) -> Optional[dict]:
+        """Fetch STUN/TURN ICE server credentials for a liveType=2 camera.
+
+        Publishes ``IPC/getIceConfigReq`` via MQTT and waits up to 5 s for the
+        ``IPC/getIceConfigResp`` reply.  The response contains per-device and
+        per-user TURN credentials for the Arnoo TURN cluster.
+
+        Returns a dict with keys ``app`` (list of user-side ICE server entries)
+        and ``dev`` (list of device-side ICE server entries), each entry having
+        the shape::
+
+            {"id": str, "token": int, "ttl": int,
+             "uris": [...], "dnsUris": [...]}
+
+        Returns ``None`` if the MQTT session fails or no response arrives.
+        A fallback ICE config (public STUN only, no TURN credentials) can be
+        constructed by the caller if ``None`` is returned.
+        """
+        smarthome_auth = await self._async_get_smarthome_auth()
+        mqtt_user = (smarthome_auth or {}).get("mqttUser") or str(self.user_id)
+        mqtt_pwd  = (smarthome_auth or {}).get("mqttPassword") or ""
+        client_id = (self._user_info.get("mqttClientId") or f"app-{mqtt_user}")
+        user_id   = str(self.user_id)
+        diag_cid  = _diag_client_id(client_id, user_id)
+        mqtt_url  = await self._async_get_mqtt_url()
+        if not mqtt_url:
+            _LOGGER.warning("async_get_ice_config: no MQTT URL available")
+            return None
+
+        seq     = f"ap{random.randint(1000000, 9999999)}"
+        result: dict = {}
+
+        payload = json.dumps({
+            "method":  "getIceConfigReq",
+            "service": "IPC",
+            "srcAddr": f"0.{user_id}",
+            "seq":     seq,
+            "tst":     int(time.time() * 1000),
+            "payload": {"deviceId": device_id, "userId": user_id},
+        })
+
+        def _capture(topic: str, raw: str) -> None:
+            # Accept any message on the user callback topic that looks like
+            # an ICE config response.
+            if "iceconfig" in topic.lower() or "getice" in topic.lower():
+                try:
+                    msg = json.loads(raw)
+                    inner = (msg.get("payload") or msg.get("data") or msg)
+                    if isinstance(inner, dict) and ("app" in inner or "dev" in inner):
+                        result["data"] = inner
+                    elif isinstance(inner, dict):
+                        result["data"] = msg
+                except Exception:
+                    result["data"] = raw
+
+        await _mqtt_session(
+            mqtt_url, mqtt_user, mqtt_pwd, diag_cid,
+            subscribe_topics=[f"iot/v1/c/{user_id}/#"],
+            publish_items=[(f"iot/v1/s/{user_id}/IPC/getIceConfigReq", payload)],
+            duration=5.0,
+            on_message=_capture,
+        )
+
+        if "data" not in result:
+            _LOGGER.warning(
+                "async_get_ice_config: no getIceConfigResp received for device %s; "
+                "the device may not support MQTT ICE config (try after opening app live view)",
+                device_id,
+            )
+        return result.get("data")
+
+    @staticmethod
+    def generate_webrtc_peer_id(live_type: int = 2, stream_id: int = 0) -> str:
+        """Generate a peerId for a liveType=2 WebRTC connection.
+
+        Format observed in iOS app telemetry:
+        ``{32-hex-session}_{6-hex-random}_{liveType}_{streamId}_{version}``
+
+        The session prefix is a per-app-session UUID (same for all cameras
+        opened in the same session).  We generate it fresh per call; callers
+        that open multiple cameras simultaneously should share one session
+        prefix across all ``generate_webrtc_peer_id`` calls.
+        """
+        import os
+        session = os.urandom(16).hex()          # 32 hex chars
+        rand6   = os.urandom(3).hex()           # 6 hex chars
+        return f"{session}_{rand6}_{live_type}_{stream_id}_1"
+
     async def async_get_live_stream_info(self) -> Optional[dict]:
         """Probe MQTT and HTTP for the live-stream provisioning response.
 
@@ -2282,28 +2370,50 @@ class DeviceClient(object):
 
         return results if results else None
 
-    async def async_open_kvs_stream(
+    async def async_open_webrtc_stream(
         self,
         on_frame: Callable[[VideoFrame], None],
     ) -> None:
-        """Placeholder: open a WebRTC/AWS KVS live stream for this camera.
+        """Placeholder: open a liveType=2 WebRTC-over-MQTT DataChannel stream.
 
-        NOT YET IMPLEMENTED.  Run ``test_camera.py --diag-live`` to capture
-        the provisioning API response, then implement based on findings.
+        NOT YET IMPLEMENTED.  Use ``test_camera.py --diag-live`` (with the user
+        prompt) to capture the live MQTT signaling messages, then implement.
 
-        Expected flow (AWS KVS WebRTC):
-          1. Call provisioning API → KVS channel ARN + AWS temp credentials
-          2. Describe/create KVS signaling channel
-          3. Get signaling channel WSS endpoint + ICE server config
-          4. Connect as viewer via WSS signaling channel
-          5. Exchange SDP offer/answer with the camera
-          6. Receive H.264/H.265 video via SRTP; decode with aiortc
+        Confirmed protocol (from iOS app telemetry, 2025-03-23):
+          1. ``async_get_ice_config(device_id)``
+             → MQTT ``IPC/getIceConfigReq`` → ``getIceConfigResp``
+             → STUN: 3.230.182.123:3478 / TURN: 3.230.182.123:5349
+             → per-device TURN credentials (token int)
+
+          2. Create ``aiortc.RTCPeerConnection`` with ICE servers
+             Create ``RTCDataChannel``
+
+          3. Generate SDP offer, gather local ICE candidates
+             Publish to ``iot/v1/s/{userId}/IPC/offerReq``
+             (peerid format: ``{session32hex}_{rand6hex}_{liveType}_{streamId}_1``)
+
+          4. Receive SDP answer + device ICE candidates on
+             ``iot/v1/c/{userId}/#``
+
+          5. ICE negotiation → DataChannel OPEN
+
+          6. Publish ``iot/v1/s/{userId}/IPC/livePlayReq``
+             → receive ``livePlayResp`` code=200
+
+          7. Receive binary video frames from DataChannel
+             (proprietary Leedarson framing; H.264 NAL units inside)
+
+        Requires: ``pip install python-aidot[webrtc]``  (adds aiortc)
         """
         raise NotImplementedError(
-            "async_open_kvs_stream is not yet implemented. "
-            "Run test_camera.py --diag-live while opening a live view in the AiDot "
-            "app to capture the provisioning API, then file an issue or PR."
+            "async_open_webrtc_stream is not yet implemented. "
+            "Run test_camera.py --diag-live (with ENTER prompt) while opening a "
+            "live view in the AiDot app to capture the MQTT signaling messages, "
+            "then implement based on observed offer/answer payload format."
         )
+
+    # Keep old name as alias so any callers don't break
+    async_open_kvs_stream = async_open_webrtc_stream
 
     # -- Existing methods (unchanged) ---------------------------------------- #
 
