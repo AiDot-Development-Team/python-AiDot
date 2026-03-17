@@ -1004,6 +1004,17 @@ class LiveStreamSession:
 # compatibility issues.
 # --------------------------------------------------------------------------- #
 
+def _diag_client_id(authorised_cid: str, user_id: str) -> str:
+    """Return an alternative clientId matching {terminalIndex}-{userId} format.
+
+    The authorised clientId has the form '{6chars}-{userId}'.  Broker auth
+    validates the username (userId) + password; the terminal-index prefix is
+    client-chosen.  We use a fixed diagnostic prefix so we don't collide with
+    the real app session while still satisfying any format checks.
+    """
+    return f"cc0001-{user_id}"
+
+
 def _mqtt_session_sync(
     mqtt_url: str,
     mqtt_user: str,
@@ -1013,6 +1024,7 @@ def _mqtt_session_sync(
     publish_items: list,
     duration: float,
     on_message=None,
+    ws_path: str = "/mqtt",
 ) -> tuple:
     """Synchronous paho MQTT session (runs in a thread executor).
 
@@ -1020,6 +1032,9 @@ def _mqtt_session_sync(
       messages    = list of (topic, payload_str) tuples received
       status_dict = {"connected": bool, "rc": int, "rc_str": str,
                      "error": str|None, "log": [str, ...]}
+
+    ws_path overrides the WebSocket endpoint path (default "/mqtt").
+    Pass "" or "/" to try the root path.
     """
     import paho.mqtt.client as _paho
     import ssl as _ssl
@@ -1031,7 +1046,10 @@ def _mqtt_session_sync(
     hostname = parsed.hostname or mqtt_url
     port     = parsed.port or (8443 if parsed.scheme in ("wss", "https") else 1883)
     tls      = parsed.scheme in ("wss", "https", "mqtts")
-    path     = parsed.path or "/mqtt"
+    # ws_path parameter takes priority; fall back to URL path then "/mqtt"
+    path     = ws_path if ws_path is not None else (parsed.path or "/mqtt")
+    if path == "":
+        path = "/"
 
     msg_q   = _queue.Queue()
     conn_ev = threading.Event()
@@ -1074,6 +1092,12 @@ def _mqtt_session_sync(
         msg_q.put((msg.topic, payload))
 
     def _on_disconnect(c, ud, disconnect_flags=None, reason_code=None, props=None):
+        # If _on_connect was never fired (WebSocket upgrade failed, auth refused
+        # at TCP level, etc.) signal conn_ev now so the caller doesn't time out.
+        if not conn_ev.is_set():
+            status["connected"] = False
+            status["rc_str"]    = f"disconnect-before-connect rc={reason_code}"
+            conn_ev.set()
         msg_q.put(None)   # sentinel to unblock the receive loop
 
     def _on_log(c, ud, level, buf):
@@ -1164,18 +1188,20 @@ async def _mqtt_session(
     publish_items: list,
     duration: float,
     on_message=None,
+    ws_path: str = "/mqtt",
 ) -> list:
     """Async wrapper: runs _mqtt_session_sync in a thread executor.
 
     Returns list of (topic, payload_str) tuples.
     """
+    import functools
     loop = asyncio.get_running_loop()
-    messages, status = await loop.run_in_executor(
-        None,
+    fn = functools.partial(
         _mqtt_session_sync,
         mqtt_url, mqtt_user, mqtt_pwd, client_id,
-        subscribe_topics, publish_items, duration, on_message,
+        subscribe_topics, publish_items, duration, on_message, ws_path,
     )
+    messages, status = await loop.run_in_executor(None, fn)
     if status.get("error"):
         _LOGGER.warning("_mqtt_session failed: %s", status["error"])
     return messages
@@ -1190,15 +1216,17 @@ async def _mqtt_session_with_status(
     publish_items: list,
     duration: float,
     on_message=None,
+    ws_path: str = "/mqtt",
 ) -> tuple:
     """Like _mqtt_session but also returns the status dict for diagnostics."""
+    import functools
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None,
+    fn = functools.partial(
         _mqtt_session_sync,
         mqtt_url, mqtt_user, mqtt_pwd, client_id,
-        subscribe_topics, publish_items, duration, on_message,
+        subscribe_topics, publish_items, duration, on_message, ws_path,
     )
+    return await loop.run_in_executor(None, fn)
 
 
 async def _mqtt_get_playback_server_info(
@@ -2150,12 +2178,21 @@ class DeviceClient(object):
 
         seq = str(random.randint(100000, 999999))
 
+        # Use a diagnostics clientId that matches {terminalIndex}-{userId} format
+        # so the broker doesn't reject it.  Do NOT append arbitrary suffixes.
+        diag_cid = _diag_client_id(client_id, user_id)
+
         # Known service/method names for live-stream provisioning (try all).
+        # connectipcReq is the documented TCP-relay live-stream request; also
+        # try liveType=2 candidates getLiveStreamUrl / getSignalingChannel.
         pub_candidates = [
+            ("LiveAndPlayBack",  "connectipcReq"),
+            ("IPC",              "connectipcReq"),
             ("LiveAndPlayBack",  "start"),
             ("IPC",              "getLiveInfo"),
             ("IPC",              "startLive"),
             ("IPC",              "getSignalingChannelReq"),
+            ("IPC",              "getLiveStreamUrl"),
             ("PlayBack",         "getPlaybackServerInfoReq"),
         ]
 
@@ -2172,7 +2209,11 @@ class DeviceClient(object):
                 "srcAddr": f"0.{user_id}",
                 "seq":     seq,
                 "tst":     int(time.time() * 1000),
-                "payload": {"deviceId": self.device_id},
+                "payload": {
+                    "deviceId": self.device_id,
+                    "devId":    self.device_id,
+                    "userId":   user_id,
+                },
             })
             publish_items.append((pub_topic, body))
 
@@ -2183,7 +2224,7 @@ class DeviceClient(object):
                 results[f"mqtt:{topic}"] = raw
 
         await _mqtt_session(
-            mqtt_url, mqtt_user, mqtt_pwd, client_id + "-probe",
+            mqtt_url, mqtt_user, mqtt_pwd, diag_cid,
             subscribe_topics=[
                 f"iot/v1/cb/{self.device_id}/#",
                 f"iot/v1/c/{user_id}/#",
@@ -2196,30 +2237,46 @@ class DeviceClient(object):
         )
 
         # --- HTTP probe -------------------------------------------------------
-        v32_paths = [
-            f"/devices/{self.device_id}/live",
-            f"/devices/{self.device_id}/stream",
-            f"/devices/{self.device_id}/signal",
-            f"/devices/{self.device_id}/webrtc",
-            f"/livestream/{self.device_id}",
+        # Three API base URLs to try: v21 (general device API), v32 IPC (camera
+        # specific), and the smarthome endpoint (SDK login backend).
+        _ipc_id = self.device_id
+        _http_probes = [
+            # (base_url, path, method)
+            (self._aidot_v32_base, f"/devices/{_ipc_id}/live",     "get"),
+            (self._aidot_v32_base, f"/devices/{_ipc_id}/stream",   "get"),
+            (self._aidot_v32_base, f"/devices/{_ipc_id}/signal",   "get"),
+            (self._aidot_v32_base, f"/devices/{_ipc_id}/webrtc",   "get"),
+            (self._aidot_v32_base, f"/livestream/{_ipc_id}",       "get"),
+            (self._aidot_v32_base, f"/devices/{_ipc_id}/live",     "post"),
+            (self._aidot_v32_base, f"/livestream/{_ipc_id}",       "post"),
+            # v21 API paths
+            (self._aidot_v21_base, f"/devices/{_ipc_id}/live",     "get"),
+            (self._aidot_v21_base, f"/ipc/{_ipc_id}/stream",       "get"),
+            (self._aidot_v21_base, f"/ipc/live/{_ipc_id}",         "get"),
+            (self._aidot_v21_base, f"/devices/{_ipc_id}/live",     "post"),
+            # smarthome / Leedarson SDK paths
+            (self._smarthome_base, f"/device/ipc/connect",          "post"),
+            (self._smarthome_base, f"/deviceController/ipc/live",   "get"),
+            (self._smarthome_base, f"/deviceController/ipc/stream", "post"),
         ]
         try:
             async with aiohttp.ClientSession() as session:
-                for path in v32_paths:
-                    for method_fn in ("get", "post"):
-                        url = f"{self._aidot_v32_base}{path}"
-                        try:
-                            kw = dict(headers=self._aidot_headers(), timeout=aiohttp.ClientTimeout(total=8))
-                            if method_fn == "post":
-                                kw["json"] = {"deviceId": self.device_id}
-                            fn = getattr(session, method_fn)
-                            async with fn(url, **kw) as resp:
-                                body_r = await resp.json(content_type=None)
-                            results[f"http:{method_fn.upper()}:{path}:status={resp.status}"] = body_r
-                            if resp.status < 400:
-                                break
-                        except Exception as exc:
-                            results[f"http:{method_fn.upper()}:{path}"] = f"ERROR: {exc}"
+                for base, path, method_fn in _http_probes:
+                    url = f"{base}{path}"
+                    try:
+                        kw: dict = dict(
+                            headers=self._aidot_headers(),
+                            timeout=aiohttp.ClientTimeout(total=8),
+                        )
+                        if method_fn == "post":
+                            kw["json"] = {"deviceId": _ipc_id}
+                        fn = getattr(session, method_fn)
+                        async with fn(url, **kw) as resp:
+                            body_r = await resp.json(content_type=None)
+                        key = f"http:{method_fn.upper()}:{path}:status={resp.status}"
+                        results[key] = body_r
+                    except Exception as exc:
+                        results[f"http:{method_fn.upper()}:{path}"] = f"ERROR: {exc}"
         except Exception as exc:
             _LOGGER.debug("async_get_live_stream_info: HTTP probe error: %s", exc)
 

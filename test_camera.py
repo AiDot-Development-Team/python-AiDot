@@ -318,6 +318,7 @@ async def run(args: argparse.Namespace) -> None:
                 # ----------------------------------------------------------- #
                 import json as _dlj
                 import logging as _dl_logging
+                from aidot.device_client import _mqtt_session_with_status, _diag_client_id
 
                 # Raise log level so MQTT connection events are visible
                 _dl_logging.getLogger("aidot.device_client").setLevel(_dl_logging.INFO)
@@ -336,15 +337,28 @@ async def run(args: argparse.Namespace) -> None:
                 _mqtt_cid  = (dc._user_info.get("mqttClientId") or
                               (dc._user_info.get("_userConfigRaw") or {}).get("mqtt", {}).get("clientId") or
                               f"app-{_mqtt_user}")
+                # Diagnostic clientId that keeps the {terminal}-{userId} format
+                _diag_cid  = _diag_client_id(_mqtt_cid, _mqtt_user)
                 _mqtt_url  = await dc._async_get_mqtt_url()
 
                 print(f"    MQTT broker   : {_mqtt_url}")
                 print(f"    MQTT user     : {_mqtt_user}")
-                print(f"    MQTT clientId : {_mqtt_cid}")
+                print(f"    MQTT clientId : {_mqtt_cid}  (auth)")
+                print(f"    MQTT diagCid  : {_diag_cid}  (used for sniff)")
                 print(f"    MQTT pwd      : {'<present>' if _mqtt_pwd else '<MISSING>'}")
 
-                # Step A: connection test — try all known WebSocket paths
-                from aidot.device_client import _mqtt_session_with_status
+                # Print any streaming-related keys from getServerUrlConfig response
+                _raw_cfg = (dc._smarthome_auth or {}).get("raw") or {}
+                if _raw_cfg:
+                    _stream_keys = {k: v for k, v in _raw_cfg.items()
+                                    if any(x in k.lower() for x in
+                                           ("live", "stream", "rtsp", "webrtc", "kvs",
+                                            "signal", "media", "play", "video", "ipc"))}
+                    if _stream_keys:
+                        print(f"    getServerUrlConfig streaming keys: {_stream_keys}")
+                    else:
+                        print(f"    getServerUrlConfig keys: {sorted(_raw_cfg.keys())}")
+
                 _live_topics = [
                     f"iot/v1/cb/{cam.get('id')}/#",
                     f"iot/v1/c/{_mqtt_user}/#",
@@ -352,43 +366,58 @@ async def run(args: argparse.Namespace) -> None:
                     f"lds/v1/c/{_mqtt_user}/#",
                 ]
 
-                print(f"\n[DIAG-LIVE] Testing MQTT connection (5s) ...")
-                _test_msgs, _test_status = await _mqtt_session_with_status(
-                    _mqtt_url, _mqtt_user, _mqtt_pwd, _mqtt_cid,
-                    _live_topics, [], 5.0,
-                )
-                if _test_status.get("connected"):
-                    print(f"    Connection OK  rc={_test_status['rc']} ({_test_status['rc_str']})")
-                elif _test_status.get("error"):
-                    print(f"    Connection FAILED: {_test_status['error']}")
-                    # Print last paho log lines for diagnosis
-                    for _logline in _test_status.get("log", [])[-10:]:
-                        print(f"      paho: {_logline}")
-                else:
-                    print(f"    Connection REFUSED  rc={_test_status['rc']} ({_test_status['rc_str']})")
-                    for _logline in _test_status.get("log", [])[-10:]:
-                        print(f"      paho: {_logline}")
+                # Step A: connection test — try WebSocket paths until one works
+                # Fixes: wrong path causes WebSocket upgrade failure (silent with
+                # old code; now reported via _on_disconnect before conn_ev timeout).
+                print(f"\n[DIAG-LIVE] Testing MQTT connection (WebSocket path probe) ...")
+                _working_path = None
+                for _ws_path in ["/mqtt", "/", "/ws"]:
+                    _t_msgs, _t_st = await _mqtt_session_with_status(
+                        _mqtt_url, _mqtt_user, _mqtt_pwd, _mqtt_cid,
+                        _live_topics, [], 3.0, ws_path=_ws_path,
+                    )
+                    if _t_st.get("connected"):
+                        print(f"    path {_ws_path!r:8s}: CONNECTED  rc={_t_st['rc']} ({_t_st['rc_str']})")
+                        _working_path = _ws_path
+                        break
+                    else:
+                        _err = _t_st.get("error") or _t_st.get("rc_str") or "unknown"
+                        print(f"    path {_ws_path!r:8s}: FAILED  ({_err})")
+                        for _logline in _t_st.get("log", [])[-5:]:
+                            print(f"      paho: {_logline}")
 
-                # Step B: HTTP provisioning probe
-                print(f"\n[DIAG-LIVE] Probing HTTP provisioning endpoints ...")
+                if _working_path is None:
+                    print(f"\n    All WebSocket paths failed.  Check credentials / network.")
+                    print(f"    (sniff will still run in case broker is intermittent)")
+
+                # Step B: HTTP + MQTT active probe (uses diag clientId internally)
+                print(f"\n[DIAG-LIVE] Probing HTTP/MQTT provisioning endpoints ...")
                 _probe_result = await dc.async_get_live_stream_info()
                 if _probe_result:
                     for _k, _v in sorted(_probe_result.items()):
-                        _vstr = _dlj.dumps(_v, indent=8, default=str) if isinstance(_v, dict) else repr(_v)
+                        if isinstance(_v, dict):
+                            _vstr = _dlj.dumps(_v, indent=8, default=str)
+                        elif isinstance(_v, str) and _v.startswith("ERROR"):
+                            continue   # skip noisy errors
+                        else:
+                            _vstr = repr(_v)
                         print(f"  [{_k}]  {_vstr}")
                 else:
-                    print("    (no provisioning responses received from HTTP endpoints)")
+                    print("    (no provisioning responses received)")
 
-                # Step C: passive MQTT sniff — keep running even if connection fails
-                # so user has the full window to open the app
-                _sniff_secs = args.diag_live_seconds
-                print(f"\n[DIAG-LIVE] Passive MQTT sniff for {_sniff_secs}s ...")
-                if _test_status.get("connected"):
+                # Step C: passive MQTT sniff — always runs full duration
+                # Uses _diag_cid (not _mqtt_cid) so we don't kick the real app.
+                # Uses _working_path (the path that succeeded above) or "/mqtt".
+                _sniff_secs  = args.diag_live_seconds
+                _sniff_path  = _working_path or "/mqtt"
+                print(f"\n[DIAG-LIVE] Passive MQTT sniff for {_sniff_secs}s "
+                      f"(path={_sniff_path!r}, clientId={_diag_cid}) ...")
+                if _working_path:
                     print(f"    >>> MQTT connected OK — now open the AiDot app")
                     print(f"    >>> and start a LIVE VIEW for this camera <<<")
                 else:
-                    print(f"    >>> MQTT connection failed (see above) — check credentials <<<")
-                    print(f"    >>> Will still wait {_sniff_secs}s in case connection recovers <<<")
+                    print(f"    >>> Connection previously failed — check output above")
+                    print(f"    >>> Still running {_sniff_secs}s in case it was transient <<<")
                 print()
 
                 _seen = []
@@ -403,12 +432,13 @@ async def run(args: argparse.Namespace) -> None:
                     print(f"        {_pstr}")
 
                 _sniff_msgs, _sniff_status = await _mqtt_session_with_status(
-                    _mqtt_url, _mqtt_user, _mqtt_pwd, _mqtt_cid + "-2",
+                    _mqtt_url, _mqtt_user, _mqtt_pwd, _diag_cid,
                     _live_topics, [], float(_sniff_secs), _on_msg,
+                    ws_path=_sniff_path,
                 )
                 print(f"\n    Sniff complete. {len(_seen)} message(s) captured.")
                 if _sniff_status.get("connected"):
-                    print(f"    MQTT connected OK during sniff.")
+                    print(f"    MQTT connected OK during sniff (path={_sniff_path!r}).")
                 elif _sniff_status.get("error"):
                     print(f"    MQTT sniff connection error: {_sniff_status['error']}")
                     for _logline in _sniff_status.get("log", [])[-10:]:
