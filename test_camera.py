@@ -347,9 +347,11 @@ async def run(args: argparse.Namespace) -> None:
                 print(f"    MQTT diagCid  : {_diag_cid}  (used for sniff)")
                 print(f"    MQTT pwd      : {'<present>' if _mqtt_pwd else '<MISSING>'}")
 
-                # Print any streaming-related keys from getServerUrlConfig response
+                # Print any streaming-related keys from getServerUrlConfig response.
+                # Strategy 1 of _async_get_smarthome_auth sets raw={"source": "login_info.mqttPassword"}
+                # (not the actual getServerUrlConfig data), so filter that placeholder out.
                 _raw_cfg = (dc._smarthome_auth or {}).get("raw") or {}
-                if _raw_cfg:
+                if _raw_cfg and set(_raw_cfg.keys()) != {"source"}:
                     _stream_keys = {k: v for k, v in _raw_cfg.items()
                                     if any(x in k.lower() for x in
                                            ("live", "stream", "rtsp", "webrtc", "kvs",
@@ -358,6 +360,8 @@ async def run(args: argparse.Namespace) -> None:
                         print(f"    getServerUrlConfig streaming keys: {_stream_keys}")
                     else:
                         print(f"    getServerUrlConfig keys: {sorted(_raw_cfg.keys())}")
+                else:
+                    print(f"    getServerUrlConfig: (credentials sourced from login_info, no raw config data)")
 
                 _live_topics = [
                     f"iot/v1/cb/{cam.get('id')}/#",
@@ -413,8 +417,20 @@ async def run(args: argparse.Namespace) -> None:
                 print(f"\n[DIAG-LIVE] Passive MQTT sniff for {_sniff_secs}s "
                       f"(path={_sniff_path!r}, clientId={_diag_cid}) ...")
                 if _working_path:
-                    print(f"    >>> MQTT connected OK — now open the AiDot app")
-                    print(f"    >>> and start a LIVE VIEW for this camera <<<")
+                    print()
+                    print(f"    *** MQTT connection confirmed on path {_sniff_path!r} ***")
+                    print()
+                    print(f"    STEP 1: Open the AiDot app on your phone")
+                    print(f"    STEP 2: Navigate to the live view for '{cam.get('name')}'")
+                    print(f"    STEP 3: Press ENTER below AFTER the live view is open")
+                    print()
+                    import asyncio as _asyncio
+                    await _asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: input(f"    >>> Press ENTER to start the {_sniff_secs}s capture window ... "),
+                    )
+                    print()
+                    print(f"    Capture started — keep the live view open for {_sniff_secs}s ...")
                 else:
                     print(f"    >>> Connection previously failed — check output above")
                     print(f"    >>> Still running {_sniff_secs}s in case it was transient <<<")
