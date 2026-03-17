@@ -26,6 +26,34 @@ import time
 
 import aiohttp
 
+
+class _Tee:
+    """Write to both the real stdout and a log file simultaneously.
+
+    Installed as sys.stdout when --log-file is given so that all print()
+    calls go to both the terminal and the file with no code changes at
+    call sites.
+    """
+    def __init__(self, path: str) -> None:
+        self._file   = open(path, "w", encoding="utf-8", buffering=1)
+        self._stdout = sys.__stdout__
+
+    def write(self, s: str) -> None:
+        self._stdout.write(s)
+        self._file.write(s)
+
+    def flush(self) -> None:
+        self._stdout.flush()
+        self._file.flush()
+
+    def fileno(self) -> int:          # needed by some logging handlers
+        return self._stdout.fileno()
+
+    def close(self) -> None:
+        self._file.close()
+
+    isatty = lambda self: False       # noqa: E731
+
 # Run from the python-aidot repo root so the local aidot package is found.
 sys.path.insert(0, ".")
 
@@ -318,14 +346,17 @@ async def run(args: argparse.Namespace) -> None:
                 # ----------------------------------------------------------- #
                 import json as _dlj
                 import logging as _dl_logging
-                from aidot.device_client import _mqtt_session_with_status, _diag_client_id
-
-                # Raise log level so MQTT connection events are visible
-                _dl_logging.getLogger("aidot.device_client").setLevel(_dl_logging.INFO)
-                _dl_logging.basicConfig(
-                    level=_dl_logging.INFO,
-                    format="%(name)s %(levelname)s: %(message)s",
+                from aidot.device_client import (
+                    _mqtt_session_with_status, _diag_client_id, _fresh_diag_client_id,
                 )
+
+                # Verbose mode: raise paho log level so connection events are shown
+                if args.verbose:
+                    _dl_logging.getLogger("aidot.device_client").setLevel(_dl_logging.DEBUG)
+                    _dl_logging.basicConfig(
+                        level=_dl_logging.DEBUG,
+                        format="%(name)s %(levelname)s: %(message)s",
+                    )
 
                 print(f"\n[DIAG-LIVE] Live-stream provisioning probe for {cam.get('name')} ...")
 
@@ -370,101 +401,98 @@ async def run(args: argparse.Namespace) -> None:
                     f"lds/v1/c/{_mqtt_user}/#",
                 ]
 
-                # Step A: connection test — try WebSocket paths until one works
-                # Fixes: wrong path causes WebSocket upgrade failure (silent with
-                # old code; now reported via _on_disconnect before conn_ev timeout).
+                # Step A: connection test — verify WebSocket path works.
+                # Use a fresh unique clientId per attempt so the broker never sees
+                # the same clientId reused.  Do NOT use _mqtt_cid (the phone app's
+                # authorized clientId) — that would kick the phone off the broker.
                 print(f"\n[DIAG-LIVE] Testing MQTT connection (WebSocket path probe) ...")
                 _working_path = None
                 for _ws_path in ["/mqtt", "/", "/ws"]:
+                    _probe_cid = _fresh_diag_client_id(_mqtt_user)
                     _t_msgs, _t_st = await _mqtt_session_with_status(
-                        _mqtt_url, _mqtt_user, _mqtt_pwd, _mqtt_cid,
+                        _mqtt_url, _mqtt_user, _mqtt_pwd, _probe_cid,
                         _live_topics, [], 3.0, ws_path=_ws_path,
                     )
                     if _t_st.get("connected"):
-                        print(f"    path {_ws_path!r:8s}: CONNECTED  rc={_t_st['rc']} ({_t_st['rc_str']})")
+                        print(f"    path {_ws_path!r:8s}: CONNECTED  rc={_t_st['rc']}")
                         _working_path = _ws_path
                         break
                     else:
                         _err = _t_st.get("error") or _t_st.get("rc_str") or "unknown"
-                        print(f"    path {_ws_path!r:8s}: FAILED  ({_err})")
-                        for _logline in _t_st.get("log", [])[-5:]:
-                            print(f"      paho: {_logline}")
+                        if args.verbose:
+                            print(f"    path {_ws_path!r:8s}: FAILED  ({_err})")
+                            for _logline in _t_st.get("log", [])[-5:]:
+                                print(f"      paho: {_logline}")
 
                 if _working_path is None:
                     print(f"\n    All WebSocket paths failed.  Check credentials / network.")
                     print(f"    (sniff will still run in case broker is intermittent)")
 
-                # Step B: Fetch ICE server config (STUN/TURN credentials for WebRTC)
-                # Protocol confirmed: liveType=2 uses WebRTC-over-MQTT DataChannel.
-                # ICE config provides per-device TURN credentials from the Arnoo cluster.
+                # Step B: Fetch ICE server config (STUN/TURN credentials for WebRTC).
+                # Uses a fresh unique clientId so it doesn't collide with the path probe.
                 print(f"\n[DIAG-LIVE] Fetching ICE server config (STUN/TURN credentials) ...")
                 _ice_cfg = await dc.async_get_ice_config(cam.get("id"))
                 if _ice_cfg:
                     _app_entries = _ice_cfg.get("app") or []
                     _dev_entries = _ice_cfg.get("dev") or []
-                    print(f"    ICE config received:  {len(_app_entries)} app entry, {len(_dev_entries)} dev entr{'y' if len(_dev_entries)==1 else 'ies'}")
-                    for _e in _app_entries:
-                        print(f"      app  id={_e.get('id','?')}  token={_e.get('token','?')}  ttl={_e.get('ttl','?')}")
-                        for _u in (_e.get("uris") or []):
-                            print(f"           uri: {_u}")
-                    for _e in _dev_entries:
-                        if _e.get("id") == cam.get("id"):
-                            print(f"      dev  id={_e.get('id','?')}  token={_e.get('token','?')}  ttl={_e.get('ttl','?')}  *** this camera ***")
-                        else:
-                            print(f"      dev  id={_e.get('id','?')}  token={_e.get('token','?')}")
-                        for _u in (_e.get("uris") or []):
-                            print(f"           uri: {_u}")
+                    _cam_dev = next((e for e in _dev_entries if e.get("id") == cam.get("id")), None)
+                    print(f"    ICE config received — "
+                          f"{len(_app_entries)} app entr{'y' if len(_app_entries)==1 else 'ies'}, "
+                          f"{len(_dev_entries)} device entr{'y' if len(_dev_entries)==1 else 'ies'}")
+                    if _cam_dev:
+                        _uris = _cam_dev.get("uris") or []
+                        print(f"    This camera: token={_cam_dev.get('token','?')}  "
+                              f"ttl={_cam_dev.get('ttl','?')}  uris={_uris}")
+                    if args.verbose:
+                        for _e in _app_entries:
+                            print(f"      app  id={_e.get('id','?')}  token={_e.get('token','?')}  ttl={_e.get('ttl','?')}")
+                            for _u in (_e.get("uris") or []):
+                                print(f"           uri: {_u}")
+                        for _e in _dev_entries:
+                            _marker = "  *** this camera ***" if _e.get("id") == cam.get("id") else ""
+                            print(f"      dev  id={_e.get('id','?')}  token={_e.get('token','?')}{_marker}")
+                            for _u in (_e.get("uris") or []):
+                                print(f"           uri: {_u}")
                 else:
-                    print(f"    (no ICE config received — will need passive sniff to capture getIceConfigResp)")
-                    print(f"    Note: ICE config may only be delivered while the app is active; the passive")
-                    print(f"    sniff below will capture it if the AiDot app fetches it during the window.")
+                    print(f"    (no ICE config received — passive sniff may capture it if app is active)")
 
-                # Step B2: HTTP/MQTT broad probe (all return HTTP 500 for this camera model)
-                # Kept for documentation; none of these endpoints work for liveType=2 cameras.
-                print(f"\n[DIAG-LIVE] Probing HTTP/MQTT provisioning endpoints (expect all 500s for liveType=2) ...")
-                _probe_result = await dc.async_get_live_stream_info()
-                if _probe_result:
-                    _non_error = {k: v for k, v in _probe_result.items()
-                                  if not (isinstance(v, str) and v.startswith("ERROR"))}
-                    _mqtt_results = {k: v for k, v in _non_error.items() if k.startswith("mqtt:")}
-                    _http_non500 = {k: v for k, v in _non_error.items()
-                                    if k.startswith("http:") and "status=500" not in k}
-                    if _mqtt_results:
-                        print(f"  MQTT responses:")
-                        for _k, _v in sorted(_mqtt_results.items()):
+                # Step B2 (--verbose only): exploratory HTTP/MQTT probe.
+                # All endpoints return HTTP 500 for liveType=2 cameras; skip by default.
+                if args.verbose:
+                    print(f"\n[DIAG-LIVE] Probing HTTP/MQTT provisioning endpoints (verbose) ...")
+                    _probe_result = await dc.async_get_live_stream_info()
+                    if _probe_result:
+                        _non_error = {k: v for k, v in _probe_result.items()
+                                      if not (isinstance(v, str) and v.startswith("ERROR"))}
+                        for _k, _v in sorted(_non_error.items()):
                             _vstr = _dlj.dumps(_v, indent=8, default=str) if isinstance(_v, dict) else repr(_v)
                             print(f"  [{_k}]  {_vstr}")
-                    if _http_non500:
-                        print(f"  HTTP non-500 responses:")
-                        for _k, _v in sorted(_http_non500.items()):
-                            _vstr = _dlj.dumps(_v, indent=8, default=str) if isinstance(_v, dict) else repr(_v)
-                            print(f"  [{_k}]  {_vstr}")
-                    if not _mqtt_results and not _http_non500:
-                        print(f"    (all HTTP endpoints returned 500 / no MQTT responses — expected for liveType=2)")
-                else:
-                    print("    (no responses received)")
+                    else:
+                        print("    (no responses received)")
 
-                # Step C: passive MQTT sniff — always runs full duration
-                # Uses _diag_cid (not _mqtt_cid) so we don't kick the real app.
-                # Uses _working_path (the path that succeeded above) or "/mqtt".
+                # Step C: passive MQTT sniff — always runs full duration.
+                # A fresh unique clientId avoids rc=4 caused by reusing the same clientId
+                # as the ICE config or path probe sessions.
                 _sniff_secs  = args.diag_live_seconds
                 _sniff_path  = _working_path or "/mqtt"
+                _sniff_cid   = _fresh_diag_client_id(_mqtt_user)
                 print(f"\n[DIAG-LIVE] Passive MQTT sniff for {_sniff_secs}s "
-                      f"(path={_sniff_path!r}, clientId={_diag_cid}) ...")
+                      f"(path={_sniff_path!r}) ...")
                 if _working_path:
                     print()
-                    print(f"    *** MQTT connection confirmed on path {_sniff_path!r} ***")
+                    print(f"    *** MQTT connection confirmed — broker is reachable ***")
                     print()
                     print(f"    STEP 1: Open the AiDot app on your phone")
                     print(f"    STEP 2: Navigate to the live view for '{cam.get('name')}'")
                     print(f"    STEP 3: Press ENTER below AFTER the live view is open")
                     print()
-                    import asyncio as _asyncio
-                    await _asyncio.get_event_loop().run_in_executor(
-                        None,
-                        lambda: input(f"    >>> Press ENTER to start the {_sniff_secs}s capture window ... "),
+                    # Write prompt to stderr so it appears on the terminal even when
+                    # stdout is redirected to a file (python3 test_camera.py ... > log).
+                    sys.stderr.write(
+                        f"    >>> Press ENTER to start the {_sniff_secs}s capture window ... "
                     )
-                    print()
+                    sys.stderr.flush()
+                    await asyncio.get_event_loop().run_in_executor(None, sys.stdin.readline)
                     print(f"    Capture started — keep the live view open for {_sniff_secs}s ...")
                 else:
                     print(f"    >>> Connection previously failed — check output above")
@@ -483,13 +511,13 @@ async def run(args: argparse.Namespace) -> None:
                     print(f"        {_pstr}")
 
                 _sniff_msgs, _sniff_status = await _mqtt_session_with_status(
-                    _mqtt_url, _mqtt_user, _mqtt_pwd, _diag_cid,
+                    _mqtt_url, _mqtt_user, _mqtt_pwd, _sniff_cid,
                     _live_topics, [], float(_sniff_secs), _on_msg,
                     ws_path=_sniff_path,
                 )
                 print(f"\n    Sniff complete. {len(_seen)} message(s) captured.")
                 if _sniff_status.get("connected"):
-                    print(f"    MQTT connected OK during sniff (path={_sniff_path!r}).")
+                    print(f"    MQTT connected OK during sniff.")
                 elif _sniff_status.get("error"):
                     print(f"    MQTT sniff connection error: {_sniff_status['error']}")
                     for _logline in _sniff_status.get("log", [])[-10:]:
@@ -544,6 +572,12 @@ def main() -> None:
                         help="How many seconds to sniff MQTT during --diag-live (default: 60)")
     parser.add_argument("--device", metavar="DEVICE_ID",
                         help="Run tests on only the camera with this AiDot device UID")
+    parser.add_argument("--log-file", metavar="PATH",
+                        help="Write all output to PATH in addition to stdout "
+                             "(prompt still appears on terminal even when stdout is redirected)")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Show detailed probe output: per-URI ICE config, paho logs, "
+                             "HTTP/MQTT exploratory probes")
 
     args = parser.parse_args()
 
@@ -554,10 +588,19 @@ def main() -> None:
         args.play            = True
         args.live            = True
 
+    _tee = None
+    if args.log_file:
+        _tee = _Tee(args.log_file)
+        sys.stdout = _tee
+
     try:
         asyncio.run(run(args))
     except KeyboardInterrupt:
         print("\nInterrupted.")
+    finally:
+        if _tee:
+            sys.stdout = sys.__stdout__
+            _tee.close()
 
 
 if __name__ == "__main__":

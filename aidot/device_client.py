@@ -1007,12 +1007,26 @@ class LiveStreamSession:
 def _diag_client_id(authorised_cid: str, user_id: str) -> str:
     """Return an alternative clientId matching {terminalIndex}-{userId} format.
 
-    The authorised clientId has the form '{6chars}-{userId}'.  Broker auth
-    validates the username (userId) + password; the terminal-index prefix is
-    client-chosen.  We use a fixed diagnostic prefix so we don't collide with
-    the real app session while still satisfying any format checks.
+    Returns a FIXED prefix ``cc0001``.  Prefer ``_fresh_diag_client_id`` for
+    any session that may run concurrently with or immediately after another
+    diagnostic session, to avoid broker rate-limiting on repeated clientId reuse.
     """
     return f"cc0001-{user_id}"
+
+
+def _fresh_diag_client_id(user_id: str) -> str:
+    """Return a unique diagnostic clientId for each MQTT session.
+
+    Generates a random 3-byte hex terminal-index prefix on every call so that
+    rapid successive sessions (path probe → ICE config → passive sniff) never
+    share the same clientId.  This avoids broker rc=4 rate-limiting caused by
+    the broker seeing the same clientId connect/disconnect multiple times in
+    quick succession.
+
+    Format: ``{6hex}-{userId}`` — matches broker's expected clientId pattern.
+    """
+    import os as _os
+    return f"{_os.urandom(3).hex()}-{user_id}"
 
 
 def _mqtt_session_sync(
@@ -2174,9 +2188,10 @@ class DeviceClient(object):
         smarthome_auth = await self._async_get_smarthome_auth()
         mqtt_user = (smarthome_auth or {}).get("mqttUser") or str(self.user_id)
         mqtt_pwd  = (smarthome_auth or {}).get("mqttPassword") or ""
-        client_id = (self._user_info.get("mqttClientId") or f"app-{mqtt_user}")
         user_id   = str(self.user_id)
-        diag_cid  = _diag_client_id(client_id, user_id)
+        # Fresh random clientId per call so the broker never sees the same
+        # clientId reused across rapid successive diagnostic sessions.
+        diag_cid  = _fresh_diag_client_id(user_id)
         mqtt_url  = await self._async_get_mqtt_url()
         if not mqtt_url:
             _LOGGER.warning("async_get_ice_config: no MQTT URL available")
@@ -2266,9 +2281,8 @@ class DeviceClient(object):
 
         seq = str(random.randint(100000, 999999))
 
-        # Use a diagnostics clientId that matches {terminalIndex}-{userId} format
-        # so the broker doesn't reject it.  Do NOT append arbitrary suffixes.
-        diag_cid = _diag_client_id(client_id, user_id)
+        # Fresh random clientId each call to avoid broker rate-limiting.
+        diag_cid = _fresh_diag_client_id(user_id)
 
         # Known service/method names for live-stream provisioning (try all).
         # connectipcReq is the documented TCP-relay live-stream request; also
