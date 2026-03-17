@@ -1039,6 +1039,7 @@ def _mqtt_session_sync(
     duration: float,
     on_message=None,
     ws_path: str = "/mqtt",
+    on_ready=None,
 ) -> tuple:
     """Synchronous paho MQTT session (runs in a thread executor).
 
@@ -1049,6 +1050,13 @@ def _mqtt_session_sync(
 
     ws_path overrides the WebSocket endpoint path (default "/mqtt").
     Pass "" or "/" to try the root path.
+
+    on_ready(status) — optional callback called after all subscribe/publish
+    operations complete but before the receive loop starts.  If it blocks
+    (e.g. waiting for user input) the paho background thread continues to
+    buffer incoming messages.  The ``duration`` countdown starts only after
+    on_ready returns, so use this hook to implement a "wait for ENTER before
+    starting the capture window" pattern.
     """
     import paho.mqtt.client as _paho
     import ssl as _ssl
@@ -1166,6 +1174,12 @@ def _mqtt_session_sync(
         client.publish(pub_topic, pub_payload)
         _LOGGER.debug("_mqtt_session: published %s", pub_topic)
 
+    if on_ready:
+        try:
+            on_ready(status)
+        except Exception:
+            pass
+
     collected = []
     deadline  = _time.monotonic() + duration
     while True:
@@ -1203,6 +1217,7 @@ async def _mqtt_session(
     duration: float,
     on_message=None,
     ws_path: str = "/mqtt",
+    on_ready=None,
 ) -> list:
     """Async wrapper: runs _mqtt_session_sync in a thread executor.
 
@@ -1213,7 +1228,7 @@ async def _mqtt_session(
     fn = functools.partial(
         _mqtt_session_sync,
         mqtt_url, mqtt_user, mqtt_pwd, client_id,
-        subscribe_topics, publish_items, duration, on_message, ws_path,
+        subscribe_topics, publish_items, duration, on_message, ws_path, on_ready,
     )
     messages, status = await loop.run_in_executor(None, fn)
     if status.get("error"):
@@ -1231,6 +1246,7 @@ async def _mqtt_session_with_status(
     duration: float,
     on_message=None,
     ws_path: str = "/mqtt",
+    on_ready=None,
 ) -> tuple:
     """Like _mqtt_session but also returns the status dict for diagnostics."""
     import functools
@@ -1238,7 +1254,7 @@ async def _mqtt_session_with_status(
     fn = functools.partial(
         _mqtt_session_sync,
         mqtt_url, mqtt_user, mqtt_pwd, client_id,
-        subscribe_topics, publish_items, duration, on_message, ws_path,
+        subscribe_topics, publish_items, duration, on_message, ws_path, on_ready,
     )
     return await loop.run_in_executor(None, fn)
 

@@ -346,9 +346,7 @@ async def run(args: argparse.Namespace) -> None:
                 # ----------------------------------------------------------- #
                 import json as _dlj
                 import logging as _dl_logging
-                from aidot.device_client import (
-                    _mqtt_session_with_status, _diag_client_id, _fresh_diag_client_id,
-                )
+                from aidot.device_client import _mqtt_session_with_status
 
                 # Verbose mode: raise paho log level so connection events are shown
                 if args.verbose:
@@ -364,23 +362,20 @@ async def run(args: argparse.Namespace) -> None:
                 _sm_auth = await dc._async_get_smarthome_auth()
                 _mqtt_user = (_sm_auth or {}).get("mqttUser") or str(dc.user_id)
                 _mqtt_pwd  = (_sm_auth or {}).get("mqttPassword") or ""
-                # Use the EXACT authorised clientId from the server config
+                # Use the EXACT authorised clientId from the server config.
+                # The broker requires the server-assigned {terminalIndex}-{userId}
+                # format; random or made-up prefixes are rejected with rc=4.
                 _mqtt_cid  = (dc._user_info.get("mqttClientId") or
                               (dc._user_info.get("_userConfigRaw") or {}).get("mqtt", {}).get("clientId") or
                               f"app-{_mqtt_user}")
-                # Diagnostic clientId that keeps the {terminal}-{userId} format
-                _diag_cid  = _diag_client_id(_mqtt_cid, _mqtt_user)
                 _mqtt_url  = await dc._async_get_mqtt_url()
 
                 print(f"    MQTT broker   : {_mqtt_url}")
                 print(f"    MQTT user     : {_mqtt_user}")
-                print(f"    MQTT clientId : {_mqtt_cid}  (auth)")
-                print(f"    MQTT diagCid  : {_diag_cid}  (used for sniff)")
+                print(f"    MQTT clientId : {_mqtt_cid}")
                 print(f"    MQTT pwd      : {'<present>' if _mqtt_pwd else '<MISSING>'}")
 
                 # Print any streaming-related keys from getServerUrlConfig response.
-                # Strategy 1 of _async_get_smarthome_auth sets raw={"source": "login_info.mqttPassword"}
-                # (not the actual getServerUrlConfig data), so filter that placeholder out.
                 _raw_cfg = (dc._smarthome_auth or {}).get("raw") or {}
                 if _raw_cfg and set(_raw_cfg.keys()) != {"source"}:
                     _stream_keys = {k: v for k, v in _raw_cfg.items()
@@ -389,47 +384,10 @@ async def run(args: argparse.Namespace) -> None:
                                             "signal", "media", "play", "video", "ipc"))}
                     if _stream_keys:
                         print(f"    getServerUrlConfig streaming keys: {_stream_keys}")
-                    else:
+                    elif args.verbose:
                         print(f"    getServerUrlConfig keys: {sorted(_raw_cfg.keys())}")
-                else:
-                    print(f"    getServerUrlConfig: (credentials sourced from login_info, no raw config data)")
 
-                _live_topics = [
-                    f"iot/v1/cb/{cam.get('id')}/#",
-                    f"iot/v1/c/{_mqtt_user}/#",
-                    f"lds/v1/cb/{cam.get('id')}/#",
-                    f"lds/v1/c/{_mqtt_user}/#",
-                ]
-
-                # Step A: connection test — verify WebSocket path works.
-                # Use a fresh unique clientId per attempt so the broker never sees
-                # the same clientId reused.  Do NOT use _mqtt_cid (the phone app's
-                # authorized clientId) — that would kick the phone off the broker.
-                print(f"\n[DIAG-LIVE] Testing MQTT connection (WebSocket path probe) ...")
-                _working_path = None
-                for _ws_path in ["/mqtt", "/", "/ws"]:
-                    _probe_cid = _fresh_diag_client_id(_mqtt_user)
-                    _t_msgs, _t_st = await _mqtt_session_with_status(
-                        _mqtt_url, _mqtt_user, _mqtt_pwd, _probe_cid,
-                        _live_topics, [], 3.0, ws_path=_ws_path,
-                    )
-                    if _t_st.get("connected"):
-                        print(f"    path {_ws_path!r:8s}: CONNECTED  rc={_t_st['rc']}")
-                        _working_path = _ws_path
-                        break
-                    else:
-                        _err = _t_st.get("error") or _t_st.get("rc_str") or "unknown"
-                        if args.verbose:
-                            print(f"    path {_ws_path!r:8s}: FAILED  ({_err})")
-                            for _logline in _t_st.get("log", [])[-5:]:
-                                print(f"      paho: {_logline}")
-
-                if _working_path is None:
-                    print(f"\n    All WebSocket paths failed.  Check credentials / network.")
-                    print(f"    (sniff will still run in case broker is intermittent)")
-
-                # Step B: Fetch ICE server config (STUN/TURN credentials for WebRTC).
-                # Uses a fresh unique clientId so it doesn't collide with the path probe.
+                # ICE config (HTTP — no MQTT session needed)
                 print(f"\n[DIAG-LIVE] Fetching ICE server config (STUN/TURN credentials) ...")
                 _ice_cfg = await dc.async_get_ice_config(cam.get("id"))
                 if _ice_cfg:
@@ -454,10 +412,9 @@ async def run(args: argparse.Namespace) -> None:
                             for _u in (_e.get("uris") or []):
                                 print(f"           uri: {_u}")
                 else:
-                    print(f"    (no ICE config received — passive sniff may capture it if app is active)")
+                    print(f"    (no ICE config received — sniff may capture it if app is active)")
 
-                # Step B2 (--verbose only): exploratory HTTP/MQTT probe.
-                # All endpoints return HTTP 500 for liveType=2 cameras; skip by default.
+                # Exploratory HTTP/MQTT probe (--verbose only)
                 if args.verbose:
                     print(f"\n[DIAG-LIVE] Probing HTTP/MQTT provisioning endpoints (verbose) ...")
                     _probe_result = await dc.async_get_live_stream_info()
@@ -470,34 +427,17 @@ async def run(args: argparse.Namespace) -> None:
                     else:
                         print("    (no responses received)")
 
-                # Step C: passive MQTT sniff — always runs full duration.
-                # A fresh unique clientId avoids rc=4 caused by reusing the same clientId
-                # as the ICE config or path probe sessions.
-                _sniff_secs  = args.diag_live_seconds
-                _sniff_path  = _working_path or "/mqtt"
-                _sniff_cid   = _fresh_diag_client_id(_mqtt_user)
-                print(f"\n[DIAG-LIVE] Passive MQTT sniff for {_sniff_secs}s "
-                      f"(path={_sniff_path!r}) ...")
-                if _working_path:
-                    print()
-                    print(f"    *** MQTT connection confirmed — broker is reachable ***")
-                    print()
-                    print(f"    STEP 1: Open the AiDot app on your phone")
-                    print(f"    STEP 2: Navigate to the live view for '{cam.get('name')}'")
-                    print(f"    STEP 3: Press ENTER below AFTER the live view is open")
-                    print()
-                    # Write prompt to stderr so it appears on the terminal even when
-                    # stdout is redirected to a file (python3 test_camera.py ... > log).
-                    sys.stderr.write(
-                        f"    >>> Press ENTER to start the {_sniff_secs}s capture window ... "
-                    )
-                    sys.stderr.flush()
-                    await asyncio.get_event_loop().run_in_executor(None, sys.stdin.readline)
-                    print(f"    Capture started — keep the live view open for {_sniff_secs}s ...")
-                else:
-                    print(f"    >>> Connection previously failed — check output above")
-                    print(f"    >>> Still running {_sniff_secs}s in case it was transient <<<")
-                print()
+                # Passive MQTT sniff — single persistent session using the
+                # authorised clientId.  The on_ready hook waits for ENTER so the
+                # 60-second capture window starts exactly when the user says, while
+                # the broker connection (and any early messages) are preserved.
+                _sniff_secs = args.diag_live_seconds
+                _live_topics = [
+                    f"iot/v1/cb/{cam.get('id')}/#",
+                    f"iot/v1/c/{_mqtt_user}/#",
+                    f"lds/v1/cb/{cam.get('id')}/#",
+                    f"lds/v1/c/{_mqtt_user}/#",
+                ]
 
                 _seen = []
                 def _on_msg(topic, payload):
@@ -510,18 +450,47 @@ async def run(args: argparse.Namespace) -> None:
                     print(f"  MQTT  topic={topic}")
                     print(f"        {_pstr}")
 
+                def _on_ready(st):
+                    """Called from the MQTT thread after subscription.
+                    Blocks on stdin so the capture window starts after ENTER.
+                    """
+                    if not st.get("connected"):
+                        err = st.get("error") or st.get("rc_str") or f"rc={st.get('rc')}"
+                        print(f"\n[DIAG-LIVE] MQTT connection FAILED: {err}")
+                        if args.verbose:
+                            for _ll in st.get("log", [])[-10:]:
+                                print(f"  paho: {_ll}")
+                        return
+                    print(f"\n[DIAG-LIVE] MQTT connected (clientId={_mqtt_cid})")
+                    print()
+                    print(f"    STEP 1: Open the AiDot app on your phone")
+                    print(f"    STEP 2: Navigate to the live view for '{cam.get('name')}'")
+                    print(f"    STEP 3: Press ENTER below AFTER the live view is open")
+                    print()
+                    # Write prompt to stderr so it appears on the terminal even
+                    # when stdout is redirected to a file (--log-file).
+                    sys.stderr.write(
+                        f"    >>> Press ENTER to start the {_sniff_secs}s capture window ... "
+                    )
+                    sys.stderr.flush()
+                    sys.stdin.readline()
+                    print(f"    Capture started — keep the live view open for {_sniff_secs}s ...")
+                    print()
+
+                print(f"\n[DIAG-LIVE] Connecting to MQTT broker for {_sniff_secs}s sniff ...")
                 _sniff_msgs, _sniff_status = await _mqtt_session_with_status(
-                    _mqtt_url, _mqtt_user, _mqtt_pwd, _sniff_cid,
+                    _mqtt_url, _mqtt_user, _mqtt_pwd, _mqtt_cid,
                     _live_topics, [], float(_sniff_secs), _on_msg,
-                    ws_path=_sniff_path,
+                    ws_path="/mqtt", on_ready=_on_ready,
                 )
-                print(f"\n    Sniff complete. {len(_seen)} message(s) captured.")
                 if _sniff_status.get("connected"):
-                    print(f"    MQTT connected OK during sniff.")
-                elif _sniff_status.get("error"):
-                    print(f"    MQTT sniff connection error: {_sniff_status['error']}")
-                    for _logline in _sniff_status.get("log", [])[-10:]:
-                        print(f"      paho: {_logline}")
+                    print(f"\n    Sniff complete. {len(_seen)} message(s) captured.")
+                else:
+                    _err = _sniff_status.get("error") or _sniff_status.get("rc_str") or f"rc={_sniff_status.get('rc')}"
+                    print(f"\n    MQTT connection failed: {_err}")
+                    if args.verbose:
+                        for _logline in _sniff_status.get("log", [])[-10:]:
+                            print(f"      paho: {_logline}")
 
             if args.live and not args.diag_mqtt:
                 print(f"\n[LIVE] Opening live stream for {cam.get('name', cam.get('id'))} ...")
