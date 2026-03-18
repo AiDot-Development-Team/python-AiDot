@@ -4,19 +4,27 @@ test_camera.py - Exercise the camera additions to python-aidot.
 
 Usage:
   cd /path/to/python-aidot
-  python3 test_camera.py --username you@email.com --password yourpass --country US
+  python3 test_camera.py --username you@email.com --password yourpass [--country US]
+
+  # Run on a specific camera only (device UID from the device list printed above):
+  python3 test_camera.py --username ... --password ... --device DEVICE_ID --webrtc
 
 Optional flags:
-  --list-recordings   List recordings from the past 24 hours for each camera
-  --play              Stream the first available recording for 15 seconds
-  --p2p               Fetch the TUTK P2P UID for each camera (live stream token)
-  --live              Open live stream via MQTT connectipc + TCP
-  --diag-mqtt         Verbose MQTT diagnostics: show broker URL, raw messages,
-                      and ALL topics received (use this when --live fails)
-  --diag-live         Probe live-stream provisioning API (MQTT + HTTP) and
-                      passively sniff MQTT for 60s — open the AiDot app and
-                      start a live view for one of your cameras while this runs
-                      so the provisioning traffic is captured.
+  --device DEVICE_ID      Only run tests for this camera's AiDot device UID
+  --list-recordings       List recordings from the past 24 hours
+  --play                  Stream the first available recording for 15 seconds
+  --p2p                   Fetch the TUTK P2P UID (live stream token)
+  --live                  Open live stream via MQTT connectipc + TCP
+  --diag-mqtt             Verbose MQTT diagnostics (use when --live fails)
+  --diag-live             Sniff MQTT signalling — open the AiDot app live view
+                          while this runs so the WebRTC traffic is captured
+  --webrtc                Open a liveType=2 WebRTC stream (requires aiortc):
+                            pip install python-aidot[webrtc]
+  --webrtc-output PATH    Record the stream to PATH (e.g. /tmp/live.mkv)
+                          then open with:  vlc /tmp/live.mkv
+  --webrtc-seconds N      Seconds to stream during --webrtc (default: 30)
+  --log-file PATH         Write all output to PATH as well as stdout
+  --verbose               Extra detail: ICE config URIs, paho logs
 """
 
 import argparse
@@ -155,7 +163,7 @@ async def run(args: argparse.Namespace) -> None:
             for d in devices:
                 print(f"      {d.get('id')}  model={d.get('modelId')}  name={d.get('name')}")
             print("\n    You can still test P2P/playback by passing a specific device ID")
-            print("    via --device-id if you know which one is a camera.")
+            print("    via --device if you know which one is a camera.")
             return
 
         print(f"    {len(cameras)} camera(s) detected:")
