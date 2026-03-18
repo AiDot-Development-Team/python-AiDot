@@ -995,6 +995,66 @@ class LiveStreamSession:
 
 
 # --------------------------------------------------------------------------- #
+# WebRTCSession
+#
+# Manages a live WebRTC stream opened by DeviceClient.async_open_webrtc_stream.
+# Call await session.stop() to tear down the peer connection and MQTT session.
+# --------------------------------------------------------------------------- #
+
+class WebRTCSession:
+    """Active WebRTC live-stream session for a liveType=2 AiDot camera.
+
+    Obtain via ``await DeviceClient.async_open_webrtc_stream(...)``.
+    Call ``await session.stop()`` when done.
+    """
+
+    def __init__(
+        self,
+        *,
+        pc: Any,
+        outgoing_q: Any,
+        mqtt_fut: Any,
+        recorder: Any,
+        track_tasks: list,
+    ) -> None:
+        self._pc          = pc
+        self._outgoing_q  = outgoing_q
+        self._mqtt_fut    = mqtt_fut
+        self._recorder    = recorder
+        self._track_tasks = track_tasks
+
+    async def stop(self) -> None:
+        """Tear down the stream: close peer connection and MQTT session."""
+        for task in self._track_tasks:
+            task.cancel()
+        if self._recorder is not None:
+            try:
+                await self._recorder.stop()
+            except Exception:
+                pass
+        # Send None sentinel to stop the MQTT session in its thread
+        self._outgoing_q.put_nowait(None)
+        await self._pc.close()
+        try:
+            await asyncio.wait_for(self._mqtt_fut, timeout=5.0)
+        except Exception:
+            pass
+
+
+async def _webrtc_consume_video(track: Any, on_frame: Callable) -> None:
+    """Receive video frames from an aiortc VideoStreamTrack and call on_frame."""
+    while True:
+        try:
+            frame = await track.recv()
+            try:
+                on_frame(frame)
+            except Exception:
+                pass
+        except Exception:
+            break
+
+
+# --------------------------------------------------------------------------- #
 # MQTT helpers (playback provisioning + live-stream discovery)
 #
 # Uses paho-mqtt with WebSocket transport.  The synchronous paho loop runs in
@@ -1003,31 +1063,6 @@ class LiveStreamSession:
 # asyncio Future/call_soon_threadsafe bridge that had VERSION2 ReasonCode
 # compatibility issues.
 # --------------------------------------------------------------------------- #
-
-def _diag_client_id(authorised_cid: str, user_id: str) -> str:
-    """Return an alternative clientId matching {terminalIndex}-{userId} format.
-
-    Returns a FIXED prefix ``cc0001``.  Prefer ``_fresh_diag_client_id`` for
-    any session that may run concurrently with or immediately after another
-    diagnostic session, to avoid broker rate-limiting on repeated clientId reuse.
-    """
-    return f"cc0001-{user_id}"
-
-
-def _fresh_diag_client_id(user_id: str) -> str:
-    """Return a unique diagnostic clientId for each MQTT session.
-
-    Generates a random 3-byte hex terminal-index prefix on every call so that
-    rapid successive sessions (path probe → ICE config → passive sniff) never
-    share the same clientId.  This avoids broker rc=4 rate-limiting caused by
-    the broker seeing the same clientId connect/disconnect multiple times in
-    quick succession.
-
-    Format: ``{6hex}-{userId}`` — matches broker's expected clientId pattern.
-    """
-    import os as _os
-    return f"{_os.urandom(3).hex()}-{user_id}"
-
 
 def _mqtt_session_sync(
     mqtt_url: str,
@@ -1040,6 +1075,7 @@ def _mqtt_session_sync(
     on_message=None,
     ws_path: str = "/mqtt",
     on_ready=None,
+    outgoing_queue=None,
 ) -> tuple:
     """Synchronous paho MQTT session (runs in a thread executor).
 
@@ -1187,8 +1223,25 @@ def _mqtt_session_sync(
         if remaining <= 0:
             break
         try:
-            item = msg_q.get(timeout=min(remaining, 1.0))
+            item = msg_q.get(timeout=min(remaining, 0.1))
         except _queue.Empty:
+            # Drain outgoing publish queue
+            if outgoing_queue is not None:
+                while True:
+                    try:
+                        out = outgoing_queue.get_nowait()
+                    except _queue.Empty:
+                        break
+                    if out is None:   # stop sentinel
+                        client.loop_stop()
+                        try:
+                            client.disconnect()
+                        except Exception:
+                            pass
+                        return collected, status
+                    pub_topic, pub_payload = out
+                    client.publish(pub_topic, pub_payload)
+                    _LOGGER.debug("_mqtt_session: published %s", pub_topic)
             continue
         if item is None:   # disconnect sentinel
             break
@@ -2205,9 +2258,12 @@ class DeviceClient(object):
         mqtt_user = (smarthome_auth or {}).get("mqttUser") or str(self.user_id)
         mqtt_pwd  = (smarthome_auth or {}).get("mqttPassword") or ""
         user_id   = str(self.user_id)
-        # Fresh random clientId per call so the broker never sees the same
-        # clientId reused across rapid successive diagnostic sessions.
-        diag_cid  = _fresh_diag_client_id(user_id)
+        # Use the server-assigned authorised clientId — the broker rejects
+        # random or made-up prefixes with rc=4.
+        diag_cid  = (
+            self._user_info.get("mqttClientId") or
+            f"app-{mqtt_user}"
+        )
         mqtt_url  = await self._async_get_mqtt_url()
         if not mqtt_url:
             _LOGGER.warning("async_get_ice_config: no MQTT URL available")
@@ -2272,177 +2328,304 @@ class DeviceClient(object):
         rand6   = os.urandom(3).hex()           # 6 hex chars
         return f"{session}_{rand6}_{live_type}_{stream_id}_1"
 
-    async def async_get_live_stream_info(self) -> Optional[dict]:
-        """Probe MQTT and HTTP for the live-stream provisioning response.
+    async def async_open_webrtc_stream(
+        self,
+        on_frame: Optional[Callable[["VideoFrame"], None]] = None,
+        *,
+        stream_id: int = 0,
+        timeout: float = 30.0,
+        output_path: Optional[str] = None,
+    ) -> "WebRTCSession":
+        """Open a liveType=2 WebRTC stream via MQTT signaling.
 
-        Returns a dict with whatever keys the server provides (e.g. serverIP,
-        serverPort, serverProtocol, accessToken, channelArn, signalingEndpoint,
-        etc.), or None if nothing was returned.
+        Performs the full WebRTC handshake over MQTT, then delivers decoded
+        video frames to ``on_frame`` (and/or records to ``output_path``).
 
-        This is used by --diag-live to discover the provisioning API before we
-        know the exact shape of the WebRTC/KVS response.
+        Protocol (confirmed from live MQTT capture, 2025-03):
+          1. Subscribe ``iot/v1/c/{userId}/#`` on the authorised MQTT clientId
+          2. Create aiortc ``RTCPeerConnection``, add recvonly audio/video
+          3. Generate SDP offer → publish ``IPC/webrtcReq`` with peer-id
+          4. Receive ``IPC/webrtcResp`` → set remote description (SDP answer)
+          5. Exchange ICE candidates on ``IPC/iceCandidateReq`` (both directions)
+          6. When ICE is connected → publish ``IPC/livePlayReq``
+          7. Receive media tracks → call ``on_frame`` for each VideoFrame
+
+        Parameters
+        ----------
+        on_frame : callable or None
+            Called with each ``av.VideoFrame`` from the camera.
+        stream_id : int
+            Stream index: 0 = main stream, 1 = sub-stream.
+        timeout : float
+            Seconds to wait for ICE connection before raising RuntimeError.
+        output_path : str or None
+            Record the stream to this file (e.g. ``/tmp/live.mkv``) via
+            aiortc MediaRecorder.  Supports any container ffmpeg can write.
+
+        Returns
+        -------
+        WebRTCSession
+            Call ``await session.stop()`` to close the stream.
+
+        Raises
+        ------
+        ImportError
+            If ``aiortc`` is not installed
+            (``pip install python-aidot[webrtc]``).
+        RuntimeError
+            If the MQTT connection fails or ICE does not complete within
+            ``timeout`` seconds.
         """
-        import aiohttp
+        import queue as _q_mod
 
+        try:
+            from aiortc import RTCPeerConnection, RTCSessionDescription
+            from aiortc.sdp import candidate_from_sdp
+        except ImportError:
+            raise ImportError(
+                "aiortc is required for WebRTC streaming. "
+                "Install with: pip install python-aidot[webrtc]"
+            )
+
+        # ------------------------------------------------------------------ #
+        # Credentials + MQTT setup
+        # ------------------------------------------------------------------ #
         smarthome_auth = await self._async_get_smarthome_auth()
         mqtt_user = (smarthome_auth or {}).get("mqttUser") or str(self.user_id)
         mqtt_pwd  = (smarthome_auth or {}).get("mqttPassword") or ""
-        client_id = (self._user_info.get("mqttClientId") or f"app-{mqtt_user}")
         user_id   = str(self.user_id)
-
+        mqtt_cid  = (
+            self._user_info.get("mqttClientId") or
+            (self._user_info.get("_userConfigRaw") or {}).get("mqtt", {}).get("clientId") or
+            f"app-{mqtt_user}"
+        )
         mqtt_url = await self._async_get_mqtt_url()
         if not mqtt_url:
-            _LOGGER.warning("async_get_live_stream_info: no MQTT URL for %s", self.device_id)
-            return None
+            raise RuntimeError("async_open_webrtc_stream: no MQTT URL available")
 
-        seq = str(random.randint(100000, 999999))
+        device_id = self.device_id
+        peer_id   = self.generate_webrtc_peer_id(live_type=2, stream_id=stream_id)
+        loop      = asyncio.get_running_loop()
 
-        # Fresh random clientId each call to avoid broker rate-limiting.
-        diag_cid = _fresh_diag_client_id(user_id)
+        sub_topics       = [f"iot/v1/c/{user_id}/#", f"iot/v1/cb/{device_id}/#"]
+        webrtc_req_topic = f"iot/v1/s/{user_id}/IPC/webrtcReq"
+        ice_cand_topic   = f"iot/v1/s/{user_id}/IPC/iceCandidateReq"
+        live_play_topic  = f"iot/v1/s/{user_id}/IPC/livePlayReq"
 
-        # Known service/method names for live-stream provisioning (try all).
-        # connectipcReq is the documented TCP-relay live-stream request; also
-        # try liveType=2 candidates getLiveStreamUrl / getSignalingChannel.
-        pub_candidates = [
-            ("LiveAndPlayBack",  "connectipcReq"),
-            ("IPC",              "connectipcReq"),
-            ("LiveAndPlayBack",  "start"),
-            ("IPC",              "getLiveInfo"),
-            ("IPC",              "startLive"),
-            ("IPC",              "getSignalingChannelReq"),
-            ("IPC",              "getLiveStreamUrl"),
-            ("PlayBack",         "getPlaybackServerInfoReq"),
-        ]
+        # ------------------------------------------------------------------ #
+        # MQTT ↔ asyncio bridge
+        # ------------------------------------------------------------------ #
+        outgoing_q:   _q_mod.Queue      = _q_mod.Queue()
+        answer_fut:   asyncio.Future    = loop.create_future()
+        ice_q:        asyncio.Queue     = asyncio.Queue()
 
-        results = {}
+        def _on_mqtt_message(topic: str, payload_str: str) -> None:
+            try:
+                msg = json.loads(payload_str)
+            except Exception:
+                return
+            method = msg.get("method") or ""
+            inner  = msg.get("payload") or {}
+            if method == "webrtcResp":
+                answer = inner.get("answer") or {}
+                if answer.get("sdp") and not answer_fut.done():
+                    loop.call_soon_threadsafe(answer_fut.set_result, answer)
+            elif method == "iceCandidateReq":
+                cand = inner.get("candidate") or {}
+                if cand.get("candidate"):
+                    loop.call_soon_threadsafe(ice_q.put_nowait, cand)
 
-        # --- MQTT probe -------------------------------------------------------
-        publish_items = []
-        for service, method in pub_candidates:
-            pub_topic = f"iot/v1/s/{user_id}/{service}/{method}"
-            body = json.dumps({
-                "method":  method,
-                "service": service,
-                "devId":   self.device_id,
+        # Run MQTT in a thread executor (very long duration; stopped via
+        # outgoing_q sentinel when the caller calls WebRTCSession.stop()).
+        mqtt_fut = loop.run_in_executor(
+            None,
+            lambda: _mqtt_session_sync(
+                mqtt_url, mqtt_user, mqtt_pwd, mqtt_cid,
+                sub_topics, [], 3600.0, _on_mqtt_message,
+                "/mqtt", None, outgoing_q,
+            ),
+        )
+
+        # ------------------------------------------------------------------ #
+        # aiortc peer connection
+        # ------------------------------------------------------------------ #
+        pc = RTCPeerConnection()
+        pc.addTransceiver("video", direction="recvonly")
+        pc.addTransceiver("audio", direction="recvonly")
+
+        track_tasks: list = []
+
+        @pc.on("track")
+        def _on_track(track) -> None:
+            if track.kind == "video" and on_frame is not None:
+                t = asyncio.ensure_future(_webrtc_consume_video(track, on_frame))
+                track_tasks.append(t)
+
+        recorder = None
+        if output_path:
+            try:
+                from aiortc.contrib.media import MediaRecorder
+                recorder = MediaRecorder(output_path)
+
+                @pc.on("track")
+                def _on_track_rec(track) -> None:
+                    recorder.addTrack(track)
+            except Exception as exc:
+                _LOGGER.warning(
+                    "async_open_webrtc_stream: MediaRecorder not available: %s", exc
+                )
+
+        # ------------------------------------------------------------------ #
+        # Create SDP offer and publish webrtcReq
+        # ------------------------------------------------------------------ #
+        offer = await pc.createOffer()
+        await pc.setLocalDescription(offer)
+
+        def _seq() -> str:
+            return f"ap{random.randint(1000000, 9999999)}"
+
+        webrtc_req_payload = json.dumps({
+            "method":  "webrtcReq",
+            "service": "IPC",
+            "devId":   device_id,
+            "srcAddr": f"0.{user_id}",
+            "seq":     _seq(),
+            "tst":     int(time.time() * 1000),
+            "payload": {
+                "peerid":  peer_id,
+                "devId":   device_id,
+                "offer":   {"type": pc.localDescription.type,
+                             "sdp":  pc.localDescription.sdp},
+                "trackId": 1,
+                "dstAddr": user_id,
+            },
+        })
+        outgoing_q.put_nowait((webrtc_req_topic, webrtc_req_payload))
+
+        # Forward our own ICE candidates to the camera via MQTT
+        @pc.on("icecandidate")
+        def _on_local_ice(candidate) -> None:
+            if candidate is None:
+                return
+            cand_str = (
+                f"candidate:{candidate.foundation} {candidate.component} "
+                f"{candidate.protocol} {candidate.priority} {candidate.ip} "
+                f"{candidate.port} typ {candidate.type}"
+            )
+            if getattr(candidate, "relatedAddress", None):
+                cand_str += (
+                    f" raddr {candidate.relatedAddress}"
+                    f" rport {candidate.relatedPort}"
+                )
+            payload = json.dumps({
+                "method":  "iceCandidateReq",
+                "service": "IPC",
+                "devId":   device_id,
                 "srcAddr": f"0.{user_id}",
-                "seq":     seq,
+                "seq":     _seq(),
                 "tst":     int(time.time() * 1000),
                 "payload": {
-                    "deviceId": self.device_id,
-                    "devId":    self.device_id,
-                    "userId":   user_id,
+                    "peerid":    peer_id,
+                    "devId":     device_id,
+                    "candidate": {"candidate": cand_str},
+                    "dstAddr":   user_id,
                 },
             })
-            publish_items.append((pub_topic, body))
+            outgoing_q.put_nowait((ice_cand_topic, payload))
 
-        def _capture(topic, raw):
-            try:
-                results[f"mqtt:{topic}"] = json.loads(raw)
-            except Exception:
-                results[f"mqtt:{topic}"] = raw
-
-        await _mqtt_session(
-            mqtt_url, mqtt_user, mqtt_pwd, diag_cid,
-            subscribe_topics=[
-                f"iot/v1/cb/{self.device_id}/#",
-                f"iot/v1/c/{user_id}/#",
-                f"lds/v1/cb/{self.device_id}/#",
-                f"lds/v1/c/{user_id}/#",
-            ],
-            publish_items=publish_items,
-            duration=5.0,
-            on_message=_capture,
-        )
-
-        # --- HTTP probe -------------------------------------------------------
-        # Three API base URLs to try: v21 (general device API), v32 IPC (camera
-        # specific), and the smarthome endpoint (SDK login backend).
-        _ipc_id = self.device_id
-        _http_probes = [
-            # (base_url, path, method)
-            (self._aidot_v32_base, f"/devices/{_ipc_id}/live",     "get"),
-            (self._aidot_v32_base, f"/devices/{_ipc_id}/stream",   "get"),
-            (self._aidot_v32_base, f"/devices/{_ipc_id}/signal",   "get"),
-            (self._aidot_v32_base, f"/devices/{_ipc_id}/webrtc",   "get"),
-            (self._aidot_v32_base, f"/livestream/{_ipc_id}",       "get"),
-            (self._aidot_v32_base, f"/devices/{_ipc_id}/live",     "post"),
-            (self._aidot_v32_base, f"/livestream/{_ipc_id}",       "post"),
-            # v21 API paths
-            (self._aidot_v21_base, f"/devices/{_ipc_id}/live",     "get"),
-            (self._aidot_v21_base, f"/ipc/{_ipc_id}/stream",       "get"),
-            (self._aidot_v21_base, f"/ipc/live/{_ipc_id}",         "get"),
-            (self._aidot_v21_base, f"/devices/{_ipc_id}/live",     "post"),
-            # smarthome / Leedarson SDK paths
-            (self._smarthome_base, f"/device/ipc/connect",          "post"),
-            (self._smarthome_base, f"/deviceController/ipc/live",   "get"),
-            (self._smarthome_base, f"/deviceController/ipc/stream", "post"),
-        ]
+        # ------------------------------------------------------------------ #
+        # Wait for SDP answer from camera
+        # ------------------------------------------------------------------ #
         try:
-            async with aiohttp.ClientSession() as session:
-                for base, path, method_fn in _http_probes:
-                    url = f"{base}{path}"
-                    try:
-                        kw: dict = dict(
-                            headers=self._aidot_headers(),
-                            timeout=aiohttp.ClientTimeout(total=8),
-                        )
-                        if method_fn == "post":
-                            kw["json"] = {"deviceId": _ipc_id}
-                        fn = getattr(session, method_fn)
-                        async with fn(url, **kw) as resp:
-                            body_r = await resp.json(content_type=None)
-                        key = f"http:{method_fn.upper()}:{path}:status={resp.status}"
-                        results[key] = body_r
-                    except Exception as exc:
-                        results[f"http:{method_fn.upper()}:{path}"] = f"ERROR: {exc}"
-        except Exception as exc:
-            _LOGGER.debug("async_get_live_stream_info: HTTP probe error: %s", exc)
+            answer = await asyncio.wait_for(answer_fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            outgoing_q.put_nowait(None)
+            await pc.close()
+            raise RuntimeError(
+                f"async_open_webrtc_stream: no webrtcResp received within {timeout}s"
+            )
 
-        return results if results else None
-
-    async def async_open_webrtc_stream(
-        self,
-        on_frame: Callable[[VideoFrame], None],
-    ) -> None:
-        """Placeholder: open a liveType=2 WebRTC-over-MQTT DataChannel stream.
-
-        NOT YET IMPLEMENTED.  Use ``test_camera.py --diag-live`` (with the user
-        prompt) to capture the live MQTT signaling messages, then implement.
-
-        Confirmed protocol (from iOS app telemetry, 2025-03-23):
-          1. ``async_get_ice_config(device_id)``
-             → MQTT ``IPC/getIceConfigReq`` → ``getIceConfigResp``
-             → STUN: 3.230.182.123:3478 / TURN: 3.230.182.123:5349
-             → per-device TURN credentials (token int)
-
-          2. Create ``aiortc.RTCPeerConnection`` with ICE servers
-             Create ``RTCDataChannel``
-
-          3. Generate SDP offer, gather local ICE candidates
-             Publish to ``iot/v1/s/{userId}/IPC/offerReq``
-             (peerid format: ``{session32hex}_{rand6hex}_{liveType}_{streamId}_1``)
-
-          4. Receive SDP answer + device ICE candidates on
-             ``iot/v1/c/{userId}/#``
-
-          5. ICE negotiation → DataChannel OPEN
-
-          6. Publish ``iot/v1/s/{userId}/IPC/livePlayReq``
-             → receive ``livePlayResp`` code=200
-
-          7. Receive binary video frames from DataChannel
-             (proprietary Leedarson framing; H.264 NAL units inside)
-
-        Requires: ``pip install python-aidot[webrtc]``  (adds aiortc)
-        """
-        raise NotImplementedError(
-            "async_open_webrtc_stream is not yet implemented. "
-            "Run test_camera.py --diag-live (with ENTER prompt) while opening a "
-            "live view in the AiDot app to capture the MQTT signaling messages, "
-            "then implement based on observed offer/answer payload format."
+        await pc.setRemoteDescription(
+            RTCSessionDescription(
+                sdp=answer["sdp"],
+                type=answer.get("type", "answer"),
+            )
         )
 
-    # Keep old name as alias so any callers don't break
+        # ------------------------------------------------------------------ #
+        # Apply remote ICE candidates + wait for ICE connection
+        # ------------------------------------------------------------------ #
+        connected_ev = asyncio.Event()
+
+        @pc.on("connectionstatechange")
+        async def _on_conn_state() -> None:
+            _LOGGER.debug("WebRTC connectionState: %s", pc.connectionState)
+            if pc.connectionState in ("connected", "completed"):
+                connected_ev.set()
+            elif pc.connectionState in ("failed", "closed"):
+                connected_ev.set()   # unblock the wait; session will detect failure
+
+        deadline = time.monotonic() + timeout
+        while not connected_ev.is_set() and time.monotonic() < deadline:
+            # Drain incoming ICE candidates from the camera
+            while True:
+                try:
+                    cand_dict = ice_q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                cand_line = cand_dict.get("candidate", "")
+                if cand_line.startswith("candidate:"):
+                    cand_line = cand_line[len("candidate:"):]
+                try:
+                    ice_cand = candidate_from_sdp(cand_line)
+                    await pc.addIceCandidate(ice_cand)
+                except Exception as exc:
+                    _LOGGER.debug(
+                        "async_open_webrtc_stream: addIceCandidate error: %s", exc
+                    )
+            await asyncio.sleep(0.1)
+
+        if pc.connectionState not in ("connected", "completed"):
+            outgoing_q.put_nowait(None)
+            await pc.close()
+            raise RuntimeError(
+                f"async_open_webrtc_stream: ICE connection not established "
+                f"(state={pc.connectionState}) within {timeout}s"
+            )
+
+        # ------------------------------------------------------------------ #
+        # Send livePlayReq to start the media feed
+        # ------------------------------------------------------------------ #
+        live_play_payload = json.dumps({
+            "method":  "livePlayReq",
+            "service": "IPC",
+            "devId":   device_id,
+            "srcAddr": f"0.{user_id}",
+            "seq":     _seq(),
+            "tst":     int(time.time() * 1000),
+            "payload": {
+                "peerid":  peer_id,
+                "devId":   device_id,
+                "dstAddr": user_id,
+            },
+        })
+        outgoing_q.put_nowait((live_play_topic, live_play_payload))
+
+        if recorder:
+            await recorder.start()
+
+        _LOGGER.info(
+            "WebRTC stream open for %s (peerid=%s)", device_id, peer_id
+        )
+        return WebRTCSession(
+            pc=pc,
+            outgoing_q=outgoing_q,
+            mqtt_fut=mqtt_fut,
+            recorder=recorder,
+            track_tasks=track_tasks,
+        )
+
+    # Keep old name as alias
     async_open_kvs_stream = async_open_webrtc_stream
 
     # -- Existing methods (unchanged) ---------------------------------------- #

@@ -308,38 +308,6 @@ async def run(args: argparse.Namespace) -> None:
                 else:
                     print(f"    P2P UID: None  (P2P not available; relay path needed)")
 
-                # --- v32 IPC device detail probe ---
-                # Android app's NewLiveFragment.w5() parses a device property JSON
-                # string to get the TUTK UID. Probe v32 IPC endpoints directly so
-                # we can see the raw response and identify which field carries it.
-                import aiohttp as _v32_aiohttp
-                _v32_base = dc._aidot_v32_base
-                _v32_headers = dc._aidot_headers()
-                print(f"\n[DIAG] Probing v32 IPC device detail endpoints "
-                      f"({_v32_base}) ...")
-                _v32_paths = [
-                    f"/devices/{cam.get('id')}",
-                    f"/devices/{cam.get('id')}/info",
-                    f"/devices/{cam.get('id')}/detail",
-                ]
-                for _vpath in _v32_paths:
-                    try:
-                        async with _v32_aiohttp.ClientSession() as _vs:
-                            async with _vs.get(
-                                f"{_v32_base}{_vpath}",
-                                headers=_v32_headers,
-                                timeout=_v32_aiohttp.ClientTimeout(total=10),
-                            ) as _vr:
-                                _vstatus = _vr.status
-                                _vbody = await _vr.json(content_type=None)
-                        print(f"    GET {_vpath}  -> HTTP {_vstatus}")
-                        print(f"    {_dui_json.dumps(_vbody, indent=6, default=str)}")
-                        if _vstatus < 400:
-                            break   # got a real response; no need to try remaining paths
-                    except Exception as _ve:
-                        print(f"    GET {_vpath}  -> ERROR: {_ve}")
-
-
             if args.diag_live:
                 # ----------------------------------------------------------- #
                 # MQTT live-stream sniffer + HTTP provisioning probe
@@ -413,19 +381,6 @@ async def run(args: argparse.Namespace) -> None:
                                 print(f"           uri: {_u}")
                 else:
                     print(f"    (no ICE config received — sniff may capture it if app is active)")
-
-                # Exploratory HTTP/MQTT probe (--verbose only)
-                if args.verbose:
-                    print(f"\n[DIAG-LIVE] Probing HTTP/MQTT provisioning endpoints (verbose) ...")
-                    _probe_result = await dc.async_get_live_stream_info()
-                    if _probe_result:
-                        _non_error = {k: v for k, v in _probe_result.items()
-                                      if not (isinstance(v, str) and v.startswith("ERROR"))}
-                        for _k, _v in sorted(_non_error.items()):
-                            _vstr = _dlj.dumps(_v, indent=8, default=str) if isinstance(_v, dict) else repr(_v)
-                            print(f"  [{_k}]  {_vstr}")
-                    else:
-                        print("    (no responses received)")
 
                 # Passive MQTT sniff — single persistent session using the
                 # authorised clientId.  The on_ready hook waits for ENTER so the
@@ -509,6 +464,54 @@ async def run(args: argparse.Namespace) -> None:
                         await session.stop()
                     print("    Session stopped.")
 
+            if args.webrtc:
+                # ----------------------------------------------------------- #
+                # WebRTC live stream via MQTT signaling + aiortc
+                # ----------------------------------------------------------- #
+                # Requires: pip install python-aidot[webrtc]
+                #
+                # To watch live with VLC:
+                #   python3 test_camera.py ... --webrtc --webrtc-output /tmp/live.mkv
+                #   vlc /tmp/live.mkv
+                #
+                # For go2rtc / Home Assistant integration:
+                #   Add a go2rtc source pointing to the RTSP output of a local
+                #   process that streams from the WebRTCSession track callbacks,
+                #   or pipe the MediaRecorder output through ffmpeg:
+                #     ffmpeg -re -i /tmp/live.mkv -c copy -f rtsp rtsp://localhost:8554/camera
+                # ----------------------------------------------------------- #
+                print(f"\n[WEBRTC] Opening WebRTC stream for {cam.get('name', cam.get('id'))} ...")
+                print("    Requires: pip install python-aidot[webrtc]")
+                if args.webrtc_output:
+                    print(f"    Recording to: {args.webrtc_output}")
+
+                _wrtc_frames = [0]
+                def _wrtc_on_frame(frame) -> None:
+                    _wrtc_frames[0] += 1
+                    if _wrtc_frames[0] % 30 == 1:
+                        print(f"    [WEBRTC] frame #{_wrtc_frames[0]}  "
+                              f"{getattr(frame, 'width', '?')}x{getattr(frame, 'height', '?')}")
+
+                try:
+                    _wrtc_session = await dc.async_open_webrtc_stream(
+                        on_frame=_wrtc_on_frame,
+                        output_path=args.webrtc_output or None,
+                        timeout=args.webrtc_timeout,
+                    )
+                    print(f"    WebRTC connected — streaming for {args.webrtc_seconds}s ...")
+                    print("    (Ctrl+C to stop early)")
+                    try:
+                        await asyncio.sleep(args.webrtc_seconds)
+                    except asyncio.CancelledError:
+                        pass
+                    finally:
+                        await _wrtc_session.stop()
+                    print(f"    Session stopped. {_wrtc_frames[0]} frame(s) received.")
+                except ImportError as _ie:
+                    print(f"    SKIP: {_ie}")
+                except RuntimeError as _re:
+                    print(f"    FAILED: {_re}")
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -547,11 +550,21 @@ def main() -> None:
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Show detailed probe output: per-URI ICE config, paho logs, "
                              "HTTP/MQTT exploratory probes")
+    parser.add_argument("--webrtc", action="store_true",
+                        help="Open a liveType=2 WebRTC stream via MQTT signaling (requires aiortc)")
+    parser.add_argument("--webrtc-output", metavar="PATH",
+                        help="Record the WebRTC stream to this file via aiortc MediaRecorder "
+                             "(e.g. /tmp/live.mkv); play back with VLC or pipe through ffmpeg")
+    parser.add_argument("--webrtc-seconds", type=int, default=30,
+                        help="How many seconds to stream during --webrtc (default: 30)")
+    parser.add_argument("--webrtc-timeout", type=float, default=30.0,
+                        help="Seconds to wait for WebRTC ICE connection (default: 30)")
 
     args = parser.parse_args()
 
     # Default: run all tests if no specific flag given
-    if not any([args.p2p, args.list_recordings, args.play, args.live, args.diag_mqtt, args.diag_live]):
+    if not any([args.p2p, args.list_recordings, args.play, args.live,
+                args.diag_mqtt, args.diag_live, args.webrtc]):
         args.p2p             = True
         args.list_recordings = True
         args.play            = True
