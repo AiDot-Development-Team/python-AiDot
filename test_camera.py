@@ -554,6 +554,7 @@ async def run(args: argparse.Namespace) -> None:
                             output_path=args.webrtc_output or None,
                             timeout=args.webrtc_timeout,
                             status_callback=_wrtc_status,
+                            force_sdes=True if args.webrtc_sdes else None,
                         )
                         print(f"    WebRTC connected — streaming for {args.webrtc_seconds}s ...")
                         print("    (Ctrl+C to stop early)")
@@ -617,6 +618,9 @@ def main() -> None:
                         help="How many seconds to stream during --webrtc (default: 30)")
     parser.add_argument("--webrtc-timeout", type=float, default=30.0,
                         help="Seconds to wait for WebRTC ICE connection (default: 30)")
+    parser.add_argument("--webrtc-sdes", action="store_true",
+                        help="Force SDES-SRTP path (ffmpeg, peerid _1) regardless of "
+                             "isDTLS device property; use to test SDES cameras explicitly")
 
     args = parser.parse_args()
 

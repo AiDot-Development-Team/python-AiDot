@@ -2515,14 +2515,22 @@ class DeviceClient(object):
             method = msg.get("method") or ""
             inner  = msg.get("payload") or {}
             if method == "webrtcResp":
-                if inner.get("peerid") != peer_id:
+                resp_pid = inner.get("peerid")
+                if resp_pid != peer_id:
+                    loop.call_soon_threadsafe(
+                        lambda rp=resp_pid: _status(
+                            f"webrtcResp IGNORED — peerid mismatch:"
+                            f" got {rp!r}"
+                            f" expected ...{peer_id[-12:]}"
+                        )
+                    )
                     return
                 answer = inner.get("offer") or inner.get("answer") or {}
                 if answer.get("sdp") and not answer_fut.done():
                     loop.call_soon_threadsafe(answer_fut.set_result, answer)
             elif method == "iceCandidateReq":
                 if inner.get("peerid") != peer_id:
-                    return
+                    return   # high-volume; suppress status noise for ICE mismatches
                 cand = inner.get("candidate") or {}
                 if cand.get("candidate"):
                     loop.call_soon_threadsafe(ice_q.put_nowait, cand)
@@ -2644,6 +2652,8 @@ class DeviceClient(object):
             f"SDP offer  m=video={_sdp_transport(_sdp, 'video')}"
             f"  m=audio={_sdp_transport(_sdp, 'audio')}"
         )
+        _mlines = [ln for ln in _sdp.splitlines() if ln.startswith("m=")]
+        _status("SDP m-sections (%d): %s" % (len(_mlines), " | ".join(_mlines)))
 
         def _seq() -> str:
             return f"ap{random.randint(1000000, 9999999)}"
