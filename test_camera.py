@@ -21,9 +21,27 @@ Optional flags:
   --webrtc                Open a liveType=2 WebRTC stream (requires aiortc):
                             pip install python-aidot[webrtc]
   --webrtc-output PATH    Record the stream to PATH.
-                            .ts  (MPEG-TS) → streamable live:  vlc PATH  /  ffplay PATH
-                            .mkv / .mp4   → playable after recording stops
-                          SDES cameras use ffmpeg directly (no aiortc required).
+
+                          Recommended formats:
+                            /tmp/cam.ts      MPEG-TS — streamable while recording
+                            /tmp/cam.mkv     Matroska — full playback after stop
+                            pipe:1           Raw mux to stdout (pipe into ffmpeg)
+
+                          Playback / re-broadcast options (MPEG-TS recommended):
+
+                            ffmpeg (re-stream to RTSP via MediaMTX / go2rtc):
+                              ffmpeg -re -i /tmp/cam.ts -c copy \
+                                -f rtsp rtsp://localhost:8554/cam
+
+                            go2rtc (add to go2rtc.yaml, then open in any RTSP client):
+                              streams:
+                                cam: ffmpeg:/tmp/cam.ts#video=copy#audio=copy
+
+                            VLC (direct live playback):
+                              vlc /tmp/cam.ts
+                              vlc rtsp://localhost:8554/cam   # after go2rtc/MediaMTX
+
+                          SDES cameras use ffmpeg directly — no aiortc required.
   --webrtc-seconds N      Seconds to stream during --webrtc (default: 30)
   --log-file PATH         Write all output to PATH as well as stdout
   --verbose               Extra detail: ICE config URIs, paho logs
@@ -488,14 +506,22 @@ async def run(args: argparse.Namespace) -> None:
 
             if args.webrtc:
                 # ----------------------------------------------------------- #
-                # WebRTC live stream via MQTT signaling + aiortc
+                # WebRTC live stream via MQTT signaling + aiortc (DTLS cameras)
+                # or ffmpeg SRTP receiver (SDES cameras, isDTLS == '0').
                 #
-                # To watch live with VLC:
-                #   python3 test_camera.py ... --webrtc --webrtc-output /tmp/live.mkv
-                #   vlc /tmp/live.mkv
+                # Capture to MPEG-TS (streamable while recording):
+                #   python3 test_camera.py ... --webrtc --webrtc-output /tmp/cam.ts
                 #
-                # For go2rtc / Home Assistant:
-                #   ffmpeg -re -i /tmp/live.mkv -c copy -f rtsp rtsp://localhost:8554/cam
+                # Re-broadcast as RTSP with ffmpeg → MediaMTX / go2rtc:
+                #   ffmpeg -re -i /tmp/cam.ts -c copy -f rtsp rtsp://localhost:8554/cam
+                #
+                # go2rtc pull (go2rtc.yaml):
+                #   streams:
+                #     cam: ffmpeg:/tmp/cam.ts#video=copy#audio=copy
+                #
+                # VLC direct:
+                #   vlc /tmp/cam.ts
+                #   vlc rtsp://localhost:8554/cam   # after go2rtc / MediaMTX
                 # ----------------------------------------------------------- #
                 try:
                     import aiortc as _aiortc_check  # noqa: F401
@@ -584,8 +610,9 @@ def main() -> None:
     parser.add_argument("--webrtc", action="store_true",
                         help="Open a liveType=2 WebRTC stream via MQTT signaling (requires aiortc)")
     parser.add_argument("--webrtc-output", metavar="PATH",
-                        help="Record the WebRTC stream to this file via aiortc MediaRecorder "
-                             "(e.g. /tmp/live.mkv); play back with VLC or pipe through ffmpeg")
+                        help="Record the stream to this file (e.g. /tmp/cam.ts). "
+                             "Use .ts for live viewing (ffplay/VLC) or RTSP re-broadcast "
+                             "via ffmpeg+MediaMTX / go2rtc. SDES cameras use ffmpeg directly.")
     parser.add_argument("--webrtc-seconds", type=int, default=30,
                         help="How many seconds to stream during --webrtc (default: 30)")
     parser.add_argument("--webrtc-timeout", type=float, default=30.0,
