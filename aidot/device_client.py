@@ -2519,7 +2519,7 @@ class DeviceClient(object):
             _mqtt_ready_ev.set()
 
         def _on_mqtt_message(topic: str, payload_str: str) -> None:
-            _LOGGER.debug("webrtc rx  topic=%s  %s", topic, payload_str[:300])
+            _LOGGER.debug("webrtc rx  topic=%s  %s", topic, payload_str)
             try:
                 msg = json.loads(payload_str)
             except Exception:
@@ -2547,10 +2547,9 @@ class DeviceClient(object):
                 if cand.get("candidate"):
                     loop.call_soon_threadsafe(ice_q.put_nowait, cand)
             else:
-                _LOGGER.debug("webrtc: unhandled method=%r on %s", method, topic)
                 loop.call_soon_threadsafe(
-                    lambda m=method: _status(
-                        f"camera replied  method={m!r}  (not webrtcResp — ignored)"
+                    lambda m=method, p=inner: _status(
+                        f"camera replied  method={m!r}  payload={p!r}"
                     )
                 )
 

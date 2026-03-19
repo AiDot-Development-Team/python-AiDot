@@ -560,7 +560,7 @@ async def run(args: argparse.Namespace) -> None:
                             output_path=args.webrtc_output or None,
                             timeout=args.webrtc_timeout,
                             status_callback=_wrtc_status,
-                            force_sdes=True if args.webrtc_sdes else None,
+                            force_sdes=True if args.webrtc_sdes else (False if args.webrtc_dtls else None),
                         )
                         print(f"    WebRTC connected — streaming for {args.webrtc_seconds}s ...")
                         print("    (Ctrl+C to stop early)")
@@ -627,6 +627,9 @@ def main() -> None:
     parser.add_argument("--webrtc-sdes", action="store_true",
                         help="Force SDES-SRTP path (ffmpeg, peerid _1) regardless of "
                              "isDTLS device property; use to test SDES cameras explicitly")
+    parser.add_argument("--webrtc-dtls", action="store_true",
+                        help="Force DTLS-SRTP path (aiortc, peerid _2) regardless of "
+                             "isDTLS device property; use to override SDES auto-detection")
 
     args = parser.parse_args()
 
