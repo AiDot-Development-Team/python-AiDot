@@ -1475,14 +1475,19 @@ class DeviceClient(object):
 
     @property
     def is_sdes_camera(self) -> bool:
-        """True if the camera uses SDES-SRTP (peerid suffix _1) rather than DTLS-SRTP.
+        """True if the camera uses SDES-SRTP rather than DTLS-SRTP.
 
-        Determined by ``properties.isDTLS`` in the device API response:
-        ``'0'`` → not DTLS → SDES path (peerid ``_1``).
-        ``'1'`` or absent → DTLS-SRTP path (peerid ``_2``).
+        Determined by ``properties.enableSdes`` in the device API response:
+        ``'1'`` → SDES explicitly enabled → SDES path.
+        anything else → DTLS-SRTP path (default).
+
+        ``isDTLS: '0'`` is NOT used here — iOS app session captures confirm
+        that cameras with ``isDTLS: '0'`` (e.g. LK.IPC.A000088) still respond
+        with a full DTLS fingerprint answer.  ``enableSdes: '0'`` (the default)
+        means SDES is disabled, so those cameras must use DTLS.
         """
         props = getattr(self, "_raw_device", {}).get("properties") or {}
-        return str(props.get("isDTLS", "1")) == "0"
+        return str(props.get("enableSdes", "0")) == "1"
 
     def __init__(self, device: dict[str, Any], user_info: dict[str, Any]) -> None:
         self.ping_count = 0
@@ -2612,10 +2617,11 @@ class DeviceClient(object):
         )
         pc.addTransceiver("audio", direction="recvonly")   # mid:0
         pc.addTransceiver("video", direction="recvonly")   # mid:1  primary video
-        # NOTE: we intentionally do NOT call createDataChannel here.
-        # aiortc generates the old "DTLS/SCTP 5000" format (pre-RFC 8841) which
-        # strict cameras reject.  A 2-section offer (audio + video) is the
-        # minimal offer; the camera will add extra m-sections in its answer.
+        pc.createDataChannel("data")                        # mid:2  SCTP datachannel
+        # iOS app session capture confirms LK.IPC.A000088 cameras answer with a
+        # 3-section SDP (audio + video + application/SCTP).  The camera mirrors
+        # the offer's section count, so a 2-section offer would produce a
+        # 2-section answer — correct but apparently not what this firmware expects.
 
         track_tasks: list = []
 
@@ -2686,7 +2692,7 @@ class DeviceClient(object):
                 "devId":   device_id,
                 "offer":   {"type": pc.localDescription.type,
                              "sdp":  pc.localDescription.sdp},
-                "trackId": 1,
+                "trackId": 0,
                 "dstAddr": user_id,
             },
         })
@@ -2957,7 +2963,7 @@ class DeviceClient(object):
                 "peerid":  peer_id,
                 "devId":   device_id,
                 "offer":   {"type": "offer", "sdp": sdes_offer_sdp},
-                "trackId": 1,
+                "trackId": 0,
                 "dstAddr": user_id,
             },
         })
