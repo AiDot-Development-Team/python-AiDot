@@ -2326,7 +2326,7 @@ class DeviceClient(object):
         import os
         session = os.urandom(16).hex()          # 32 hex chars
         rand6   = os.urandom(3).hex()           # 6 hex chars
-        return f"{session}_{rand6}_{live_type}_{stream_id}_1"
+        return f"{session}_{rand6}_{live_type}_{stream_id}_2"
 
     async def async_open_webrtc_stream(
         self,
@@ -2444,7 +2444,7 @@ class DeviceClient(object):
             method = msg.get("method") or ""
             inner  = msg.get("payload") or {}
             if method == "webrtcResp":
-                answer = inner.get("answer") or {}
+                answer = inner.get("offer") or inner.get("answer") or {}
                 if answer.get("sdp") and not answer_fut.done():
                     loop.call_soon_threadsafe(answer_fut.set_result, answer)
             elif method == "iceCandidateReq":
@@ -2491,8 +2491,10 @@ class DeviceClient(object):
         # aiortc peer connection
         # ------------------------------------------------------------------ #
         pc = RTCPeerConnection()
-        pc.addTransceiver("video", direction="recvonly")
-        pc.addTransceiver("audio", direction="recvonly")
+        pc.addTransceiver("audio", direction="recvonly")   # mid:0
+        pc.addTransceiver("video", direction="recvonly")   # mid:1  H264
+        pc.addTransceiver("video", direction="recvonly")   # mid:2  H265 (SDP match)
+        pc.createDataChannel("data")                        # mid:3
 
         track_tasks: list = []
 
@@ -2508,9 +2510,16 @@ class DeviceClient(object):
                 from aiortc.contrib.media import MediaRecorder
                 recorder = MediaRecorder(output_path)
 
+                _video_recorded = [False]
+
                 @pc.on("track")
                 def _on_track_rec(track) -> None:
-                    recorder.addTrack(track)
+                    if track.kind == "video":
+                        if not _video_recorded[0]:
+                            recorder.addTrack(track)
+                            _video_recorded[0] = True
+                    else:
+                        recorder.addTrack(track)
             except Exception as exc:
                 _LOGGER.warning(
                     "async_open_webrtc_stream: MediaRecorder not available: %s", exc
