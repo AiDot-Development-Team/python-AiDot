@@ -113,10 +113,17 @@ def on_frame(frame: VideoFrame) -> None:
 
 async def run(args: argparse.Namespace) -> None:
     import logging as _logging
-    _logging.basicConfig(
-        level=_logging.WARNING,
-        format="%(name)s %(levelname)s: %(message)s",
-    )
+    if args.verbose:
+        _logging.getLogger("aidot.device_client").setLevel(_logging.DEBUG)
+        _logging.basicConfig(
+            level=_logging.DEBUG,
+            format="%(name)s %(levelname)s: %(message)s",
+        )
+    else:
+        _logging.basicConfig(
+            level=_logging.WARNING,
+            format="%(name)s %(levelname)s: %(message)s",
+        )
     async with aiohttp.ClientSession() as http_session:
         client = AidotClient(
             session=http_session,
@@ -321,16 +328,7 @@ async def run(args: argparse.Namespace) -> None:
                 # MQTT live-stream sniffer + HTTP provisioning probe
                 # ----------------------------------------------------------- #
                 import json as _dlj
-                import logging as _dl_logging
                 from aidot.device_client import _mqtt_session_with_status
-
-                # Verbose mode: raise paho log level so connection events are shown
-                if args.verbose:
-                    _dl_logging.getLogger("aidot.device_client").setLevel(_dl_logging.DEBUG)
-                    _dl_logging.basicConfig(
-                        level=_dl_logging.DEBUG,
-                        format="%(name)s %(levelname)s: %(message)s",
-                    )
 
                 print(f"\n[DIAG-LIVE] Live-stream provisioning probe for {cam.get('name')} ...")
 

@@ -2419,7 +2419,17 @@ class DeviceClient(object):
         answer_fut:   asyncio.Future    = loop.create_future()
         ice_q:        asyncio.Queue     = asyncio.Queue()
 
+        # Gate: block asyncio until MQTT is connected + subscribed
+        import threading as _threading
+        _mqtt_ready_ev     = _threading.Event()
+        _mqtt_conn_status: dict = {}
+
+        def _on_mqtt_ready(st: dict) -> None:
+            _mqtt_conn_status.update(st)
+            _mqtt_ready_ev.set()
+
         def _on_mqtt_message(topic: str, payload_str: str) -> None:
+            _LOGGER.debug("webrtc rx  topic=%s  %s", topic, payload_str[:300])
             try:
                 msg = json.loads(payload_str)
             except Exception:
@@ -2434,6 +2444,8 @@ class DeviceClient(object):
                 cand = inner.get("candidate") or {}
                 if cand.get("candidate"):
                     loop.call_soon_threadsafe(ice_q.put_nowait, cand)
+            else:
+                _LOGGER.debug("webrtc: unhandled method=%r on %s", method, topic)
 
         # Run MQTT in a thread executor (very long duration; stopped via
         # outgoing_q sentinel when the caller calls WebRTCSession.stop()).
@@ -2442,9 +2454,26 @@ class DeviceClient(object):
             lambda: _mqtt_session_sync(
                 mqtt_url, mqtt_user, mqtt_pwd, mqtt_cid,
                 sub_topics, [], 3600.0, _on_mqtt_message,
-                "/mqtt", None, outgoing_q,
+                "/mqtt", _on_mqtt_ready, outgoing_q,
             ),
         )
+
+        # Wait for MQTT to be connected and subscribed before proceeding.
+        # threading.Event.wait(timeout) returns True if set, False on timeout.
+        mqtt_ok = await loop.run_in_executor(
+            None, lambda: _mqtt_ready_ev.wait(timeout=15.0)
+        )
+        if not mqtt_ok or not _mqtt_conn_status.get("connected"):
+            outgoing_q.put_nowait(None)   # stop MQTT thread
+            _err = (
+                _mqtt_conn_status.get("error")
+                or _mqtt_conn_status.get("rc_str")
+                or f"rc={_mqtt_conn_status.get('rc')}"
+            )
+            raise RuntimeError(
+                f"async_open_webrtc_stream: MQTT connection failed: {_err}"
+            )
+        _LOGGER.info("webrtc: MQTT connected (clientId=%s)", mqtt_cid)
 
         # ------------------------------------------------------------------ #
         # aiortc peer connection
@@ -2480,6 +2509,10 @@ class DeviceClient(object):
         # ------------------------------------------------------------------ #
         offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
+        _LOGGER.debug(
+            "webrtc: SDP offer (first 500 chars):\n%s",
+            pc.localDescription.sdp[:500],
+        )
 
         def _seq() -> str:
             return f"ap{random.randint(1000000, 9999999)}"
@@ -2501,6 +2534,7 @@ class DeviceClient(object):
             },
         })
         outgoing_q.put_nowait((webrtc_req_topic, webrtc_req_payload))
+        _LOGGER.info("webrtc: webrtcReq published  peerid=%s", peer_id)
 
         # Forward our own ICE candidates to the camera via MQTT
         @pc.on("icecandidate")
