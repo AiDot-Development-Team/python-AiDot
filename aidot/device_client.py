@@ -1467,10 +1467,12 @@ class DeviceClient(object):
     def is_sdes_camera(self) -> bool:
         """True if the camera uses SDES-SRTP (peerid suffix _1) rather than DTLS-SRTP.
 
-        Determined by the ``isDTLS`` field in the device API response:
-        ``'0'`` → SDES; ``'1'`` or absent → DTLS (default).
+        Determined by ``properties.isDTLS`` in the device API response:
+        ``'0'`` → not DTLS → SDES path (peerid ``_1``).
+        ``'1'`` or absent → DTLS-SRTP path (peerid ``_2``).
         """
-        return str(getattr(self, "_raw_device", {}).get("isDTLS", "1")) == "0"
+        props = getattr(self, "_raw_device", {}).get("properties") or {}
+        return str(props.get("isDTLS", "1")) == "0"
 
     def __init__(self, device: dict[str, Any], user_info: dict[str, Any]) -> None:
         self.ping_count = 0
@@ -2597,9 +2599,11 @@ class DeviceClient(object):
             )
         )
         pc.addTransceiver("audio", direction="recvonly")   # mid:0
-        pc.addTransceiver("video", direction="recvonly")   # mid:1  H264
-        pc.addTransceiver("video", direction="recvonly")   # mid:2  H265 (SDP match)
-        pc.createDataChannel("data")                        # mid:3
+        pc.addTransceiver("video", direction="recvonly")   # mid:1  primary video
+        # NOTE: we intentionally do NOT call createDataChannel here.
+        # aiortc generates the old "DTLS/SCTP 5000" format (pre-RFC 8841) which
+        # strict cameras reject.  A 2-section offer (audio + video) is the
+        # minimal offer; the camera will add extra m-sections in its answer.
 
         track_tasks: list = []
 
@@ -2721,12 +2725,28 @@ class DeviceClient(object):
                 f"async_open_webrtc_stream: no webrtcResp received within {timeout}s"
             )
 
-        await pc.setRemoteDescription(
-            RTCSessionDescription(
-                sdp=answer["sdp"],
-                type=answer.get("type", "answer"),
-            )
+        _ans_sdp = answer["sdp"]
+        _ans_mlines = [ln for ln in _ans_sdp.splitlines() if ln.startswith("m=")]
+        _status(
+            f"webrtcResp received — m=video={_sdp_transport(_ans_sdp, 'video')}"
+            f"  m=audio={_sdp_transport(_ans_sdp, 'audio')}"
         )
+        _status("Answer m-sections (%d): %s" % (len(_ans_mlines), " | ".join(_ans_mlines)))
+
+        try:
+            await pc.setRemoteDescription(
+                RTCSessionDescription(
+                    sdp=_ans_sdp,
+                    type=answer.get("type", "answer"),
+                )
+            )
+        except Exception as exc:
+            _status(f"setRemoteDescription failed: {exc}")
+            outgoing_q.put_nowait(None)
+            await pc.close()
+            raise RuntimeError(
+                f"async_open_webrtc_stream: setRemoteDescription failed: {exc}"
+            ) from exc
 
         # ------------------------------------------------------------------ #
         # Apply remote ICE candidates + wait for ICE connection
