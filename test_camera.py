@@ -475,50 +475,55 @@ async def run(args: argparse.Namespace) -> None:
             if args.webrtc:
                 # ----------------------------------------------------------- #
                 # WebRTC live stream via MQTT signaling + aiortc
-                # ----------------------------------------------------------- #
-                # Requires: pip install python-aidot[webrtc]
                 #
                 # To watch live with VLC:
                 #   python3 test_camera.py ... --webrtc --webrtc-output /tmp/live.mkv
                 #   vlc /tmp/live.mkv
                 #
-                # For go2rtc / Home Assistant integration:
-                #   Add a go2rtc source pointing to the RTSP output of a local
-                #   process that streams from the WebRTCSession track callbacks,
-                #   or pipe the MediaRecorder output through ffmpeg:
-                #     ffmpeg -re -i /tmp/live.mkv -c copy -f rtsp rtsp://localhost:8554/camera
+                # For go2rtc / Home Assistant:
+                #   ffmpeg -re -i /tmp/live.mkv -c copy -f rtsp rtsp://localhost:8554/cam
                 # ----------------------------------------------------------- #
-                print(f"\n[WEBRTC] Opening WebRTC stream for {cam.get('name', cam.get('id'))} ...")
-                print("    Requires: pip install python-aidot[webrtc]")
-                if args.webrtc_output:
-                    print(f"    Recording to: {args.webrtc_output}")
-
-                _wrtc_frames = [0]
-                def _wrtc_on_frame(frame) -> None:
-                    _wrtc_frames[0] += 1
-                    if _wrtc_frames[0] % 30 == 1:
-                        print(f"    [WEBRTC] frame #{_wrtc_frames[0]}  "
-                              f"{getattr(frame, 'width', '?')}x{getattr(frame, 'height', '?')}")
-
                 try:
-                    _wrtc_session = await dc.async_open_webrtc_stream(
-                        on_frame=_wrtc_on_frame,
-                        output_path=args.webrtc_output or None,
-                        timeout=args.webrtc_timeout,
-                    )
-                    print(f"    WebRTC connected — streaming for {args.webrtc_seconds}s ...")
-                    print("    (Ctrl+C to stop early)")
+                    import aiortc as _aiortc_check  # noqa: F401
+                    _has_aiortc = True
+                except ImportError:
+                    _has_aiortc = False
+
+                if not _has_aiortc:
+                    print(f"\n[WEBRTC] aiortc is not installed. Install with:")
+                    print(f"    pip install aiortc")
+                else:
+                    print(f"\n[WEBRTC] Opening WebRTC stream for {cam.get('name', cam.get('id'))} ...")
+                    if args.webrtc_output:
+                        print(f"    Recording to: {args.webrtc_output}")
+                    print(f"    Connecting (timeout {args.webrtc_timeout}s) ...")
+
+                    _wrtc_frames = [0]
+                    def _wrtc_on_frame(frame) -> None:
+                        _wrtc_frames[0] += 1
+                        if _wrtc_frames[0] % 30 == 1:
+                            print(f"    [WEBRTC] frame #{_wrtc_frames[0]}  "
+                                  f"{getattr(frame, 'width', '?')}x{getattr(frame, 'height', '?')}")
+
                     try:
-                        await asyncio.sleep(args.webrtc_seconds)
-                    except asyncio.CancelledError:
-                        pass
-                    finally:
-                        await _wrtc_session.stop()
-                    print(f"    Session stopped. {_wrtc_frames[0]} frame(s) received.")
-                except ImportError as _ie:
-                    print(f"    SKIP: {_ie}")
-                except RuntimeError as _re:
-                    print(f"    FAILED: {_re}")
+                        _wrtc_session = await dc.async_open_webrtc_stream(
+                            on_frame=_wrtc_on_frame,
+                            output_path=args.webrtc_output or None,
+                            timeout=args.webrtc_timeout,
+                        )
+                        print(f"    WebRTC connected — streaming for {args.webrtc_seconds}s ...")
+                        print("    (Ctrl+C to stop early)")
+                        try:
+                            await asyncio.sleep(args.webrtc_seconds)
+                        except asyncio.CancelledError:
+                            pass
+                        finally:
+                            await _wrtc_session.stop()
+                        print(f"    Session stopped. {_wrtc_frames[0]} frame(s) received.")
+                    except ImportError as _ie:
+                        print(f"    ERROR: {_ie}")
+                    except RuntimeError as _re:
+                        print(f"    FAILED: {_re}")
 
 
 def main() -> None:
