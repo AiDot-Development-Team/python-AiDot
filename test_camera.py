@@ -20,8 +20,10 @@ Optional flags:
                           while this runs so the WebRTC traffic is captured
   --webrtc                Open a liveType=2 WebRTC stream (requires aiortc):
                             pip install python-aidot[webrtc]
-  --webrtc-output PATH    Record the stream to PATH (e.g. /tmp/live.mkv)
-                          then open with:  vlc /tmp/live.mkv
+  --webrtc-output PATH    Record the stream to PATH.
+                            .ts  (MPEG-TS) → streamable live:  vlc PATH  /  ffplay PATH
+                            .mkv / .mp4   → playable after recording stops
+                          SDES cameras use ffmpeg directly (no aiortc required).
   --webrtc-seconds N      Seconds to stream during --webrtc (default: 30)
   --log-file PATH         Write all output to PATH as well as stdout
   --verbose               Extra detail: ICE config URIs, paho logs

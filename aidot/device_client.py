@@ -1041,6 +1041,46 @@ class WebRTCSession:
             pass
 
 
+class SdesSession:
+    """Active SDES-SRTP stream session managed by an ffmpeg subprocess.
+
+    Obtain via ``await DeviceClient.async_open_webrtc_stream(...)`` when the
+    camera uses SDES-SRTP (``isDTLS == '0'``).
+    Call ``await session.stop()`` when done.
+    """
+
+    def __init__(
+        self,
+        *,
+        proc,
+        sdp_path: str,
+        outgoing_q,
+        mqtt_fut,
+    ) -> None:
+        self._proc       = proc
+        self._sdp_path   = sdp_path
+        self._outgoing_q = outgoing_q
+        self._mqtt_fut   = mqtt_fut
+
+    async def stop(self) -> None:
+        """Tear down the stream: terminate ffmpeg and stop MQTT."""
+        self._proc.terminate()
+        try:
+            self._proc.wait(timeout=5)
+        except Exception:
+            self._proc.kill()
+        import os
+        try:
+            os.unlink(self._sdp_path)
+        except Exception:
+            pass
+        self._outgoing_q.put_nowait(None)
+        try:
+            await asyncio.wait_for(self._mqtt_fut, timeout=5.0)
+        except Exception:
+            pass
+
+
 async def _webrtc_consume_video(track: Any, on_frame: Callable) -> None:
     """Receive video frames from an aiortc VideoStreamTrack and call on_frame."""
     while True:
@@ -1423,6 +1463,15 @@ class DeviceClient(object):
     def connecting(self) -> bool:
         return self._connecting
 
+    @property
+    def is_sdes_camera(self) -> bool:
+        """True if the camera uses SDES-SRTP (peerid suffix _1) rather than DTLS-SRTP.
+
+        Determined by the ``isDTLS`` field in the device API response:
+        ``'0'`` → SDES; ``'1'`` or absent → DTLS (default).
+        """
+        return str(getattr(self, "_raw_device", {}).get("isDTLS", "1")) == "0"
+
     def __init__(self, device: dict[str, Any], user_info: dict[str, Any]) -> None:
         self.ping_count = 0
         self.status = DeviceStatusData()
@@ -1441,6 +1490,9 @@ class DeviceClient(object):
         # Cache slot for Leedarson smarthome auth (mqttUser, mqttPassword, userId)
         # Fetched lazily via _async_get_smarthome_auth()
         self._smarthome_auth: Optional[dict] = None
+
+        # Raw device dict retained for transport-type detection (isDTLS field)
+        self._raw_device: dict = device
 
         if CONF_AES_KEY in device:
             key_string = device[CONF_AES_KEY][0]
@@ -2312,21 +2364,25 @@ class DeviceClient(object):
         return result.get("data")
 
     @staticmethod
-    def generate_webrtc_peer_id(live_type: int = 2, stream_id: int = 0) -> str:
-        """Generate a peerId for a liveType=2 WebRTC connection.
+    def generate_webrtc_peer_id(
+        live_type: int = 2, stream_id: int = 0, *, sdes: bool = False
+    ) -> str:
+        """Generate a peerId for a WebRTC connection.
 
         Format observed in iOS app telemetry:
         ``{32-hex-session}_{6-hex-random}_{liveType}_{streamId}_{version}``
 
-        The session prefix is a per-app-session UUID (same for all cameras
-        opened in the same session).  We generate it fresh per call; callers
-        that open multiple cameras simultaneously should share one session
-        prefix across all ``generate_webrtc_peer_id`` calls.
+        The trailing version digit is ``2`` for DTLS-SRTP cameras and ``1``
+        for SDES-SRTP cameras.  The session prefix is a per-app-session UUID
+        (same for all cameras opened in the same session); callers that open
+        multiple cameras simultaneously should share one session prefix across
+        all ``generate_webrtc_peer_id`` calls.
         """
         import os
         session = os.urandom(16).hex()          # 32 hex chars
         rand6   = os.urandom(3).hex()           # 6 hex chars
-        return f"{session}_{rand6}_{live_type}_{stream_id}_2"
+        suffix  = "1" if sdes else "2"
+        return f"{session}_{rand6}_{live_type}_{stream_id}_{suffix}"
 
     async def async_open_webrtc_stream(
         self,
@@ -2336,15 +2392,21 @@ class DeviceClient(object):
         timeout: float = 30.0,
         output_path: Optional[str] = None,
         status_callback: Optional[Callable[[str], None]] = None,
+        force_sdes: Optional[bool] = None,
     ) -> "WebRTCSession":
         """Open a liveType=2 WebRTC stream via MQTT signaling.
 
         Performs the full WebRTC handshake over MQTT, then delivers decoded
         video frames to ``on_frame`` (and/or records to ``output_path``).
 
+        Supports both DTLS-SRTP cameras (aiortc path, peerid suffix ``_2``)
+        and SDES-SRTP cameras (ffmpeg path, peerid suffix ``_1``).  The
+        transport is auto-detected from ``self.is_sdes_camera`` unless
+        overridden by ``force_sdes``.
+
         Protocol (confirmed from live MQTT capture, 2025-03):
           1. Subscribe ``iot/v1/c/{userId}/#`` on the authorised MQTT clientId
-          2. Create aiortc ``RTCPeerConnection``, add recvonly audio/video
+          2. Create peer connection (aiortc or SDES SDP), add recvonly tracks
           3. Generate SDP offer → publish ``IPC/webrtcReq`` with peer-id
           4. Receive ``IPC/webrtcResp`` → set remote description (SDP answer)
           5. Exchange ICE candidates on ``IPC/iceCandidateReq`` (both directions)
@@ -2354,24 +2416,28 @@ class DeviceClient(object):
         Parameters
         ----------
         on_frame : callable or None
-            Called with each ``av.VideoFrame`` from the camera.
+            Called with each ``av.VideoFrame`` from the camera (DTLS path only).
         stream_id : int
             Stream index: 0 = main stream, 1 = sub-stream.
         timeout : float
             Seconds to wait for ICE connection before raising RuntimeError.
         output_path : str or None
-            Record the stream to this file (e.g. ``/tmp/live.mkv``) via
-            aiortc MediaRecorder.  Supports any container ffmpeg can write.
+            Record the stream to this file (e.g. ``/tmp/live.ts``) via
+            aiortc MediaRecorder (DTLS) or ffmpeg (SDES).  Supports any
+            container ffmpeg can write; ``.ts`` is streamable via vlc/ffplay.
+        force_sdes : bool or None
+            Override transport auto-detection.  ``True`` → SDES path,
+            ``False`` → DTLS path, ``None`` → auto (uses ``is_sdes_camera``).
 
         Returns
         -------
-        WebRTCSession
+        WebRTCSession or SdesSession
             Call ``await session.stop()`` to close the stream.
 
         Raises
         ------
         ImportError
-            If ``aiortc`` is not installed
+            If ``aiortc`` is not installed (DTLS path only).
             (``pip install python-aidot[webrtc]``).
         RuntimeError
             If the MQTT connection fails or ICE does not complete within
@@ -2379,14 +2445,17 @@ class DeviceClient(object):
         """
         import queue as _q_mod
 
-        try:
-            from aiortc import RTCPeerConnection, RTCSessionDescription
-            from aiortc.sdp import candidate_from_sdp
-        except ImportError:
-            raise ImportError(
-                "aiortc is required for WebRTC streaming. "
-                "Install with: pip install python-aidot[webrtc]"
-            )
+        use_sdes = force_sdes if force_sdes is not None else self.is_sdes_camera
+
+        if not use_sdes:
+            try:
+                from aiortc import RTCPeerConnection, RTCSessionDescription
+                from aiortc.sdp import candidate_from_sdp
+            except ImportError:
+                raise ImportError(
+                    "aiortc is required for WebRTC streaming. "
+                    "Install with: pip install python-aidot[webrtc]"
+                )
 
         # ------------------------------------------------------------------ #
         # Credentials + MQTT setup
@@ -2405,7 +2474,9 @@ class DeviceClient(object):
             raise RuntimeError("async_open_webrtc_stream: no MQTT URL available")
 
         device_id = self.device_id
-        peer_id   = self.generate_webrtc_peer_id(live_type=2, stream_id=stream_id)
+        peer_id   = self.generate_webrtc_peer_id(
+            live_type=2, stream_id=stream_id, sdes=use_sdes
+        )
         loop      = asyncio.get_running_loop()
 
         sub_topics       = [f"iot/v1/c/{user_id}/#", f"iot/v1/cb/{device_id}/#"]
@@ -2444,10 +2515,14 @@ class DeviceClient(object):
             method = msg.get("method") or ""
             inner  = msg.get("payload") or {}
             if method == "webrtcResp":
+                if inner.get("peerid") != peer_id:
+                    return
                 answer = inner.get("offer") or inner.get("answer") or {}
                 if answer.get("sdp") and not answer_fut.done():
                     loop.call_soon_threadsafe(answer_fut.set_result, answer)
             elif method == "iceCandidateReq":
+                if inner.get("peerid") != peer_id:
+                    return
                 cand = inner.get("candidate") or {}
                 if cand.get("candidate"):
                     loop.call_soon_threadsafe(ice_q.put_nowait, cand)
@@ -2488,9 +2563,31 @@ class DeviceClient(object):
         _status(f"MQTT connected (clientId={mqtt_cid})")
 
         # ------------------------------------------------------------------ #
-        # aiortc peer connection
+        # Branch: SDES-SRTP cameras use ffmpeg; DTLS cameras use aiortc
         # ------------------------------------------------------------------ #
-        pc = RTCPeerConnection()
+        if use_sdes:
+            return await self._open_sdes_stream(
+                peer_id=peer_id,
+                user_id=user_id,
+                device_id=device_id,
+                outgoing_q=outgoing_q,
+                answer_fut=answer_fut,
+                loop=loop,
+                timeout=timeout,
+                output_path=output_path,
+                _status=_status,
+                mqtt_fut=mqtt_fut,
+            )
+
+        # ------------------------------------------------------------------ #
+        # aiortc peer connection (DTLS-SRTP path)
+        # ------------------------------------------------------------------ #
+        from aiortc import RTCConfiguration, RTCIceServer
+        pc = RTCPeerConnection(
+            configuration=RTCConfiguration(
+                iceServers=[RTCIceServer(urls=["stun:stun.l.google.com:19302"])]
+            )
+        )
         pc.addTransceiver("audio", direction="recvonly")   # mid:0
         pc.addTransceiver("video", direction="recvonly")   # mid:1  H264
         pc.addTransceiver("video", direction="recvonly")   # mid:2  H265 (SDP match)
@@ -2645,6 +2742,10 @@ class DeviceClient(object):
                 cand_line = cand_dict.get("candidate", "")
                 if cand_line.startswith("candidate:"):
                     cand_line = cand_line[len("candidate:"):]
+                # Strip non-standard trailing extensions (generation, network-cost)
+                # that aioice's candidate_from_sdp cannot parse.
+                import re as _re
+                cand_line = _re.sub(r'\s+generation\s+\d+.*$', '', cand_line).strip()
                 try:
                     ice_cand = candidate_from_sdp(cand_line)
                     await pc.addIceCandidate(ice_cand)
@@ -2696,6 +2797,154 @@ class DeviceClient(object):
 
     # Keep old name as alias
     async_open_kvs_stream = async_open_webrtc_stream
+
+    # ------------------------------------------------------------------ #
+    # SDES-SRTP streaming path (cameras with isDTLS == '0')
+    # ------------------------------------------------------------------ #
+
+    async def _open_sdes_stream(
+        self,
+        *,
+        peer_id: str,
+        user_id: str,
+        device_id: str,
+        outgoing_q,
+        answer_fut,
+        loop,
+        timeout: float,
+        output_path: Optional[str],
+        _status,
+        mqtt_fut,
+    ) -> "SdesSession":
+        """SDES-SRTP streaming path using a hand-crafted SDP offer and ffmpeg.
+
+        SDES cameras negotiate SRTP keys inline in the SDP (``a=crypto:`` lines)
+        rather than via a DTLS handshake.  aiortc does not support SDES-SRTP, so
+        this path sends a manually constructed SDP offer, waits for the camera's
+        SDP answer, writes it to a temp file, and launches ffmpeg to receive and
+        record the SRTP stream.
+        """
+        import base64
+        import os
+        import subprocess
+        import tempfile
+        import json
+
+        smarthome_auth = await self._async_get_smarthome_auth()
+        user_id = user_id or str(self.user_id)
+
+        webrtc_req_topic = f"iot/v1/s/{user_id}/IPC/webrtcReq"
+
+        def _seq() -> str:
+            import random
+            return f"ap{random.randint(1000000, 9999999)}"
+
+        # --- Build SDES SDP offer ------------------------------------------ #
+        # Generate a random 30-byte (240-bit) inline SRTP master key+salt.
+        # AES_CM_128_HMAC_SHA1_80 needs 16-byte key + 14-byte salt = 30 bytes.
+        srtp_key_audio = base64.b64encode(os.urandom(30)).decode()
+        srtp_key_video = base64.b64encode(os.urandom(30)).decode()
+        ts = int(time.time())
+        sdes_sdp = (
+            "v=0\r\n"
+            f"o=- {ts} {ts} IN IP4 0.0.0.0\r\n"
+            "s=-\r\n"
+            "t=0 0\r\n"
+            "a=group:BUNDLE 0 1 2 3\r\n"
+            "m=audio 9 RTP/SAVPF 0 8\r\n"
+            "c=IN IP4 0.0.0.0\r\n"
+            "a=mid:0\r\n"
+            "a=recvonly\r\n"
+            f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_audio}\r\n"
+            "a=rtpmap:0 PCMU/8000\r\n"
+            "a=rtpmap:8 PCMA/8000\r\n"
+            "m=video 9 RTP/SAVPF 96 97\r\n"
+            "c=IN IP4 0.0.0.0\r\n"
+            "a=mid:1\r\n"
+            "a=recvonly\r\n"
+            f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_video}\r\n"
+            "a=rtpmap:96 H264/90000\r\n"
+            "a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n"
+            "a=rtpmap:97 H265/90000\r\n"
+            "m=video 9 RTP/SAVPF 97\r\n"
+            "c=IN IP4 0.0.0.0\r\n"
+            "a=mid:2\r\n"
+            "a=recvonly\r\n"
+            f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_video}\r\n"
+            "a=rtpmap:97 H265/90000\r\n"
+            "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+            "c=IN IP4 0.0.0.0\r\n"
+            "a=mid:3\r\n"
+        )
+
+        _status(
+            "SDP offer (SDES)  m=video=RTP/SAVPF  m=audio=RTP/SAVPF"
+        )
+
+        webrtc_req_payload = json.dumps({
+            "method":  "webrtcReq",
+            "service": "IPC",
+            "devId":   device_id,
+            "srcAddr": f"0.{user_id}",
+            "seq":     _seq(),
+            "tst":     int(time.time() * 1000),
+            "payload": {
+                "peerid":  peer_id,
+                "devId":   device_id,
+                "offer":   {"type": "offer", "sdp": sdes_sdp},
+                "trackId": 1,
+                "dstAddr": user_id,
+            },
+        })
+        outgoing_q.put_nowait((webrtc_req_topic, webrtc_req_payload))
+        _status(f"webrtcReq sent (SDES)  peerid={peer_id}")
+
+        # --- Wait for SDP answer ------------------------------------------- #
+        try:
+            answer = await asyncio.wait_for(answer_fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            _status(f"no webrtcResp in {timeout}s")
+            outgoing_q.put_nowait(None)
+            raise RuntimeError(
+                f"_open_sdes_stream: no webrtcResp received within {timeout}s"
+            )
+
+        _status("webrtcResp received (SDES) — launching ffmpeg SRTP receiver")
+
+        # --- Write answer SDP to temp file ---------------------------------- #
+        sdp_fd, sdp_path = tempfile.mkstemp(suffix=".sdp", prefix="aidot_sdes_")
+        try:
+            with os.fdopen(sdp_fd, "w") as f:
+                f.write(answer.get("sdp", ""))
+        except Exception:
+            os.close(sdp_fd)
+            raise
+
+        # --- Launch ffmpeg -------------------------------------------------- #
+        dest = output_path or "/dev/null"
+        cmd = [
+            "ffmpeg", "-y",
+            "-loglevel", "warning",
+            "-protocol_whitelist", "file,rtp,udp,srtp",
+            "-i", sdp_path,
+            "-c", "copy",
+            dest,
+        ]
+        _LOGGER.info("SDES ffmpeg cmd: %s", " ".join(cmd))
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+
+        _status(f"SDES stream recording → {dest}  (ffmpeg pid={proc.pid})")
+
+        return SdesSession(
+            proc=proc,
+            sdp_path=sdp_path,
+            outgoing_q=outgoing_q,
+            mqtt_fut=mqtt_fut,
+        )
 
     # -- Existing methods (unchanged) ---------------------------------------- #
 
