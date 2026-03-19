@@ -2680,6 +2680,32 @@ class DeviceClient(object):
         def _seq() -> str:
             return f"ap{random.randint(1000000, 9999999)}"
 
+        def _upgrade_sctp(sdp: str) -> str:
+            """Convert aiortc pre-RFC-8841 SCTP section to RFC 8841 format.
+
+            aiortc generates the legacy format:
+                m=application PORT DTLS/SCTP 5000
+                a=sctpmap:5000 webrtc-datachannel 65535
+                a=max-message-size:65536
+
+            Cameras (and modern browsers) expect RFC 8841:
+                m=application 9 UDP/DTLS/SCTP webrtc-datachannel
+                a=sctp-port:5000
+            """
+            out = []
+            for line in re.split(r'\r?\n', sdp):
+                if re.match(r'^m=application \d+ DTLS/SCTP \d+$', line):
+                    out.append('m=application 9 UDP/DTLS/SCTP webrtc-datachannel')
+                elif line.startswith('a=sctpmap:'):
+                    out.append('a=sctp-port:5000')
+                elif line == 'a=max-message-size:65536':
+                    pass   # not used in RFC 8841
+                else:
+                    out.append(line)
+            return '\r\n'.join(out)
+
+        _offer_sdp = _upgrade_sctp(pc.localDescription.sdp)
+
         webrtc_req_payload = json.dumps({
             "method":  "webrtcReq",
             "service": "IPC",
@@ -2691,7 +2717,7 @@ class DeviceClient(object):
                 "peerid":  peer_id,
                 "devId":   device_id,
                 "offer":   {"type": pc.localDescription.type,
-                             "sdp":  pc.localDescription.sdp},
+                             "sdp":  _offer_sdp},
                 "trackId": 0,
                 "dstAddr": user_id,
             },
