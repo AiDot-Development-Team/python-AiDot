@@ -2384,17 +2384,20 @@ class DeviceClient(object):
         Format observed in iOS app telemetry:
         ``{32-hex-session}_{6-hex-random}_{liveType}_{streamId}_{version}``
 
-        The trailing version digit is ``2`` for DTLS-SRTP cameras and ``1``
-        for SDES-SRTP cameras.  The session prefix is a per-app-session UUID
-        (same for all cameras opened in the same session); callers that open
-        multiple cameras simultaneously should share one session prefix across
-        all ``generate_webrtc_peer_id`` calls.
+        The trailing version digit is always ``2`` (main stream / standard
+        WebRTC).  Earlier code used ``1`` for SDES cameras on the assumption
+        that the suffix encodes the transport type, but product schema analysis
+        of ``isDTLS`` (description: "设备是否支持DTLS加密传输" — whether DTLS
+        is supported) confirms that transport selection belongs to the SDP
+        content, not the peerid.  Cameras completely ignore ``_1`` peerids
+        (confirmed by multiple test runs); ``_2`` is the only value that
+        elicits any response.  The ``sdes`` parameter is kept for call-site
+        compatibility but no longer changes the suffix.
         """
         import os
         session = os.urandom(16).hex()          # 32 hex chars
         rand6   = os.urandom(3).hex()           # 6 hex chars
-        suffix  = "1" if sdes else "2"
-        return f"{session}_{rand6}_{live_type}_{stream_id}_{suffix}"
+        return f"{session}_{rand6}_{live_type}_{stream_id}_2"
 
     async def async_open_webrtc_stream(
         self,
