@@ -132,18 +132,24 @@ def on_frame(frame: VideoFrame) -> None:
 # --------------------------------------------------------------------------- #
 
 async def run(args: argparse.Namespace) -> None:
+    import sys as _sys
     import logging as _logging
     if args.verbose:
         _logging.getLogger("aidot.device_client").setLevel(_logging.DEBUG)
         _logging.basicConfig(
             level=_logging.DEBUG,
             format="%(name)s %(levelname)s: %(message)s",
+            stream=_sys.stdout,
         )
     else:
         _logging.basicConfig(
             level=_logging.WARNING,
             format="%(name)s %(levelname)s: %(message)s",
+            stream=_sys.stdout,
         )
+    # Silence chatty third-party libraries that flood output even at --verbose.
+    for _noisy in ("aiortc", "aioice", "aioice.ice"):
+        _logging.getLogger(_noisy).setLevel(_logging.WARNING)
     async with aiohttp.ClientSession() as http_session:
         client = AidotClient(
             session=http_session,
