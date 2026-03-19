@@ -1056,11 +1056,15 @@ class SdesSession:
         sdp_path: str,
         outgoing_q,
         mqtt_fut,
+        audio_sock=None,
+        video_sock=None,
     ) -> None:
         self._proc       = proc
         self._sdp_path   = sdp_path
         self._outgoing_q = outgoing_q
         self._mqtt_fut   = mqtt_fut
+        self._audio_sock = audio_sock
+        self._video_sock = video_sock
 
     async def stop(self) -> None:
         """Tear down the stream: terminate ffmpeg and stop MQTT."""
@@ -1074,6 +1078,12 @@ class SdesSession:
             os.unlink(self._sdp_path)
         except Exception:
             pass
+        for _sock in (self._audio_sock, self._video_sock):
+            if _sock is not None:
+                try:
+                    _sock.close()
+                except Exception:
+                    pass
         self._outgoing_q.put_nowait(None)
         try:
             await asyncio.wait_for(self._mqtt_fut, timeout=5.0)
@@ -2869,46 +2879,69 @@ class DeviceClient(object):
             import random
             return f"ap{random.randint(1000000, 9999999)}"
 
+        # --- Allocate UDP ports and determine local IP ---------------------- #
+        import socket as _socket
+
+        _audio_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        _audio_sock.bind(("0.0.0.0", 0))
+        audio_port = _audio_sock.getsockname()[1]
+
+        _video_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        _video_sock.bind(("0.0.0.0", 0))
+        video_port = _video_sock.getsockname()[1]
+
+        # Use the outbound interface toward 8.8.8.8 to find our local IP.
+        # connect() on a UDP socket does not send any packet.
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM) as _s:
+            _s.connect(("8.8.8.8", 80))
+            local_ip = _s.getsockname()[0]
+
         # --- Build SDES SDP offer ------------------------------------------ #
-        # Generate a random 30-byte (240-bit) inline SRTP master key+salt.
-        # AES_CM_128_HMAC_SHA1_80 needs 16-byte key + 14-byte salt = 30 bytes.
+        # AES_CM_128_HMAC_SHA1_80: 16-byte key + 14-byte salt = 30 bytes.
         srtp_key_audio = base64.b64encode(os.urandom(30)).decode()
         srtp_key_video = base64.b64encode(os.urandom(30)).decode()
+        # ICE credentials — included for RFC compliance; no STUN checks done.
+        ufrag = base64.b64encode(os.urandom(3)).decode()[:4]
+        pwd   = base64.b64encode(os.urandom(18)).decode()[:24]
         ts = int(time.time())
-        sdes_sdp = (
+        sdes_offer_sdp = (
             "v=0\r\n"
-            f"o=- {ts} {ts} IN IP4 0.0.0.0\r\n"
+            f"o=- {ts} {ts} IN IP4 {local_ip}\r\n"
             "s=-\r\n"
             "t=0 0\r\n"
-            "a=group:BUNDLE 0 1 2 3\r\n"
-            "m=audio 9 RTP/SAVPF 0 8\r\n"
-            "c=IN IP4 0.0.0.0\r\n"
+            "a=group:BUNDLE 0 1\r\n"
+            f"a=ice-ufrag:{ufrag}\r\n"
+            f"a=ice-pwd:{pwd}\r\n"
+            f"m=audio {audio_port} RTP/SAVPF 0 8\r\n"
+            f"c=IN IP4 {local_ip}\r\n"
             "a=mid:0\r\n"
             "a=recvonly\r\n"
+            "a=rtcp-mux\r\n"
+            f"a=ice-ufrag:{ufrag}\r\n"
+            f"a=ice-pwd:{pwd}\r\n"
             f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_audio}\r\n"
             "a=rtpmap:0 PCMU/8000\r\n"
             "a=rtpmap:8 PCMA/8000\r\n"
-            "m=video 9 RTP/SAVPF 96 97\r\n"
-            "c=IN IP4 0.0.0.0\r\n"
+            f"a=candidate:1 1 UDP 2130706431 {local_ip} {audio_port} typ host\r\n"
+            "a=end-of-candidates\r\n"
+            f"m=video {video_port} RTP/SAVPF 96 97\r\n"
+            f"c=IN IP4 {local_ip}\r\n"
             "a=mid:1\r\n"
             "a=recvonly\r\n"
+            "a=rtcp-mux\r\n"
+            f"a=ice-ufrag:{ufrag}\r\n"
+            f"a=ice-pwd:{pwd}\r\n"
             f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_video}\r\n"
             "a=rtpmap:96 H264/90000\r\n"
             "a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n"
             "a=rtpmap:97 H265/90000\r\n"
-            "m=video 9 RTP/SAVPF 97\r\n"
-            "c=IN IP4 0.0.0.0\r\n"
-            "a=mid:2\r\n"
-            "a=recvonly\r\n"
-            f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_video}\r\n"
-            "a=rtpmap:97 H265/90000\r\n"
-            "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
-            "c=IN IP4 0.0.0.0\r\n"
-            "a=mid:3\r\n"
+            f"a=candidate:1 1 UDP 2130706431 {local_ip} {video_port} typ host\r\n"
+            "a=end-of-candidates\r\n"
         )
 
         _status(
-            "SDP offer (SDES)  m=video=RTP/SAVPF  m=audio=RTP/SAVPF"
+            f"SDP offer (SDES)  local={local_ip}"
+            f"  audio={audio_port}  video={video_port}"
         )
 
         webrtc_req_payload = json.dumps({
@@ -2921,7 +2954,7 @@ class DeviceClient(object):
             "payload": {
                 "peerid":  peer_id,
                 "devId":   device_id,
-                "offer":   {"type": "offer", "sdp": sdes_sdp},
+                "offer":   {"type": "offer", "sdp": sdes_offer_sdp},
                 "trackId": 1,
                 "dstAddr": user_id,
             },
@@ -2939,16 +2972,38 @@ class DeviceClient(object):
                 f"_open_sdes_stream: no webrtcResp received within {timeout}s"
             )
 
-        _status("webrtcResp received (SDES) — launching ffmpeg SRTP receiver")
+        _ans_sdp = answer.get("sdp", "")
+        _ans_mlines = [ln for ln in _ans_sdp.splitlines() if ln.startswith("m=")]
+        _status(
+            "webrtcResp received (SDES) — answer m-sections (%d): %s"
+            % (len(_ans_mlines), " | ".join(_ans_mlines))
+        )
 
-        # --- Write answer SDP to temp file ---------------------------------- #
+        # --- Build local-receiver SDP for ffmpeg ----------------------------- #
+        # We write OUR ports and OUR SRTP keys.  c=IN IP4 0.0.0.0 tells ffmpeg
+        # to bind locally (listen mode) rather than connect to a remote address.
+        # The camera sends SDES-SRTP to our local_ip:{audio_port,video_port}.
+        ffmpeg_sdp = (
+            "v=0\r\n"
+            f"o=- {ts} {ts} IN IP4 0.0.0.0\r\n"
+            "s=aidot-sdes-rx\r\n"
+            "t=0 0\r\n"
+            f"m=audio {audio_port} RTP/SAVPF 0 8\r\n"
+            "c=IN IP4 0.0.0.0\r\n"
+            f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_audio}\r\n"
+            "a=rtpmap:0 PCMU/8000\r\n"
+            "a=rtpmap:8 PCMA/8000\r\n"
+            f"m=video {video_port} RTP/SAVPF 96 97\r\n"
+            "c=IN IP4 0.0.0.0\r\n"
+            f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_video}\r\n"
+            "a=rtpmap:96 H264/90000\r\n"
+            "a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n"
+            "a=rtpmap:97 H265/90000\r\n"
+        )
+
         sdp_fd, sdp_path = tempfile.mkstemp(suffix=".sdp", prefix="aidot_sdes_")
-        try:
-            with os.fdopen(sdp_fd, "w") as f:
-                f.write(answer.get("sdp", ""))
-        except Exception:
-            os.close(sdp_fd)
-            raise
+        with os.fdopen(sdp_fd, "w") as f:
+            f.write(ffmpeg_sdp)
 
         # --- Launch ffmpeg -------------------------------------------------- #
         dest = output_path or "/dev/null"
@@ -2974,6 +3029,8 @@ class DeviceClient(object):
             sdp_path=sdp_path,
             outgoing_q=outgoing_q,
             mqtt_fut=mqtt_fut,
+            audio_sock=_audio_sock,
+            video_sock=_video_sock,
         )
 
     # -- Existing methods (unchanged) ---------------------------------------- #
