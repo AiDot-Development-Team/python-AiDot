@@ -407,9 +407,23 @@ async def run(args: argparse.Namespace) -> None:
                         _p = _dlj.loads(payload)
                         _pstr = _dlj.dumps(_p, indent=6, default=str)
                     except Exception:
+                        _p = None
                         _pstr = repr(payload[:500])
                     print(f"  MQTT  topic={topic}")
                     print(f"        {_pstr}")
+                    # For webrtcReq/webrtcResp: highlight SDP transport line
+                    _method = _p.get("method") if isinstance(_p, dict) else None
+                    if _method in ("webrtcReq", "webrtcResp"):
+                        _inner = (_p.get("payload") or {})
+                        _sdp   = ((_inner.get("offer") or _inner.get("answer") or {})).get("sdp", "")
+                        _pid   = _inner.get("peerid", "?")
+                        _vtrans = next(
+                            (ln.split()[2] for ln in _sdp.splitlines()
+                             if ln.startswith("m=video ") and len(ln.split()) > 2),
+                            "absent",
+                        )
+                        print(f"        *** {_method}: peerid={_pid}")
+                        print(f"        *** SDP m=video transport: {_vtrans}")
 
                 def _on_ready(st):
                     """Called from the MQTT thread after subscription.
@@ -503,11 +517,15 @@ async def run(args: argparse.Namespace) -> None:
                             print(f"    [WEBRTC] frame #{_wrtc_frames[0]}  "
                                   f"{getattr(frame, 'width', '?')}x{getattr(frame, 'height', '?')}")
 
+                    def _wrtc_status(msg: str) -> None:
+                        print(f"    {msg}")
+
                     try:
                         _wrtc_session = await dc.async_open_webrtc_stream(
                             on_frame=_wrtc_on_frame,
                             output_path=args.webrtc_output or None,
                             timeout=args.webrtc_timeout,
+                            status_callback=_wrtc_status,
                         )
                         print(f"    WebRTC connected — streaming for {args.webrtc_seconds}s ...")
                         print("    (Ctrl+C to stop early)")

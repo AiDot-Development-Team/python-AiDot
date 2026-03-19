@@ -2335,6 +2335,7 @@ class DeviceClient(object):
         stream_id: int = 0,
         timeout: float = 30.0,
         output_path: Optional[str] = None,
+        status_callback: Optional[Callable[[str], None]] = None,
     ) -> "WebRTCSession":
         """Open a liveType=2 WebRTC stream via MQTT signaling.
 
@@ -2424,6 +2425,12 @@ class DeviceClient(object):
         _mqtt_ready_ev     = _threading.Event()
         _mqtt_conn_status: dict = {}
 
+        def _status(msg: str) -> None:
+            """Fire status_callback (if provided) and log at INFO level."""
+            if status_callback:
+                status_callback(msg)
+            _LOGGER.info("webrtc: %s", msg)
+
         def _on_mqtt_ready(st: dict) -> None:
             _mqtt_conn_status.update(st)
             _mqtt_ready_ev.set()
@@ -2446,6 +2453,11 @@ class DeviceClient(object):
                     loop.call_soon_threadsafe(ice_q.put_nowait, cand)
             else:
                 _LOGGER.debug("webrtc: unhandled method=%r on %s", method, topic)
+                loop.call_soon_threadsafe(
+                    lambda m=method: _status(
+                        f"camera replied  method={m!r}  (not webrtcResp — ignored)"
+                    )
+                )
 
         # Run MQTT in a thread executor (very long duration; stopped via
         # outgoing_q sentinel when the caller calls WebRTCSession.stop()).
@@ -2473,7 +2485,7 @@ class DeviceClient(object):
             raise RuntimeError(
                 f"async_open_webrtc_stream: MQTT connection failed: {_err}"
             )
-        _LOGGER.info("webrtc: MQTT connected (clientId=%s)", mqtt_cid)
+        _status(f"MQTT connected (clientId={mqtt_cid})")
 
         # ------------------------------------------------------------------ #
         # aiortc peer connection
@@ -2514,6 +2526,19 @@ class DeviceClient(object):
             pc.localDescription.sdp[:500],
         )
 
+        def _sdp_transport(sdp: str, kind: str) -> str:
+            for line in sdp.splitlines():
+                if line.startswith(f"m={kind} "):
+                    parts = line.split()
+                    return parts[2] if len(parts) > 2 else "?"
+            return "absent"
+
+        _sdp = pc.localDescription.sdp
+        _status(
+            f"SDP offer  m=video={_sdp_transport(_sdp, 'video')}"
+            f"  m=audio={_sdp_transport(_sdp, 'audio')}"
+        )
+
         def _seq() -> str:
             return f"ap{random.randint(1000000, 9999999)}"
 
@@ -2534,7 +2559,7 @@ class DeviceClient(object):
             },
         })
         outgoing_q.put_nowait((webrtc_req_topic, webrtc_req_payload))
-        _LOGGER.info("webrtc: webrtcReq published  peerid=%s", peer_id)
+        _status(f"webrtcReq sent  peerid={peer_id}")
 
         # Forward our own ICE candidates to the camera via MQTT
         @pc.on("icecandidate")
@@ -2573,6 +2598,7 @@ class DeviceClient(object):
         try:
             answer = await asyncio.wait_for(answer_fut, timeout=timeout)
         except asyncio.TimeoutError:
+            _status(f"no webrtcResp in {timeout}s")
             outgoing_q.put_nowait(None)
             await pc.close()
             raise RuntimeError(
