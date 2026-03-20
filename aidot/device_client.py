@@ -2527,8 +2527,9 @@ class DeviceClient(object):
         # MQTT ↔ asyncio bridge
         # ------------------------------------------------------------------ #
         outgoing_q:   _q_mod.Queue      = _q_mod.Queue()
-        answer_fut:   asyncio.Future    = loop.create_future()
-        ice_q:        asyncio.Queue     = asyncio.Queue()
+        answer_fut:      asyncio.Future    = loop.create_future()
+        ice_q:           asyncio.Queue     = asyncio.Queue()
+        camera_ready_ev: asyncio.Event     = asyncio.Event()  # set when camera is on MQTT
 
         # Gate: block asyncio until MQTT is connected + subscribed
         import threading as _threading
@@ -2558,6 +2559,10 @@ class DeviceClient(object):
                 return
             method = msg.get("method") or ""
             inner  = msg.get("payload") or {}
+            # Fire camera_ready_ev the moment the camera appears on MQTT — either via its
+            # explicit wake-ACK (lowPowerActiveStateResp) or any message on the device channel.
+            if method == "lowPowerActiveStateResp" or topic.startswith(f"iot/v1/c/{device_id}/"):
+                loop.call_soon_threadsafe(camera_ready_ev.set)
             if method == "webrtcResp":
                 resp_pid = inner.get("peerid")
                 if resp_pid != peer_id:
@@ -2631,8 +2636,12 @@ class DeviceClient(object):
         outgoing_q.put_nowait(
             (f"iot/v1/s/{user_id}/IPC/getIceConfigReq", _ice_req_payload)
         )
-        _status("getIceConfigReq sent — waiting 2s for broker session init")
-        await asyncio.sleep(2.0)
+        _status("getIceConfigReq sent — waiting for camera to wake (up to 12s)")
+        try:
+            await asyncio.wait_for(camera_ready_ev.wait(), timeout=12.0)
+            _status("Camera awake — got MQTT signal")
+        except asyncio.TimeoutError:
+            _status("Camera wake timeout — proceeding anyway (may already be active)")
 
         # ------------------------------------------------------------------ #
         # Send livePlayReq BEFORE the SDP offer.  iOS app telemetry confirms
