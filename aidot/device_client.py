@@ -2787,7 +2787,67 @@ class DeviceClient(object):
                     out.append(line)
             return '\r\n'.join(out)
 
-        _offer_sdp = _upgrade_sctp(pc.localDescription.sdp)
+        def _patch_offer_mid2_h265(sdp: str) -> str:
+            """Replace mid:2 video codecs with H265-only (PT 96).
+
+            aiortc cannot offer H265 natively, so it generates H264+VP8 for
+            every video transceiver.  Cameras with liveType=2 require H265 to
+            appear in the offer for mid:2 before they will respond with
+            webrtcResp.  This function rewrites the mid:2 m-section in-place:
+
+              m=video PORT PROTO 96
+              a=mid:2
+              a=recvonly          ← kept
+              a=rtcp-mux          ← kept
+              a=ice-*/a=fingerprint/a=setup/a=extmap  ← kept
+              a=rtpmap:96 H265/90000      ← injected
+              (all H264/VP8 rtpmap/fmtp/ssrc lines removed)
+            """
+            import re as _re
+            lines = _re.split(r'\r?\n', sdp)
+            # Split into sections: list of (m_line_index, [lines]) for each m-section
+            sections: list[list[str]] = []
+            current: list[str] = []
+            for ln in lines:
+                if ln.startswith('m=') and current:
+                    sections.append(current)
+                    current = [ln]
+                else:
+                    current.append(ln)
+            if current:
+                sections.append(current)
+
+            result: list[str] = []
+            for sec in sections:
+                if not any(a.rstrip() == 'a=mid:2' for a in sec):
+                    result.extend(sec)
+                    continue
+                # This is mid:2 — patch it
+                new_sec: list[str] = []
+                mid2_inserted = False
+                for ln in sec:
+                    if ln.startswith('m=video '):
+                        # Replace codec list with single PT 96
+                        parts = ln.split()
+                        # parts: ['m=video', port, proto, pt1, pt2, ...]
+                        new_sec.append(' '.join(parts[:3]) + ' 96')
+                    elif (ln.startswith('a=rtpmap:') or
+                          ln.startswith('a=fmtp:') or
+                          ln.startswith('a=ssrc:') or
+                          ln.startswith('a=ssrc-group:')):
+                        pass  # drop all codec/SSRC lines
+                    else:
+                        new_sec.append(ln)
+                        if ln.rstrip() == 'a=mid:2' and not mid2_inserted:
+                            new_sec.append('a=rtpmap:96 H265/90000')
+                            mid2_inserted = True
+                if not mid2_inserted:
+                    # fallback: append at end of section
+                    new_sec.append('a=rtpmap:96 H265/90000')
+                result.extend(new_sec)
+            return '\r\n'.join(result)
+
+        _offer_sdp = _patch_offer_mid2_h265(_upgrade_sctp(pc.localDescription.sdp))
         _patched_mlines = [ln for ln in _offer_sdp.splitlines() if ln.startswith("m=")]
         _status("Offer m-sections (patched): %s" % " | ".join(_patched_mlines))
 
@@ -2862,10 +2922,47 @@ class DeviceClient(object):
         )
         _status("Answer m-sections (%d): %s" % (len(_ans_mlines), " | ".join(_ans_mlines)))
 
+        def _patch_answer_mid2_for_aiortc(sdp: str) -> str:
+            """Make the camera's H265 answer digestible by aiortc.
+
+            The camera answers mid:2 with `a=rtpmap:96 H265/90000`.  aiortc
+            doesn't know H265 so setRemoteDescription would raise.  Swapping
+            the rtpmap to H264 lets aiortc accept the answer; the actual RTP
+            payload type (96) remains unchanged so the ICE/DTLS path works.
+            Mid:2 video will be undecoded but we only record mid:1 anyway.
+            """
+            import re as _re
+            lines = _re.split(r'\r?\n', sdp)
+            sections: list[list[str]] = []
+            current: list[str] = []
+            for ln in lines:
+                if ln.startswith('m=') and current:
+                    sections.append(current)
+                    current = [ln]
+                else:
+                    current.append(ln)
+            if current:
+                sections.append(current)
+
+            result: list[str] = []
+            for sec in sections:
+                if not any(a.rstrip() == 'a=mid:2' for a in sec):
+                    result.extend(sec)
+                    continue
+                new_sec = []
+                for ln in sec:
+                    if _re.match(r'^a=rtpmap:96 H265/', ln):
+                        new_sec.append('a=rtpmap:96 H264/90000')
+                    else:
+                        new_sec.append(ln)
+                result.extend(new_sec)
+            return '\r\n'.join(result)
+
+        _ans_sdp_aiortc = _patch_answer_mid2_for_aiortc(_ans_sdp)
         try:
             await pc.setRemoteDescription(
                 RTCSessionDescription(
-                    sdp=_ans_sdp,
+                    sdp=_ans_sdp_aiortc,
                     type=answer.get("type", "answer"),
                 )
             )
