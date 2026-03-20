@@ -2641,13 +2641,14 @@ class DeviceClient(object):
                 iceServers=[RTCIceServer(urls=["stun:stun.l.google.com:19302"])]
             )
         )
-        pc.addTransceiver("audio", direction="recvonly")   # mid:0
-        pc.addTransceiver("video", direction="recvonly")   # mid:1  primary video
-        pc.createDataChannel("data")                        # mid:2  SCTP datachannel
-        # iOS app session capture confirms LK.IPC.A000088 cameras answer with a
-        # 3-section SDP (audio + video + application/SCTP).  The camera mirrors
-        # the offer's section count, so a 2-section offer would produce a
-        # 2-section answer — correct but apparently not what this firmware expects.
+        pc.addTransceiver("audio", direction="recvonly")   # mid:0  audio
+        pc.addTransceiver("video", direction="recvonly")   # mid:1  H264 (primary video)
+        pc.addTransceiver("video", direction="recvonly")   # mid:2  H265 (camera firmware always sends both)
+        pc.createDataChannel("data")                        # mid:3  SCTP datachannel
+        # Live capture confirms AiDot cameras (LK.IPC.A000088 and others) answer
+        # with a 4-section SDP: audio + H264-video + H265-video + application/SCTP.
+        # The offer must have the same number of m-sections or aiortc's
+        # setRemoteDescription will reject the answer.
 
         track_tasks: list = []
 
