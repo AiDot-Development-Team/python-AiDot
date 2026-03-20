@@ -2971,7 +2971,7 @@ class DeviceClient(object):
         smarthome_auth = await self._async_get_smarthome_auth()
         user_id = user_id or str(self.user_id)
 
-        webrtc_req_topic = f"iot/v1/s/{user_id}/IPC/webrtcReq"
+        webrtc_req_topic = f"iot/v1/s/{device_id}/IPC/webrtcReq"
 
         def _seq() -> str:
             import random
