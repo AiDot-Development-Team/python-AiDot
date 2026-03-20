@@ -2424,14 +2424,15 @@ class DeviceClient(object):
         transport is auto-detected from ``self.is_sdes_camera`` unless
         overridden by ``force_sdes``.
 
-        Protocol (confirmed from live MQTT capture, 2025-03):
+        Protocol (confirmed from live MQTT capture, 2025-03 / 2026-03):
           1. Subscribe ``iot/v1/c/{userId}/#`` on the authorised MQTT clientId
-          2. Create peer connection (aiortc or SDES SDP), add recvonly tracks
-          3. Generate SDP offer → publish ``IPC/webrtcReq`` with peer-id
-          4. Receive ``IPC/webrtcResp`` → set remote description (SDP answer)
-          5. Exchange ICE candidates on ``IPC/iceCandidateReq`` (both directions)
-          6. When ICE is connected → publish ``IPC/livePlayReq``
-          7. Receive media tracks → call ``on_frame`` for each VideoFrame
+          2. Publish ``IPC/getIceConfigReq`` → wait 2 s for broker session init
+          3. Publish ``IPC/livePlayReq`` → wait 0.5 s (arms camera WebRTC subsystem)
+          4. Create peer connection (aiortc or SDES SDP), add recvonly tracks
+          5. Generate SDP offer → publish ``IPC/webrtcReq`` with peer-id
+          6. Receive ``IPC/webrtcResp`` → set remote description (SDP answer)
+          7. Exchange ICE candidates on ``IPC/iceCandidateReq`` (both directions)
+          8. Receive media tracks → call ``on_frame`` for each VideoFrame
 
         Parameters
         ----------
@@ -2614,6 +2615,28 @@ class DeviceClient(object):
         )
         _status("getIceConfigReq sent — waiting 2s for broker session init")
         await asyncio.sleep(2.0)
+
+        # ------------------------------------------------------------------ #
+        # Send livePlayReq BEFORE the SDP offer.  iOS app telemetry confirms
+        # this message is always sent first to arm the camera's WebRTC
+        # subsystem; the camera silently ignores webrtcReq without it.
+        # ------------------------------------------------------------------ #
+        _live_req_payload = json.dumps({
+            "method":  "livePlayReq",
+            "service": "IPC",
+            "devId":   device_id,
+            "srcAddr": f"0.{user_id}",
+            "seq":     f"ap{random.randint(1000000, 9999999)}",
+            "tst":     int(time.time() * 1000),
+            "payload": {
+                "peerid":  peer_id,
+                "devId":   device_id,
+                "dstAddr": user_id,
+            },
+        })
+        outgoing_q.put_nowait((live_play_topic, _live_req_payload))
+        _status(f"livePlayReq sent  peerid={peer_id}")
+        await asyncio.sleep(0.5)
 
         # ------------------------------------------------------------------ #
         # Branch: SDES-SRTP cameras use ffmpeg; DTLS cameras use aiortc
@@ -2867,24 +2890,6 @@ class DeviceClient(object):
                 f"(state={pc.connectionState}) within {timeout}s"
             )
 
-        # ------------------------------------------------------------------ #
-        # Send livePlayReq to start the media feed
-        # ------------------------------------------------------------------ #
-        live_play_payload = json.dumps({
-            "method":  "livePlayReq",
-            "service": "IPC",
-            "devId":   device_id,
-            "srcAddr": f"0.{user_id}",
-            "seq":     _seq(),
-            "tst":     int(time.time() * 1000),
-            "payload": {
-                "peerid":  peer_id,
-                "devId":   device_id,
-                "dstAddr": user_id,
-            },
-        })
-        outgoing_q.put_nowait((live_play_topic, live_play_payload))
-
         if recorder:
             await recorder.start()
 
@@ -3007,6 +3012,27 @@ class DeviceClient(object):
             f"SDP offer (SDES)  local={local_ip}"
             f"  audio={audio_port}  video={video_port}"
         )
+
+        # Send livePlayReq before the SDP offer to arm the camera's stream.
+        import random as _random
+        _live_req_sdes = json.dumps({
+            "method":  "livePlayReq",
+            "service": "IPC",
+            "devId":   device_id,
+            "srcAddr": f"0.{user_id}",
+            "seq":     f"ap{_random.randint(1000000, 9999999)}",
+            "tst":     int(time.time() * 1000),
+            "payload": {
+                "peerid":  peer_id,
+                "devId":   device_id,
+                "dstAddr": user_id,
+            },
+        })
+        _live_play_topic_sdes = f"iot/v1/s/{user_id}/IPC/livePlayReq"
+        outgoing_q.put_nowait((_live_play_topic_sdes, _live_req_sdes))
+        _status(f"livePlayReq sent (SDES)  peerid={peer_id}")
+        import asyncio as _asyncio
+        await _asyncio.sleep(0.5)
 
         webrtc_req_payload = json.dumps({
             "method":  "webrtcReq",
