@@ -2834,8 +2834,9 @@ class DeviceClient(object):
                     elif (ln.startswith('a=rtpmap:') or
                           ln.startswith('a=fmtp:') or
                           ln.startswith('a=ssrc:') or
-                          ln.startswith('a=ssrc-group:')):
-                        pass  # drop all codec/SSRC lines
+                          ln.startswith('a=ssrc-group:') or
+                          ln.startswith('a=rtcp-fb:')):
+                        pass  # drop all codec/SSRC/RTCP-FB lines
                     else:
                         new_sec.append(ln)
                         if ln.rstrip() == 'a=mid:2' and not mid2_inserted:
