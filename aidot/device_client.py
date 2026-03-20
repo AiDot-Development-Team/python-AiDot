@@ -2631,7 +2631,7 @@ class DeviceClient(object):
         _ice_req_payload = json.dumps({
             "method":  "getIceConfigReq",
             "service": "IPC",
-            "srcAddr": f"0.{user_id}",
+            "srcAddr": f"{terminal_idx}.{user_id}",
             "seq":     f"ap{random.randint(1000000, 9999999)}",
             "tst":     int(time.time() * 1000),
             "payload": {"deviceId": device_id, "userId": user_id},
