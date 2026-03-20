@@ -2527,10 +2527,15 @@ class DeviceClient(object):
             _mqtt_ready_ev.set()
 
         def _on_mqtt_message(topic: str, payload_str: str) -> None:
-            _LOGGER.debug("webrtc rx  topic=%s  %s", topic, payload_str)
+            _LOGGER.info("webrtc rx  topic=%s  %.400s", topic, payload_str)
             try:
                 msg = json.loads(payload_str)
             except Exception:
+                loop.call_soon_threadsafe(
+                    lambda t=topic, p=payload_str: _status(
+                        f"camera raw (non-JSON)  topic={t}  data={p[:200]!r}"
+                    )
+                )
                 return
             method = msg.get("method") or ""
             inner  = msg.get("payload") or {}
@@ -2556,8 +2561,8 @@ class DeviceClient(object):
                     loop.call_soon_threadsafe(ice_q.put_nowait, cand)
             else:
                 loop.call_soon_threadsafe(
-                    lambda m=method, p=inner: _status(
-                        f"camera replied  method={m!r}  payload={p!r}"
+                    lambda m=method, p=inner, t=topic: _status(
+                        f"camera replied  topic={t}  method={m!r}  payload={p!r}"
                     )
                 )
 
@@ -2588,6 +2593,27 @@ class DeviceClient(object):
                 f"async_open_webrtc_stream: MQTT connection failed: {_err}"
             )
         _status(f"MQTT connected (clientId={mqtt_cid})")
+
+        # ------------------------------------------------------------------ #
+        # Send getIceConfigReq first — this warms up the broker-side WebRTC
+        # session and registers the camera routing so the subsequent webrtcReq
+        # is forwarded to the device.  iOS app telemetry confirms getIceConfigReq
+        # is always sent before webrtcReq.  Without this step the broker echoes
+        # webrtcReq back to us but never routes it to the camera.
+        # ------------------------------------------------------------------ #
+        _ice_req_payload = json.dumps({
+            "method":  "getIceConfigReq",
+            "service": "IPC",
+            "srcAddr": f"0.{user_id}",
+            "seq":     f"ap{random.randint(1000000, 9999999)}",
+            "tst":     int(time.time() * 1000),
+            "payload": {"deviceId": device_id, "userId": user_id},
+        })
+        outgoing_q.put_nowait(
+            (f"iot/v1/s/{user_id}/IPC/getIceConfigReq", _ice_req_payload)
+        )
+        _status("getIceConfigReq sent — waiting 2s for broker session init")
+        await asyncio.sleep(2.0)
 
         # ------------------------------------------------------------------ #
         # Branch: SDES-SRTP cameras use ffmpeg; DTLS cameras use aiortc
@@ -2699,7 +2725,7 @@ class DeviceClient(object):
                     out.append('m=application 9 UDP/DTLS/SCTP webrtc-datachannel')
                 elif line.startswith('a=sctpmap:'):
                     out.append('a=sctp-port:5000')
-                elif line == 'a=max-message-size:65536':
+                elif line.startswith('a=max-message-size:'):
                     pass   # not used in RFC 8841
                 else:
                     out.append(line)
