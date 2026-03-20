@@ -2428,18 +2428,20 @@ class DeviceClient(object):
           1. Subscribe ``iot/v1/c/{userId}/#`` on the authorised MQTT clientId
           2. Publish to ``iot/v1/s/{userId}/IPC/getIceConfigReq`` (server-side wake)
              → wait 2 s for broker session init
-          3. Publish to ``iot/v1/s/{deviceId}/IPC/livePlayReq`` (camera-side arm)
+          3. Publish to ``iot/v1/s/{userId}/IPC/livePlayReq`` (camera-side arm)
              → wait 0.5 s for camera WebRTC subsystem to arm
           4. Create peer connection (aiortc or SDES SDP), add recvonly tracks
-          5. Generate SDP offer → publish to ``iot/v1/s/{deviceId}/IPC/webrtcReq``
+          5. Generate SDP offer → publish to ``iot/v1/s/{userId}/IPC/webrtcReq``
           6. Receive ``IPC/webrtcResp`` on ``iot/v1/c/{userId}/#`` → set remote description
-          7. Exchange ICE candidates on ``iot/v1/s/{deviceId}/IPC/iceCandidateReq``
+          7. Exchange ICE candidates on ``iot/v1/s/{userId}/IPC/iceCandidateReq``
           8. Receive media tracks → call ``on_frame`` for each VideoFrame
 
-        Topic routing: camera-addressed messages (livePlayReq, webrtcReq,
-        iceCandidateReq) must go to ``iot/v1/s/{deviceId}/...`` so the broker
-        delivers them to the camera's own channel ``iot/v1/c/{deviceId}/#``.
-        Server-addressed messages (getIceConfigReq) use ``iot/v1/s/{userId}/...``.
+        Topic routing: ALL IPC publish messages (getIceConfigReq, livePlayReq,
+        webrtcReq, iceCandidateReq) go to ``iot/v1/s/{userId}/IPC/...``.
+        The broker routes to the specific camera using the ``devId`` field in
+        the JSON payload, NOT based on the MQTT topic path.  Confirmed from
+        iOS app telemetry (2025-03-23): explicit publish logs show userId in
+        the topic for iceCandidateReq and livePlayReq.
 
         Parameters
         ----------
@@ -2519,9 +2521,12 @@ class DeviceClient(object):
             f"iot/v1/cb/{device_id}/#",
             f"iot/v1/c/{device_id}/#",   # catch webrtcResp routed to device channel
         ]
-        webrtc_req_topic = f"iot/v1/s/{device_id}/IPC/webrtcReq"
-        ice_cand_topic   = f"iot/v1/s/{device_id}/IPC/iceCandidateReq"
-        live_play_topic  = f"iot/v1/s/{device_id}/IPC/livePlayReq"
+        # iOS app telemetry (2025-03-23) confirms ALL IPC publish topics use
+        # the userId path.  The broker routes to the specific camera using the
+        # ``devId`` field inside the JSON payload, NOT the MQTT topic path.
+        webrtc_req_topic = f"iot/v1/s/{user_id}/IPC/webrtcReq"
+        ice_cand_topic   = f"iot/v1/s/{user_id}/IPC/iceCandidateReq"
+        live_play_topic  = f"iot/v1/s/{user_id}/IPC/livePlayReq"
 
         # ------------------------------------------------------------------ #
         # MQTT ↔ asyncio bridge
@@ -2971,7 +2976,7 @@ class DeviceClient(object):
         smarthome_auth = await self._async_get_smarthome_auth()
         user_id = user_id or str(self.user_id)
 
-        webrtc_req_topic = f"iot/v1/s/{device_id}/IPC/webrtcReq"
+        webrtc_req_topic = f"iot/v1/s/{user_id}/IPC/webrtcReq"
 
         def _seq() -> str:
             import random
@@ -3057,7 +3062,7 @@ class DeviceClient(object):
                 "dstAddr": user_id,
             },
         })
-        _live_play_topic_sdes = f"iot/v1/s/{device_id}/IPC/livePlayReq"
+        _live_play_topic_sdes = f"iot/v1/s/{user_id}/IPC/livePlayReq"
         outgoing_q.put_nowait((_live_play_topic_sdes, _live_req_sdes))
         _status(f"livePlayReq sent (SDES)  peerid={peer_id}")
         import asyncio as _asyncio
