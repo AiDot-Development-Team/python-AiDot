@@ -2514,7 +2514,11 @@ class DeviceClient(object):
         )
         loop      = asyncio.get_running_loop()
 
-        sub_topics       = [f"iot/v1/c/{user_id}/#", f"iot/v1/cb/{device_id}/#"]
+        sub_topics       = [
+            f"iot/v1/c/{user_id}/#",
+            f"iot/v1/cb/{device_id}/#",
+            f"iot/v1/c/{device_id}/#",   # catch webrtcResp routed to device channel
+        ]
         webrtc_req_topic = f"iot/v1/s/{device_id}/IPC/webrtcReq"
         ice_cand_topic   = f"iot/v1/s/{device_id}/IPC/iceCandidateReq"
         live_play_topic  = f"iot/v1/s/{device_id}/IPC/livePlayReq"
