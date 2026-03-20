@@ -2338,13 +2338,14 @@ class DeviceClient(object):
             _LOGGER.warning("async_get_ice_config: no MQTT URL available")
             return None
 
+        terminal_idx = self._user_info.get("terminalIndex") or diag_cid.split("-")[0]
         seq     = f"ap{random.randint(1000000, 9999999)}"
         result: dict = {}
 
         payload = json.dumps({
             "method":  "getIceConfigReq",
             "service": "IPC",
-            "srcAddr": f"0.{user_id}",
+            "srcAddr": f"{terminal_idx}.{user_id}",
             "seq":     seq,
             "tst":     int(time.time() * 1000),
             "payload": {"deviceId": device_id, "userId": user_id},
