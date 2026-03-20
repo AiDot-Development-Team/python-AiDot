@@ -2497,6 +2497,13 @@ class DeviceClient(object):
             (self._user_info.get("_userConfigRaw") or {}).get("mqtt", {}).get("clientId") or
             f"app-{mqtt_user}"
         )
+        # terminalIndex is the session prefix of mqtt_cid (e.g. "1i1h3m" from "1i1h3m-{userId}").
+        # The camera validates srcAddr against active MQTT sessions; "0.{userId}" matches nothing.
+        terminal_idx = (
+            mqtt_cid.split('-')[0]
+            if '-' in mqtt_cid
+            else (self._user_info.get("terminalIndex") or "0")
+        )
         mqtt_url = await self._async_get_mqtt_url()
         if not mqtt_url:
             raise RuntimeError("async_open_webrtc_stream: no MQTT URL available")
@@ -2632,7 +2639,7 @@ class DeviceClient(object):
             "method":  "livePlayReq",
             "service": "IPC",
             "devId":   device_id,
-            "srcAddr": f"0.{user_id}",
+            "srcAddr": f"{terminal_idx}.{user_id}",
             "seq":     f"ap{random.randint(1000000, 9999999)}",
             "tst":     int(time.time() * 1000),
             "payload": {
@@ -2653,6 +2660,7 @@ class DeviceClient(object):
                 peer_id=peer_id,
                 user_id=user_id,
                 device_id=device_id,
+                terminal_idx=terminal_idx,
                 outgoing_q=outgoing_q,
                 answer_fut=answer_fut,
                 loop=loop,
@@ -2770,7 +2778,7 @@ class DeviceClient(object):
             "method":  "webrtcReq",
             "service": "IPC",
             "devId":   device_id,
-            "srcAddr": f"0.{user_id}",
+            "srcAddr": f"{terminal_idx}.{user_id}",
             "seq":     _seq(),
             "tst":     int(time.time() * 1000),
             "payload": {
@@ -2804,7 +2812,7 @@ class DeviceClient(object):
                 "method":  "iceCandidateReq",
                 "service": "IPC",
                 "devId":   device_id,
-                "srcAddr": f"0.{user_id}",
+                "srcAddr": f"{terminal_idx}.{user_id}",
                 "seq":     _seq(),
                 "tst":     int(time.time() * 1000),
                 "payload": {
@@ -2924,6 +2932,7 @@ class DeviceClient(object):
         peer_id: str,
         user_id: str,
         device_id: str,
+        terminal_idx: str,
         outgoing_q,
         answer_fut,
         loop,
@@ -3026,7 +3035,7 @@ class DeviceClient(object):
             "method":  "livePlayReq",
             "service": "IPC",
             "devId":   device_id,
-            "srcAddr": f"0.{user_id}",
+            "srcAddr": f"{terminal_idx}.{user_id}",
             "seq":     f"ap{_random.randint(1000000, 9999999)}",
             "tst":     int(time.time() * 1000),
             "payload": {
@@ -3045,7 +3054,7 @@ class DeviceClient(object):
             "method":  "webrtcReq",
             "service": "IPC",
             "devId":   device_id,
-            "srcAddr": f"0.{user_id}",
+            "srcAddr": f"{terminal_idx}.{user_id}",
             "seq":     _seq(),
             "tst":     int(time.time() * 1000),
             "payload": {
