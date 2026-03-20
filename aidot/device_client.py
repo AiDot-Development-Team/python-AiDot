@@ -2692,9 +2692,10 @@ class DeviceClient(object):
                 m=application 9 UDP/DTLS/SCTP webrtc-datachannel
                 a=sctp-port:5000
             """
+            import re as _re
             out = []
-            for line in re.split(r'\r?\n', sdp):
-                if re.match(r'^m=application \d+ DTLS/SCTP \d+$', line):
+            for line in _re.split(r'\r?\n', sdp):
+                if _re.match(r'^m=application \d+ DTLS/SCTP \d+$', line):
                     out.append('m=application 9 UDP/DTLS/SCTP webrtc-datachannel')
                 elif line.startswith('a=sctpmap:'):
                     out.append('a=sctp-port:5000')
@@ -2705,6 +2706,8 @@ class DeviceClient(object):
             return '\r\n'.join(out)
 
         _offer_sdp = _upgrade_sctp(pc.localDescription.sdp)
+        _patched_mlines = [ln for ln in _offer_sdp.splitlines() if ln.startswith("m=")]
+        _status("Offer m-sections (patched): %s" % " | ".join(_patched_mlines))
 
         webrtc_req_payload = json.dumps({
             "method":  "webrtcReq",
