@@ -2520,6 +2520,8 @@ class DeviceClient(object):
             f"iot/v1/cb/{user_id}/#",    # catch webrtcResp on user cb channel
             f"iot/v1/cb/{device_id}/#",
             f"iot/v1/c/{device_id}/#",   # catch webrtcResp routed to device channel
+            f"lds/v1/c/{user_id}/#",     # Leedarson firmware: webrtcResp on user channel
+            f"lds/v1/cb/{device_id}/#",  # Leedarson firmware: webrtcResp on device cb channel
         ]
         # iOS app telemetry (2025-03-23) confirms ALL IPC publish topics use
         # the userId path.  The broker routes to the specific camera using the
