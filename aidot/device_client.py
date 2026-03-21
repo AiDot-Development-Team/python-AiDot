@@ -2788,22 +2788,53 @@ class DeviceClient(object):
             return '\r\n'.join(out)
 
         def _patch_offer_mid2_h265(sdp: str) -> str:
-            """Replace mid:2 video codecs with H265-only (PT 96).
+            """Replace mid:2 video codecs with H265-only, using an unused PT.
 
             aiortc cannot offer H265 natively, so it generates H264+VP8 for
             every video transceiver.  Cameras with liveType=2 require H265 to
             appear in the offer for mid:2 before they will respond with
             webrtcResp.  This function rewrites the mid:2 m-section in-place:
 
-              m=video PORT PROTO 96
+              m=video PORT PROTO <h265_pt>
               a=mid:2
               a=recvonly          ← kept
               a=rtcp-mux          ← kept
               a=ice-*/a=fingerprint/a=setup/a=extmap  ← kept
-              a=rtpmap:96 H265/90000      ← injected
+              a=rtpmap:<h265_pt> H265/90000   ← injected
               (all H264/VP8 rtpmap/fmtp/ssrc lines removed)
+
+            The PT number for H265 is chosen dynamically: the function scans
+            the full SDP for every PT already in use and picks the lowest
+            unused value in the dynamic range 96–127.  Standard aiortc offers
+            assign PT 96 (opus), 97–102 (VP8/H264 variants), 0 and 8 (PCMU/A),
+            so the selection reliably lands on PT 103.  Using an unused PT
+            avoids violating RFC 8843 §9.2, which requires every PT to be
+            globally unique across all m-sections in a BUNDLE group — a
+            collision (e.g. PT 96 for both opus and H265) causes conformant
+            camera firmware to silently discard the offer without sending
+            webrtcResp.
             """
             import re as _re
+
+            # Scan the entire SDP for PT numbers already in use so we can
+            # assign H265 a PT that does not collide with audio or mid:1.
+            _used_pts: set = set()
+            for _ln in _re.split(r'\r?\n', sdp):
+                # m-lines list their PTs after the protocol token
+                _mm = _re.match(r'^m=\S+ \d+ \S+ (.+)$', _ln)
+                if _mm:
+                    for _pt in _mm.group(1).split():
+                        try:
+                            _used_pts.add(int(_pt))
+                        except ValueError:
+                            pass  # "webrtc-datachannel" and similar
+                # a=rtpmap:<pt> lines are an additional cross-check
+                _rm = _re.match(r'^a=rtpmap:(\d+) ', _ln)
+                if _rm:
+                    _used_pts.add(int(_rm.group(1)))
+            # Pick the first unused dynamic PT
+            _h265_pt = next(pt for pt in range(96, 128) if pt not in _used_pts)
+
             lines = _re.split(r'\r?\n', sdp)
             # Split into sections: list of (m_line_index, [lines]) for each m-section
             sections: list[list[str]] = []
@@ -2827,10 +2858,10 @@ class DeviceClient(object):
                 mid2_inserted = False
                 for ln in sec:
                     if ln.startswith('m=video '):
-                        # Replace codec list with single PT 96
+                        # Replace codec list with the chosen H265 PT
                         parts = ln.split()
                         # parts: ['m=video', port, proto, pt1, pt2, ...]
-                        new_sec.append(' '.join(parts[:3]) + ' 96')
+                        new_sec.append(' '.join(parts[:3]) + f' {_h265_pt}')
                     elif (ln.startswith('a=rtpmap:') or
                           ln.startswith('a=fmtp:') or
                           ln.startswith('a=ssrc:') or
@@ -2840,11 +2871,11 @@ class DeviceClient(object):
                     else:
                         new_sec.append(ln)
                         if ln.rstrip() == 'a=mid:2' and not mid2_inserted:
-                            new_sec.append('a=rtpmap:96 H265/90000')
+                            new_sec.append(f'a=rtpmap:{_h265_pt} H265/90000')
                             mid2_inserted = True
                 if not mid2_inserted:
                     # fallback: append at end of section
-                    new_sec.append('a=rtpmap:96 H265/90000')
+                    new_sec.append(f'a=rtpmap:{_h265_pt} H265/90000')
                 result.extend(new_sec)
             return '\r\n'.join(result)
 
