@@ -2517,6 +2517,7 @@ class DeviceClient(object):
 
         sub_topics       = [
             f"iot/v1/c/{user_id}/#",
+            f"iot/v1/cb/{user_id}/#",    # catch webrtcResp on user cb channel
             f"iot/v1/cb/{device_id}/#",
             f"iot/v1/c/{device_id}/#",   # catch webrtcResp routed to device channel
         ]
@@ -2770,9 +2771,10 @@ class DeviceClient(object):
                 a=sctpmap:5000 webrtc-datachannel 65535
                 a=max-message-size:65536
 
-            Cameras (and modern browsers) expect RFC 8841:
+            RFC 8841 (and cameras / modern browsers) expect:
                 m=application 9 UDP/DTLS/SCTP webrtc-datachannel
                 a=sctp-port:5000
+                a=max-message-size:65536   ← required by RFC 8841 §4.3.1
             """
             import re as _re
             out = []
@@ -2781,10 +2783,8 @@ class DeviceClient(object):
                     out.append('m=application 9 UDP/DTLS/SCTP webrtc-datachannel')
                 elif line.startswith('a=sctpmap:'):
                     out.append('a=sctp-port:5000')
-                elif line.startswith('a=max-message-size:'):
-                    pass   # not used in RFC 8841
                 else:
-                    out.append(line)
+                    out.append(line)   # includes a=max-message-size (keep as-is)
             return '\r\n'.join(out)
 
         def _patch_offer_mid2_h265(sdp: str) -> str:
