@@ -2533,10 +2533,11 @@ class DeviceClient(object):
         # ------------------------------------------------------------------ #
         # MQTT ↔ asyncio bridge
         # ------------------------------------------------------------------ #
-        outgoing_q:   _q_mod.Queue      = _q_mod.Queue()
-        answer_fut:      asyncio.Future    = loop.create_future()
-        ice_q:           asyncio.Queue     = asyncio.Queue()
-        camera_ready_ev: asyncio.Event     = asyncio.Event()  # set when camera is on MQTT
+        outgoing_q:       _q_mod.Queue    = _q_mod.Queue()
+        answer_fut:       asyncio.Future  = loop.create_future()
+        ice_q:            asyncio.Queue   = asyncio.Queue()
+        camera_ready_ev:  asyncio.Event   = asyncio.Event()  # set when camera is on MQTT
+        liveplay_echo_ev: asyncio.Event   = asyncio.Event()  # set when livePlayReq echo arrives
 
         # Gate: block asyncio until MQTT is connected + subscribed
         import threading as _threading
@@ -2572,6 +2573,10 @@ class DeviceClient(object):
                     or topic.startswith(f"iot/v1/c/{device_id}/")
                     or topic.startswith(f"lds/v1/cb/{device_id}/")):
                 loop.call_soon_threadsafe(camera_ready_ev.set)
+            # livePlayReq echo: broker/camera confirmed delivery of our livePlayReq.
+            # Signal _open_sdes_stream to proceed with webrtcReq.
+            if method == "livePlayReq" and inner.get("devId") == device_id:
+                loop.call_soon_threadsafe(liveplay_echo_ev.set)
             if method == "webrtcResp":
                 resp_pid = inner.get("peerid")
                 answer   = inner.get("offer") or inner.get("answer") or {}
@@ -2669,7 +2674,18 @@ class DeviceClient(object):
             await asyncio.wait_for(camera_ready_ev.wait(), timeout=12.0)
             _status("Camera awake — got MQTT signal")
         except asyncio.TimeoutError:
-            _status("Camera wake timeout — proceeding anyway (may already be active)")
+            # First attempt timed out — camera may be awake but the broker session
+            # may not be registered yet.  Retry getIceConfigReq to re-trigger
+            # broker routing registration before proceeding.
+            _status("Camera wake timeout — retrying getIceConfigReq ...")
+            outgoing_q.put_nowait(
+                (f"iot/v1/s/{user_id}/IPC/getIceConfigReq", _ice_req_payload)
+            )
+            try:
+                await asyncio.wait_for(camera_ready_ev.wait(), timeout=5.0)
+                _status("Camera awake — got MQTT signal (after retry)")
+            except asyncio.TimeoutError:
+                _status("Camera wake timeout after retry — proceeding anyway")
 
         # ------------------------------------------------------------------ #
         # Send livePlayReq BEFORE the SDP offer.  iOS app telemetry confirms
@@ -2712,6 +2728,7 @@ class DeviceClient(object):
                 output_path=output_path,
                 _status=_status,
                 mqtt_fut=mqtt_fut,
+                liveplay_echo_ev=liveplay_echo_ev,
             )
 
         # ------------------------------------------------------------------ #
@@ -3206,6 +3223,7 @@ class DeviceClient(object):
         output_path: Optional[str],
         _status,
         mqtt_fut,
+        liveplay_echo_ev,
     ) -> "SdesSession":
         """SDES-SRTP streaming path using a hand-crafted SDP offer and ffmpeg.
 
@@ -3302,7 +3320,15 @@ class DeviceClient(object):
         outgoing_q.put_nowait((_live_play_topic_sdes, _live_req_sdes))
         _status(f"livePlayReq sent (SDES)  peerid={peer_id}")
         import asyncio as _asyncio
-        await _asyncio.sleep(0.5)
+        # Wait for the livePlayReq echo from the broker/camera before sending
+        # webrtcReq.  The echo confirms the MQTT pipeline to this device is live
+        # and the broker session is registered.  Fall through after 5 s if it
+        # never arrives (same safety as the old fixed 0.5 s sleep, but adaptive).
+        try:
+            await _asyncio.wait_for(liveplay_echo_ev.wait(), timeout=5.0)
+            _status("livePlayReq echo received — sending webrtcReq")
+        except _asyncio.TimeoutError:
+            _status("no livePlayReq echo in 5s — sending webrtcReq anyway")
 
         webrtc_req_payload = json.dumps({
             "method":  "webrtcReq",
