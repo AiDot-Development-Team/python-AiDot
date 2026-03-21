@@ -2848,7 +2848,50 @@ class DeviceClient(object):
                 result.extend(new_sec)
             return '\r\n'.join(result)
 
-        _offer_sdp = _patch_offer_mid2_h265(_upgrade_sctp(pc.localDescription.sdp))
+        def _normalize_bundle_ice_credentials(sdp: str) -> str:
+            """Unify all m-section ICE credentials to match the BUNDLE master (mid:0).
+
+            RFC 8843 §7.1.3 requires all bundled m-sections to carry the same
+            ice-ufrag and ice-pwd.  aiortc generates a separate ICETransport per
+            transceiver, giving each a unique credential pair.  Cameras that
+            validate this requirement silently reject offers with mismatched
+            credentials.  We overwrite every m-section's credentials with those
+            of the first m-section (the BUNDLE master, mid:0).
+
+            This is safe because: after BUNDLE negotiation succeeds, aiortc uses
+            only mid:0's ICETransport for all media; the camera's ICE checks go
+            exclusively to mid:0, whose credentials remain unchanged.
+            """
+            import re as _re
+            lines = _re.split(r'\r?\n', sdp)
+            master_ufrag: str | None = None
+            master_pwd:   str | None = None
+            in_msection = False
+            for ln in lines:
+                if ln.startswith('m='):
+                    in_msection = True
+                if in_msection:
+                    if ln.startswith('a=ice-ufrag:') and master_ufrag is None:
+                        master_ufrag = ln
+                    if ln.startswith('a=ice-pwd:') and master_pwd is None:
+                        master_pwd = ln
+                if master_ufrag and master_pwd:
+                    break
+            if not (master_ufrag and master_pwd):
+                return sdp   # no ICE credentials found; leave SDP unchanged
+            result = []
+            for ln in lines:
+                if ln.startswith('a=ice-ufrag:'):
+                    result.append(master_ufrag)
+                elif ln.startswith('a=ice-pwd:'):
+                    result.append(master_pwd)
+                else:
+                    result.append(ln)
+            return '\r\n'.join(result)
+
+        _offer_sdp = _normalize_bundle_ice_credentials(
+            _patch_offer_mid2_h265(_upgrade_sctp(pc.localDescription.sdp))
+        )
         _patched_mlines = [ln for ln in _offer_sdp.splitlines() if ln.startswith("m=")]
         _status("Offer m-sections (patched): %s" % " | ".join(_patched_mlines))
 
