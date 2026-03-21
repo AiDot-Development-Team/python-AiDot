@@ -2889,8 +2889,59 @@ class DeviceClient(object):
                     result.append(ln)
             return '\r\n'.join(result)
 
-        _offer_sdp = _normalize_bundle_ice_credentials(
-            _patch_offer_mid2_h265(_upgrade_sctp(pc.localDescription.sdp))
+        def _reorder_m_section_ice_attrs(sdp: str) -> str:
+            """Move transport attrs (ice-ufrag/pwd, fingerprint, setup) before candidates.
+
+            aiortc places a=ice-ufrag, a=ice-pwd, a=fingerprint, and a=setup at
+            the END of each m-section, after all a=candidate lines.  Camera
+            firmware parsers (and Chrome/libwebrtc) expect these transport
+            attributes to appear BEFORE the first a=candidate line.  A linear
+            parser that encounters candidates before seeing ice-ufrag/pwd cannot
+            validate them and silently rejects the offer — producing no webrtcResp.
+
+            This function moves those four lines to immediately before the first
+            a=candidate: in every m-section that contains candidates.  All other
+            attribute ordering is preserved; no content is added or removed.
+            """
+            import re as _re
+            _TRANSPORT = ('a=ice-ufrag:', 'a=ice-pwd:', 'a=fingerprint:', 'a=setup:')
+            lines = _re.split(r'\r?\n', sdp)
+            sections: list[list[str]] = []
+            current: list[str] = []
+            for ln in lines:
+                if ln.startswith('m=') and current:
+                    sections.append(current)
+                    current = [ln]
+                else:
+                    current.append(ln)
+            if current:
+                sections.append(current)
+            result: list[str] = []
+            for sec in sections:
+                first_cand = next(
+                    (i for i, ln in enumerate(sec) if ln.startswith('a=candidate:')),
+                    None,
+                )
+                if first_cand is None:
+                    result.extend(sec)
+                    continue
+                # Collect transport lines that appear at-or-after first candidate
+                transport_after: list[str] = []
+                kept: list[str] = []
+                for ln in sec[first_cand:]:
+                    if any(ln.startswith(p) for p in _TRANSPORT):
+                        transport_after.append(ln)
+                    else:
+                        kept.append(ln)
+                result.extend(sec[:first_cand])
+                result.extend(transport_after)
+                result.extend(kept)
+            return '\r\n'.join(result)
+
+        _offer_sdp = _reorder_m_section_ice_attrs(
+            _normalize_bundle_ice_credentials(
+                _patch_offer_mid2_h265(_upgrade_sctp(pc.localDescription.sdp))
+            )
         )
         _patched_mlines = [ln for ln in _offer_sdp.splitlines() if ln.startswith("m=")]
         _status("Offer m-sections (patched): %s" % " | ".join(_patched_mlines))
