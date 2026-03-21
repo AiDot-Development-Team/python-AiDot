@@ -2574,21 +2574,39 @@ class DeviceClient(object):
                 loop.call_soon_threadsafe(camera_ready_ev.set)
             if method == "webrtcResp":
                 resp_pid = inner.get("peerid")
-                if resp_pid != peer_id:
+                answer   = inner.get("offer") or inner.get("answer") or {}
+                if not answer.get("sdp"):
+                    return  # empty / incomplete response — ignore
+                if resp_pid == peer_id:
+                    pass  # exact peerid match — accept (fast path)
+                elif (inner.get("devId") == device_id
+                        or inner.get("dstAddr") == user_id):
+                    # Camera replied with its own stable session peerid rather than
+                    # echoing back our peerid.  Accept the SDP answer as long as
+                    # devId or dstAddr identifies this session unambiguously.
                     loop.call_soon_threadsafe(
                         lambda rp=resp_pid: _status(
-                            f"webrtcResp IGNORED — peerid mismatch:"
+                            f"webrtcResp accepted (camera peerid) —"
                             f" got {rp!r}"
                             f" expected ...{peer_id[-12:]}"
                         )
                     )
+                else:
+                    loop.call_soon_threadsafe(
+                        lambda rp=resp_pid: _status(
+                            f"webrtcResp IGNORED — peerid/devId/dstAddr mismatch:"
+                            f" got {rp!r}"
+                        )
+                    )
                     return
-                answer = inner.get("offer") or inner.get("answer") or {}
-                if answer.get("sdp") and not answer_fut.done():
+                if not answer_fut.done():
                     loop.call_soon_threadsafe(answer_fut.set_result, answer)
             elif method == "iceCandidateReq":
-                if inner.get("peerid") != peer_id:
-                    return   # high-volume; suppress status noise for ICE mismatches
+                resp_pid = inner.get("peerid")
+                if (resp_pid != peer_id
+                        and inner.get("devId") != device_id
+                        and inner.get("dstAddr") != user_id):
+                    return   # high-volume; suppress status noise for foreign ICE
                 cand = inner.get("candidate") or {}
                 if cand.get("candidate"):
                     loop.call_soon_threadsafe(ice_q.put_nowait, cand)
