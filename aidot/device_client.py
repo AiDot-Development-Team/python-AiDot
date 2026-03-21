@@ -2568,7 +2568,9 @@ class DeviceClient(object):
             inner  = msg.get("payload") or {}
             # Fire camera_ready_ev the moment the camera appears on MQTT — either via its
             # explicit wake-ACK (lowPowerActiveStateResp) or any message on the device channel.
-            if method == "lowPowerActiveStateResp" or topic.startswith(f"iot/v1/c/{device_id}/"):
+            if (method == "lowPowerActiveStateResp"
+                    or topic.startswith(f"iot/v1/c/{device_id}/")
+                    or topic.startswith(f"lds/v1/cb/{device_id}/")):
                 loop.call_soon_threadsafe(camera_ready_ev.set)
             if method == "webrtcResp":
                 resp_pid = inner.get("peerid")
@@ -2635,10 +2637,11 @@ class DeviceClient(object):
         _ice_req_payload = json.dumps({
             "method":  "getIceConfigReq",
             "service": "IPC",
+            "devId":   device_id,
             "srcAddr": f"{terminal_idx}.{user_id}",
             "seq":     f"ap{random.randint(1000000, 9999999)}",
             "tst":     int(time.time() * 1000),
-            "payload": {"deviceId": device_id, "userId": user_id},
+            "payload": {"devId": device_id, "userId": user_id},
         })
         outgoing_q.put_nowait(
             (f"iot/v1/s/{user_id}/IPC/getIceConfigReq", _ice_req_payload)
