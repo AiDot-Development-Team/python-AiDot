@@ -2671,9 +2671,12 @@ class DeviceClient(object):
                 "dstAddr": user_id,
             },
         })
-        outgoing_q.put_nowait((live_play_topic, _live_req_payload))
-        _status(f"livePlayReq sent  peerid={peer_id}")
-        await asyncio.sleep(0.5)
+        if not use_sdes:
+            # SDES path sends its own livePlayReq inside _open_sdes_stream;
+            # only send here for the DTLS path to avoid a duplicate.
+            outgoing_q.put_nowait((live_play_topic, _live_req_payload))
+            _status(f"livePlayReq sent  peerid={peer_id}")
+            await asyncio.sleep(0.5)
 
         # ------------------------------------------------------------------ #
         # Branch: SDES-SRTP cameras use ffmpeg; DTLS cameras use aiortc
@@ -3230,43 +3233,31 @@ class DeviceClient(object):
         # AES_CM_128_HMAC_SHA1_80: 16-byte key + 14-byte salt = 30 bytes.
         srtp_key_audio = base64.b64encode(os.urandom(30)).decode()
         srtp_key_video = base64.b64encode(os.urandom(30)).decode()
-        # ICE credentials — included for RFC compliance; no STUN checks done.
-        ufrag = base64.b64encode(os.urandom(3)).decode()[:4]
-        pwd   = base64.b64encode(os.urandom(18)).decode()[:24]
         ts = int(time.time())
+        # SDES-SRTP cameras use SIP-era plain SDP: no BUNDLE, no ICE.
+        # The camera sends RTP directly to c=IN IP4 {local_ip} on each
+        # m-section port.  BUNDLE and ICE attributes cause silent rejection
+        # by many firmware parsers that predate the WebRTC extensions.
         sdes_offer_sdp = (
             "v=0\r\n"
             f"o=- {ts} {ts} IN IP4 {local_ip}\r\n"
             "s=-\r\n"
             "t=0 0\r\n"
-            "a=group:BUNDLE 0 1\r\n"
-            f"a=ice-ufrag:{ufrag}\r\n"
-            f"a=ice-pwd:{pwd}\r\n"
             f"m=audio {audio_port} RTP/SAVPF 0 8\r\n"
             f"c=IN IP4 {local_ip}\r\n"
-            "a=mid:0\r\n"
             "a=recvonly\r\n"
             "a=rtcp-mux\r\n"
-            f"a=ice-ufrag:{ufrag}\r\n"
-            f"a=ice-pwd:{pwd}\r\n"
             f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_audio}\r\n"
             "a=rtpmap:0 PCMU/8000\r\n"
             "a=rtpmap:8 PCMA/8000\r\n"
-            f"a=candidate:1 1 UDP 2130706431 {local_ip} {audio_port} typ host\r\n"
-            "a=end-of-candidates\r\n"
             f"m=video {video_port} RTP/SAVPF 96 97\r\n"
             f"c=IN IP4 {local_ip}\r\n"
-            "a=mid:1\r\n"
             "a=recvonly\r\n"
             "a=rtcp-mux\r\n"
-            f"a=ice-ufrag:{ufrag}\r\n"
-            f"a=ice-pwd:{pwd}\r\n"
             f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_video}\r\n"
             "a=rtpmap:96 H264/90000\r\n"
             "a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n"
             "a=rtpmap:97 H265/90000\r\n"
-            f"a=candidate:1 1 UDP 2130706431 {local_ip} {video_port} typ host\r\n"
-            "a=end-of-candidates\r\n"
         )
 
         _status(
