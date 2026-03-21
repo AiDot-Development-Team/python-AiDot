@@ -2412,6 +2412,7 @@ class DeviceClient(object):
         output_path: Optional[str] = None,
         status_callback: Optional[Callable[[str], None]] = None,
         force_sdes: Optional[bool] = None,
+        _skip_ice_config: bool = False,
     ) -> "WebRTCSession":
         """Open a liveType=2 WebRTC stream via MQTT signaling.
 
@@ -2656,41 +2657,49 @@ class DeviceClient(object):
         # is forwarded to the device.  iOS app telemetry confirms getIceConfigReq
         # is always sent before webrtcReq.  Without this step the broker echoes
         # webrtcReq back to us but never routes it to the camera.
+        #
+        # Skipped on SDES→DTLS fallback retries (_skip_ice_config=True): the
+        # camera is already awake from the SDES attempt so the wake phase is
+        # unnecessary; skipping saves up to 17 s of timeout overhead.
         # ------------------------------------------------------------------ #
-        _ice_req_payload = json.dumps({
-            "method":  "getIceConfigReq",
-            "service": "IPC",
-            "devId":   device_id,
-            "srcAddr": f"{terminal_idx}.{user_id}",
-            "seq":     f"ap{random.randint(1000000, 9999999)}",
-            "tst":     int(time.time() * 1000),
-            "payload": {"devId": device_id, "userId": user_id},
-        })
-        outgoing_q.put_nowait(
-            (f"iot/v1/s/{user_id}/IPC/getIceConfigReq", _ice_req_payload)
-        )
-        _status("getIceConfigReq sent — waiting for camera to wake (up to 12s)")
-        try:
-            await asyncio.wait_for(camera_ready_ev.wait(), timeout=12.0)
-            _status("Camera awake — got MQTT signal")
-        except asyncio.TimeoutError:
-            # First attempt timed out — camera may be awake but the broker session
-            # may not be registered yet.  Retry getIceConfigReq to re-trigger
-            # broker routing registration before proceeding.
-            _status("Camera wake timeout — retrying getIceConfigReq ...")
+        if _skip_ice_config:
+            camera_ready_ev.set()  # camera already awake; skip wake handshake
+            _status("Skipping getIceConfigReq (DTLS fallback — camera already awake)")
+        else:
+            _ice_req_payload = json.dumps({
+                "method":  "getIceConfigReq",
+                "service": "IPC",
+                "devId":   device_id,
+                "srcAddr": f"{terminal_idx}.{user_id}",
+                "seq":     f"ap{random.randint(1000000, 9999999)}",
+                "tst":     int(time.time() * 1000),
+                "payload": {"devId": device_id, "userId": user_id},
+            })
             outgoing_q.put_nowait(
                 (f"iot/v1/s/{user_id}/IPC/getIceConfigReq", _ice_req_payload)
             )
+            _status("getIceConfigReq sent — waiting for camera to wake (up to 12s)")
             try:
-                await asyncio.wait_for(camera_ready_ev.wait(), timeout=5.0)
-                _status("Camera awake — got MQTT signal (after retry)")
+                await asyncio.wait_for(camera_ready_ev.wait(), timeout=12.0)
+                _status("Camera awake — got MQTT signal")
             except asyncio.TimeoutError:
-                _status("Camera wake timeout after retry — proceeding anyway")
-                if use_sdes:
-                    _status(
-                        "Note: getIceConfigReq timed out for claimed-SDES camera"
-                        " — will fall back to DTLS if SDES handshake fails"
-                    )
+                # First attempt timed out — camera may be awake but the broker session
+                # may not be registered yet.  Retry getIceConfigReq to re-trigger
+                # broker routing registration before proceeding.
+                _status("Camera wake timeout — retrying getIceConfigReq ...")
+                outgoing_q.put_nowait(
+                    (f"iot/v1/s/{user_id}/IPC/getIceConfigReq", _ice_req_payload)
+                )
+                try:
+                    await asyncio.wait_for(camera_ready_ev.wait(), timeout=5.0)
+                    _status("Camera awake — got MQTT signal (after retry)")
+                except asyncio.TimeoutError:
+                    _status("Camera wake timeout after retry — proceeding anyway")
+                    if use_sdes:
+                        _status(
+                            "Note: getIceConfigReq timed out for claimed-SDES camera"
+                            " — will fall back to DTLS if SDES handshake fails"
+                        )
 
         # ------------------------------------------------------------------ #
         # Send livePlayReq BEFORE the SDP offer.  iOS app telemetry confirms
@@ -2759,6 +2768,7 @@ class DeviceClient(object):
                     output_path=output_path,
                     status_callback=status_callback,
                     force_sdes=False,
+                    _skip_ice_config=True,
                 )
 
         # ------------------------------------------------------------------ #
@@ -3421,12 +3431,12 @@ class DeviceClient(object):
             f"o=- {ts} {ts} IN IP4 0.0.0.0\r\n"
             "s=aidot-sdes-rx\r\n"
             "t=0 0\r\n"
-            f"m=audio {audio_port} RTP/SAVPF 0 8\r\n"
+            f"m=audio {audio_port} RTP/SAVP 0 8\r\n"
             "c=IN IP4 0.0.0.0\r\n"
             f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_audio}\r\n"
             "a=rtpmap:0 PCMU/8000\r\n"
             "a=rtpmap:8 PCMA/8000\r\n"
-            f"m=video {video_port} RTP/SAVPF 96 97\r\n"
+            f"m=video {video_port} RTP/SAVP 96 97\r\n"
             "c=IN IP4 0.0.0.0\r\n"
             f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_video}\r\n"
             "a=rtpmap:96 H264/90000\r\n"
