@@ -2686,6 +2686,11 @@ class DeviceClient(object):
                 _status("Camera awake — got MQTT signal (after retry)")
             except asyncio.TimeoutError:
                 _status("Camera wake timeout after retry — proceeding anyway")
+                if use_sdes:
+                    _status(
+                        "Note: getIceConfigReq timed out for claimed-SDES camera"
+                        " — will fall back to DTLS if SDES handshake fails"
+                    )
 
         # ------------------------------------------------------------------ #
         # Send livePlayReq BEFORE the SDP offer.  iOS app telemetry confirms
@@ -2716,20 +2721,45 @@ class DeviceClient(object):
         # Branch: SDES-SRTP cameras use ffmpeg; DTLS cameras use aiortc
         # ------------------------------------------------------------------ #
         if use_sdes:
-            return await self._open_sdes_stream(
-                peer_id=peer_id,
-                user_id=user_id,
-                device_id=device_id,
-                terminal_idx=terminal_idx,
-                outgoing_q=outgoing_q,
-                answer_fut=answer_fut,
-                loop=loop,
-                timeout=timeout,
-                output_path=output_path,
-                _status=_status,
-                mqtt_fut=mqtt_fut,
-                liveplay_echo_ev=liveplay_echo_ev,
-            )
+            try:
+                return await self._open_sdes_stream(
+                    peer_id=peer_id,
+                    user_id=user_id,
+                    device_id=device_id,
+                    terminal_idx=terminal_idx,
+                    outgoing_q=outgoing_q,
+                    answer_fut=answer_fut,
+                    loop=loop,
+                    timeout=timeout,
+                    output_path=output_path,
+                    _status=_status,
+                    mqtt_fut=mqtt_fut,
+                    liveplay_echo_ev=liveplay_echo_ev,
+                )
+            except DeviceClient._SdesNoAnswerError:
+                # Camera reported enableSdes='1' but did not respond to our SDES
+                # offer.  iOS telemetry shows models such as LK.IPC.A001064 can
+                # have an incorrectly set enableSdes property while actually
+                # requiring DTLS (peerid suffix _2).  The MQTT session was already
+                # told to close (None sentinel sent to outgoing_q inside
+                # _open_sdes_stream); wait for the thread to finish before opening
+                # a new MQTT connection with the same clientId.
+                _status(
+                    "SDES handshake failed — camera may be DTLS despite"
+                    " enableSdes='1'.  Retrying with DTLS (aiortc) ..."
+                )
+                try:
+                    await asyncio.wait_for(mqtt_fut, timeout=5.0)
+                except Exception:
+                    pass   # MQTT thread exit errors don't affect the retry
+                return await self.async_open_webrtc_stream(
+                    on_frame,
+                    stream_id=stream_id,
+                    timeout=timeout,
+                    output_path=output_path,
+                    status_callback=status_callback,
+                    force_sdes=False,
+                )
 
         # ------------------------------------------------------------------ #
         # aiortc peer connection (DTLS-SRTP path)
@@ -3209,6 +3239,15 @@ class DeviceClient(object):
     # SDES-SRTP streaming path (cameras with isDTLS == '0')
     # ------------------------------------------------------------------ #
 
+    class _SdesNoAnswerError(Exception):
+        """Raised by _open_sdes_stream when no webrtcResp arrives.
+
+        Signals async_open_webrtc_stream to retry with the DTLS path.
+        This handles cameras that report ``enableSdes: '1'`` in the API
+        but actually require DTLS (e.g. LK.IPC.A001064 whose property
+        appears to have been incorrectly set after a firmware update).
+        """
+
     async def _open_sdes_stream(
         self,
         *,
@@ -3274,22 +3313,24 @@ class DeviceClient(object):
         # The camera sends RTP directly to c=IN IP4 {local_ip} on each
         # m-section port.  BUNDLE and ICE attributes cause silent rejection
         # by many firmware parsers that predate the WebRTC extensions.
+        # SDES-SRTP cameras use SIP-era plain SDP (RFC 3264 + RFC 3711).
+        # Use RTP/SAVP (not SAVPF) — the WebRTC feedback profile is not
+        # understood by older Leedarson firmware.  Likewise omit a=rtcp-mux;
+        # RTCP multiplexing is a WebRTC extension that predates SDES cameras.
         sdes_offer_sdp = (
             "v=0\r\n"
             f"o=- {ts} {ts} IN IP4 {local_ip}\r\n"
             "s=-\r\n"
             "t=0 0\r\n"
-            f"m=audio {audio_port} RTP/SAVPF 0 8\r\n"
+            f"m=audio {audio_port} RTP/SAVP 0 8\r\n"
             f"c=IN IP4 {local_ip}\r\n"
             "a=recvonly\r\n"
-            "a=rtcp-mux\r\n"
             f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_audio}\r\n"
             "a=rtpmap:0 PCMU/8000\r\n"
             "a=rtpmap:8 PCMA/8000\r\n"
-            f"m=video {video_port} RTP/SAVPF 96 97\r\n"
+            f"m=video {video_port} RTP/SAVP 96 97\r\n"
             f"c=IN IP4 {local_ip}\r\n"
             "a=recvonly\r\n"
-            "a=rtcp-mux\r\n"
             f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_video}\r\n"
             "a=rtpmap:96 H264/90000\r\n"
             "a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n"
@@ -3348,22 +3389,28 @@ class DeviceClient(object):
         outgoing_q.put_nowait((webrtc_req_topic, webrtc_req_payload))
         _status(f"webrtcReq sent (SDES)  peerid={peer_id}")
 
-        # --- Wait for SDP answer ------------------------------------------- #
+        # --- Wait for SDP answer (optional for SDES) ------------------------ #
+        # webrtcResp is optional: the ffmpeg_sdp below is built entirely from
+        # our own offered keys and ports, so the camera's answer is not needed.
+        # Use a short timeout (8 s) then proceed.  If no answer arrives it may
+        # mean the camera is actually DTLS — the caller catches _SdesNoAnswerError
+        # and retries with the DTLS / aiortc path.
+        _sdes_answer_timeout = min(timeout, 8.0)
         try:
-            answer = await asyncio.wait_for(answer_fut, timeout=timeout)
-        except asyncio.TimeoutError:
-            _status(f"no webrtcResp in {timeout}s")
-            outgoing_q.put_nowait(None)
-            raise RuntimeError(
-                f"_open_sdes_stream: no webrtcResp received within {timeout}s"
+            answer = await asyncio.wait_for(answer_fut, timeout=_sdes_answer_timeout)
+            _ans_sdp = answer.get("sdp", "")
+            _ans_mlines = [ln for ln in _ans_sdp.splitlines() if ln.startswith("m=")]
+            _status(
+                "webrtcResp received (SDES) — answer m-sections (%d): %s"
+                % (len(_ans_mlines), " | ".join(_ans_mlines))
             )
-
-        _ans_sdp = answer.get("sdp", "")
-        _ans_mlines = [ln for ln in _ans_sdp.splitlines() if ln.startswith("m=")]
-        _status(
-            "webrtcResp received (SDES) — answer m-sections (%d): %s"
-            % (len(_ans_mlines), " | ".join(_ans_mlines))
-        )
+        except asyncio.TimeoutError:
+            _status(
+                f"no webrtcResp in {_sdes_answer_timeout:.0f}s"
+                " — camera may be DTLS; will retry with DTLS if so"
+            )
+            outgoing_q.put_nowait(None)
+            raise DeviceClient._SdesNoAnswerError()
 
         # --- Build local-receiver SDP for ffmpeg ----------------------------- #
         # We write OUR ports and OUR SRTP keys.  c=IN IP4 0.0.0.0 tells ffmpeg
