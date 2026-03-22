@@ -2516,6 +2516,15 @@ class DeviceClient(object):
         #    validate the caller (LK.IPC.A001064 silently ignores offers without it).
         _cam_user_info = await self.async_get_device_user_info()
         _numeric_uid_raw = (_cam_user_info or {}).get("userId")
+        if _numeric_uid_raw is not None:
+            try:
+                _numeric_uid_raw = int(_numeric_uid_raw)
+            except (TypeError, ValueError):
+                _LOGGER.warning(
+                    "async_open_webrtc_stream: unexpected userId type %r — skipping injection",
+                    _numeric_uid_raw,
+                )
+                _numeric_uid_raw = None
         numeric_user_id = str(_numeric_uid_raw) if _numeric_uid_raw is not None else None
 
         device_id = self.device_id
@@ -2694,6 +2703,7 @@ class DeviceClient(object):
                 "srcAddr": f"{terminal_idx}.{user_id}",
                 "seq":     f"ap{random.randint(1000000, 9999999)}",
                 "tst":     int(time.time() * 1000),
+                **( {"userId": _numeric_uid_raw} if _numeric_uid_raw is not None else {} ),
                 "payload": {"devId": device_id, "userId": user_id},
             })
             outgoing_q.put_nowait(
