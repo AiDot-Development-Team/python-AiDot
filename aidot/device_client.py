@@ -2522,8 +2522,6 @@ class DeviceClient(object):
         # stored owner ID (numeric) and silently drop webrtcResp when dstAddr is the
         # UUID.  Fall back to the UUID when numeric userId is unavailable.
         dst_addr = numeric_user_id if numeric_user_id and numeric_user_id != user_id else user_id
-        if dst_addr != user_id:
-            _status(f"Using numeric userId as dstAddr: {dst_addr}")
 
         device_id = self.device_id
         peer_id   = self.generate_webrtc_peer_id(
@@ -2575,6 +2573,9 @@ class DeviceClient(object):
             if status_callback:
                 status_callback(msg)
             _LOGGER.info("webrtc: %s", msg)
+
+        if dst_addr != user_id:
+            _status(f"Using numeric userId as dstAddr: {dst_addr}")
 
         def _on_mqtt_ready(st: dict) -> None:
             _mqtt_conn_status.update(st)
