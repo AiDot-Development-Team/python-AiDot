@@ -3454,10 +3454,9 @@ class DeviceClient(object):
         except asyncio.TimeoutError:
             _status(
                 f"no webrtcResp in {_sdes_answer_timeout:.0f}s"
-                " — camera may be DTLS; will retry with DTLS if so"
+                " — proceeding with ffmpeg (some SDES cameras send SRTP"
+                " without a formal webrtcResp answer)"
             )
-            outgoing_q.put_nowait(None)
-            raise DeviceClient._SdesNoAnswerError()
 
         # --- Build local-receiver SDP for ffmpeg ----------------------------- #
         # We write OUR ports and OUR SRTP keys.  c=IN IP4 0.0.0.0 tells ffmpeg
@@ -3486,6 +3485,16 @@ class DeviceClient(object):
             f.write(ffmpeg_sdp)
 
         # --- Launch ffmpeg -------------------------------------------------- #
+        # Release the port-reservation sockets NOW so ffmpeg can bind to
+        # those exact ports exclusively.  We hold them open only long enough
+        # to include the port numbers in the SDP offer; once the offer is
+        # sent we no longer need them.
+        for _rsock in (_audio_sock, _video_sock):
+            try:
+                _rsock.close()
+            except Exception:
+                pass
+
         dest = output_path or "/dev/null"
         cmd = [
             "ffmpeg", "-y",
@@ -3509,8 +3518,8 @@ class DeviceClient(object):
             sdp_path=sdp_path,
             outgoing_q=outgoing_q,
             mqtt_fut=mqtt_fut,
-            audio_sock=_audio_sock,
-            video_sock=_video_sock,
+            audio_sock=None,   # already closed above
+            video_sock=None,
         )
 
     # -- Existing methods (unchanged) ---------------------------------------- #
