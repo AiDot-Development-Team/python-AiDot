@@ -2517,6 +2517,14 @@ class DeviceClient(object):
         _numeric_uid_raw = (_cam_user_info or {}).get("userId")
         numeric_user_id = str(_numeric_uid_raw) if _numeric_uid_raw is not None else None
 
+        # Use the camera's numeric userId as dstAddr in all outgoing IPC payloads.
+        # Cameras such as LK.IPC.A001064 validate dstAddr against their internally
+        # stored owner ID (numeric) and silently drop webrtcResp when dstAddr is the
+        # UUID.  Fall back to the UUID when numeric userId is unavailable.
+        dst_addr = numeric_user_id if numeric_user_id and numeric_user_id != user_id else user_id
+        if dst_addr != user_id:
+            _status(f"Using numeric userId as dstAddr: {dst_addr}")
+
         device_id = self.device_id
         peer_id   = self.generate_webrtc_peer_id(
             live_type=2, stream_id=stream_id, sdes=use_sdes
@@ -2733,7 +2741,7 @@ class DeviceClient(object):
             "payload": {
                 "peerid":  peer_id,
                 "devId":   device_id,
-                "dstAddr": user_id,
+                "dstAddr": dst_addr,
             },
         })
         if not use_sdes:
@@ -2761,6 +2769,7 @@ class DeviceClient(object):
                     _status=_status,
                     mqtt_fut=mqtt_fut,
                     liveplay_echo_ev=liveplay_echo_ev,
+                    dst_addr=dst_addr,
                 )
             except DeviceClient._SdesNoAnswerError:
                 # Camera reported enableSdes='1' but did not respond to our SDES
@@ -3090,7 +3099,7 @@ class DeviceClient(object):
                 "offer":   {"type": pc.localDescription.type,
                              "sdp":  _offer_sdp},
                 "trackId": 0,
-                "dstAddr": user_id,
+                "dstAddr": dst_addr,
             },
         })
         outgoing_q.put_nowait((webrtc_req_topic, webrtc_req_payload))
@@ -3122,7 +3131,7 @@ class DeviceClient(object):
                     "peerid":    peer_id,
                     "devId":     device_id,
                     "candidate": {"candidate": cand_str},
-                    "dstAddr":   user_id,
+                    "dstAddr":   dst_addr,
                 },
             })
             outgoing_q.put_nowait((ice_cand_topic, payload))
@@ -3290,6 +3299,7 @@ class DeviceClient(object):
         _status,
         mqtt_fut,
         liveplay_echo_ev,
+        dst_addr: Optional[str] = None,
     ) -> "SdesSession":
         """SDES-SRTP streaming path using a hand-crafted SDP offer and ffmpeg.
 
@@ -3299,6 +3309,11 @@ class DeviceClient(object):
         SDP answer, writes it to a temp file, and launches ffmpeg to receive and
         record the SRTP stream.
         """
+        # Resolve destination address: prefer the camera's numeric userId (passed
+        # by the caller) over the UUID so cameras that validate dstAddr against
+        # their internally stored owner ID accept the offer.
+        dst_addr = dst_addr or user_id
+
         import base64
         import os
         import subprocess
@@ -3381,7 +3396,7 @@ class DeviceClient(object):
             "payload": {
                 "peerid":  peer_id,
                 "devId":   device_id,
-                "dstAddr": user_id,
+                "dstAddr": dst_addr,
             },
         })
         _live_play_topic_sdes = f"iot/v1/s/{user_id}/IPC/livePlayReq"
@@ -3410,7 +3425,7 @@ class DeviceClient(object):
                 "devId":   device_id,
                 "offer":   {"type": "offer", "sdp": sdes_offer_sdp},
                 "trackId": 0,
-                "dstAddr": user_id,
+                "dstAddr": dst_addr,
             },
         })
         outgoing_q.put_nowait((webrtc_req_topic, webrtc_req_payload))
