@@ -203,17 +203,18 @@ async def run(args: argparse.Namespace) -> None:
         for cam in cameras:
             print(f"      {cam.get('id')}  model={cam.get('modelId')}  name={cam.get('name')}")
 
+        # Collect all camera IDs upfront for batch API calls.
+        # The app sends all device IDs in a single batchGetDeviceUserInfo request
+        # (~260 bytes for 7 devices); sending only one may return an empty result.
+        # Must be built from the unfiltered list before --device narrows it down.
+        _all_camera_ids = [c.get("id") for c in cameras if c.get("id")]
+
         if args.device:
             cameras = [c for c in cameras if c.get("id") == args.device]
             if not cameras:
                 print(f"    --device {args.device!r} not found in camera list")
                 return
             print(f"    Filtered to device {args.device!r}")
-
-        # Collect all camera IDs upfront for batch API calls.
-        # The app sends all device IDs in a single batchGetDeviceUserInfo request
-        # (~260 bytes for 7 devices); sending only one may return an empty result.
-        _all_camera_ids = [c.get("id") for c in cameras if c.get("id")]
 
         # Run selected tests
         for cam in cameras:

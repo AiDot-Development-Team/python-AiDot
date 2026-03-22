@@ -2510,6 +2510,13 @@ class DeviceClient(object):
         if not mqtt_url:
             raise RuntimeError("async_open_webrtc_stream: no MQTT URL available")
 
+        # Fetch camera's registered numeric userId for additional MQTT subscriptions.
+        # Cameras such as LK.IPC.A001064 route webrtcResp via their internally stored
+        # numeric userId topic rather than the UUID topic, so we subscribe to both.
+        _cam_user_info = await self.async_get_device_user_info()
+        _numeric_uid_raw = (_cam_user_info or {}).get("userId")
+        numeric_user_id = str(_numeric_uid_raw) if _numeric_uid_raw is not None else None
+
         device_id = self.device_id
         peer_id   = self.generate_webrtc_peer_id(
             live_type=2, stream_id=stream_id, sdes=use_sdes
@@ -2524,6 +2531,16 @@ class DeviceClient(object):
             f"lds/v1/c/{user_id}/#",     # Leedarson firmware: webrtcResp on user channel
             f"lds/v1/cb/{device_id}/#",  # Leedarson firmware: webrtcResp on device cb channel
         ]
+        # Some camera firmware (e.g. LK.IPC.A001064) routes webrtcResp using the
+        # camera's internally registered numeric userId rather than the account UUID.
+        # Subscribe to those topics so we receive the answer regardless of which ID
+        # the camera firmware uses for routing.
+        if numeric_user_id and numeric_user_id != user_id:
+            sub_topics += [
+                f"iot/v1/c/{numeric_user_id}/#",
+                f"iot/v1/cb/{numeric_user_id}/#",
+                f"lds/v1/c/{numeric_user_id}/#",
+            ]
         # iOS app telemetry (2025-03-23) confirms ALL IPC publish topics use
         # the userId path.  The broker routes to the specific camera using the
         # ``devId`` field inside the JSON payload, NOT the MQTT topic path.
