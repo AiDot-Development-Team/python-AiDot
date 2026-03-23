@@ -1073,6 +1073,13 @@ class SdesSession:
             self._proc.wait(timeout=5)
         except Exception:
             self._proc.kill()
+        stderr_bytes = b""
+        try:
+            stderr_bytes = self._proc.stderr.read()
+        except Exception:
+            pass
+        if stderr_bytes:
+            _LOGGER.warning("ffmpeg SDES stderr:\n%s", stderr_bytes.decode(errors="replace"))
         import os
         try:
             os.unlink(self._sdp_path)
@@ -3413,55 +3420,19 @@ class DeviceClient(object):
         # never arrives (same safety as the old fixed 0.5 s sleep, but adaptive).
         try:
             await _asyncio.wait_for(liveplay_echo_ev.wait(), timeout=5.0)
-            _status("livePlayReq echo received — sending webrtcReq")
+            _status("livePlayReq echo received — launching ffmpeg then sending webrtcReq")
         except _asyncio.TimeoutError:
-            _status("no livePlayReq echo in 5s — sending webrtcReq anyway")
-
-        webrtc_req_payload = json.dumps({
-            "method":  "webrtcReq",
-            "service": "IPC",
-            "devId":   device_id,
-            "srcAddr": f"{terminal_idx}.{user_id}",
-            "seq":     _seq(),
-            "tst":     int(time.time() * 1000),
-            **( {"userId": numeric_uid_raw} if numeric_uid_raw is not None else {} ),
-            "payload": {
-                "peerid":  peer_id,
-                "devId":   device_id,
-                "offer":   {"type": "offer", "sdp": sdes_offer_sdp},
-                "trackId": 0,
-                "dstAddr": user_id,
-            },
-        })
-        outgoing_q.put_nowait((webrtc_req_topic, webrtc_req_payload))
-        _status(f"webrtcReq sent (SDES)  peerid={peer_id}")
-
-        # --- Wait for SDP answer (optional for SDES) ------------------------ #
-        # webrtcResp is optional: the ffmpeg_sdp below is built entirely from
-        # our own offered keys and ports, so the camera's answer is not needed.
-        # Use a short timeout (8 s) then proceed.  If no answer arrives it may
-        # mean the camera is actually DTLS — the caller catches _SdesNoAnswerError
-        # and retries with the DTLS / aiortc path.
-        _sdes_answer_timeout = min(timeout, 8.0)
-        try:
-            answer = await asyncio.wait_for(answer_fut, timeout=_sdes_answer_timeout)
-            _ans_sdp = answer.get("sdp", "")
-            _ans_mlines = [ln for ln in _ans_sdp.splitlines() if ln.startswith("m=")]
-            _status(
-                "webrtcResp received (SDES) — answer m-sections (%d): %s"
-                % (len(_ans_mlines), " | ".join(_ans_mlines))
-            )
-        except asyncio.TimeoutError:
-            _status(
-                f"no webrtcResp in {_sdes_answer_timeout:.0f}s"
-                " — proceeding with ffmpeg (some SDES cameras send SRTP"
-                " without a formal webrtcResp answer)"
-            )
+            _status("no livePlayReq echo in 5s — launching ffmpeg then sending webrtcReq anyway")
 
         # --- Build local-receiver SDP for ffmpeg ----------------------------- #
-        # We write OUR ports and OUR SRTP keys.  c=IN IP4 0.0.0.0 tells ffmpeg
-        # to bind locally (listen mode) rather than connect to a remote address.
-        # The camera sends SDES-SRTP to our local_ip:{audio_port,video_port}.
+        # Built BEFORE sending webrtcReq so ffmpeg is already listening on the
+        # reserved ports when the camera starts streaming.  Launching ffmpeg
+        # after webrtcReq means the first seconds of SRTP data land in the
+        # Python reservation sockets (or trigger ICMP port-unreachable after
+        # they are closed), causing 0-frame output.
+        # ffmpeg_sdp uses only audio_port/video_port and srtp_key_* — all known
+        # from the allocation step above; the camera's webrtcResp is not needed.
+        # c=IN IP4 0.0.0.0 tells ffmpeg to bind locally (listen mode).
         ffmpeg_sdp = (
             "v=0\r\n"
             f"o=- {ts} {ts} IN IP4 0.0.0.0\r\n"
@@ -3484,11 +3455,8 @@ class DeviceClient(object):
         with os.fdopen(sdp_fd, "w") as f:
             f.write(ffmpeg_sdp)
 
-        # --- Launch ffmpeg -------------------------------------------------- #
-        # Release the port-reservation sockets NOW so ffmpeg can bind to
-        # those exact ports exclusively.  We hold them open only long enough
-        # to include the port numbers in the SDP offer; once the offer is
-        # sent we no longer need them.
+        # --- Launch ffmpeg BEFORE sending webrtcReq -------------------------- #
+        # Release the port-reservation sockets so ffmpeg can bind exclusively.
         for _rsock in (_audio_sock, _video_sock):
             try:
                 _rsock.close()
@@ -3510,8 +3478,46 @@ class DeviceClient(object):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
+        _status(f"SDES ffmpeg listening → {dest}  (ffmpeg pid={proc.pid})")
 
-        _status(f"SDES stream recording → {dest}  (ffmpeg pid={proc.pid})")
+        # --- Send webrtcReq — camera starts streaming to ffmpeg's ports ------ #
+        webrtc_req_payload = json.dumps({
+            "method":  "webrtcReq",
+            "service": "IPC",
+            "devId":   device_id,
+            "srcAddr": f"{terminal_idx}.{user_id}",
+            "seq":     _seq(),
+            "tst":     int(time.time() * 1000),
+            **( {"userId": numeric_uid_raw} if numeric_uid_raw is not None else {} ),
+            "payload": {
+                "peerid":  peer_id,
+                "devId":   device_id,
+                "offer":   {"type": "offer", "sdp": sdes_offer_sdp},
+                "trackId": 0,
+                "dstAddr": user_id,
+            },
+        })
+        outgoing_q.put_nowait((webrtc_req_topic, webrtc_req_payload))
+        _status(f"webrtcReq sent (SDES)  peerid={peer_id}")
+
+        # --- Wait for SDP answer (optional for SDES) ------------------------ #
+        # webrtcResp is not needed to receive the stream: ffmpeg_sdp is built
+        # entirely from our own offered keys and ports.  Log it if it arrives;
+        # fall through silently on timeout (some SDES firmware never sends it).
+        _sdes_answer_timeout = min(timeout, 8.0)
+        try:
+            answer = await asyncio.wait_for(answer_fut, timeout=_sdes_answer_timeout)
+            _ans_sdp = answer.get("sdp", "")
+            _ans_mlines = [ln for ln in _ans_sdp.splitlines() if ln.startswith("m=")]
+            _status(
+                "webrtcResp received (SDES) — answer m-sections (%d): %s"
+                % (len(_ans_mlines), " | ".join(_ans_mlines))
+            )
+        except asyncio.TimeoutError:
+            _status(
+                f"no webrtcResp in {_sdes_answer_timeout:.0f}s"
+                " — ffmpeg already running; stream should be flowing"
+            )
 
         return SdesSession(
             proc=proc,
