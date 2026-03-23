@@ -2534,6 +2534,12 @@ class DeviceClient(object):
                 _numeric_uid_raw = None
         numeric_user_id = str(_numeric_uid_raw) if _numeric_uid_raw is not None else None
 
+        # Determine whether a DTLS fallback is viable.  If the camera reports
+        # isDTLS='0' in its properties, it cannot perform a DTLS handshake, so
+        # falling back to the DTLS path after SDES timeout is pointless.
+        _props = getattr(self, "_raw_device", {}).get("properties") or {}
+        _dtls_fallback_ok = str(_props.get("isDTLS", "1")) != "0"
+
         device_id = self.device_id
         peer_id   = self.generate_webrtc_peer_id(
             live_type=2, stream_id=stream_id, sdes=use_sdes
@@ -2784,6 +2790,7 @@ class DeviceClient(object):
                     mqtt_fut=mqtt_fut,
                     liveplay_echo_ev=liveplay_echo_ev,
                     numeric_uid_raw=_numeric_uid_raw,
+                    dtls_fallback_ok=_dtls_fallback_ok,
                 )
             except DeviceClient._SdesNoAnswerError:
                 # Camera reported enableSdes='1' but did not respond to our SDES
@@ -3315,6 +3322,7 @@ class DeviceClient(object):
         mqtt_fut,
         liveplay_echo_ev,
         numeric_uid_raw=None,
+        dtls_fallback_ok: bool = True,
     ) -> "SdesSession":
         """SDES-SRTP streaming path using a hand-crafted SDP offer and ffmpeg.
 
@@ -3566,24 +3574,36 @@ class DeviceClient(object):
                 % (len(_ans_mlines), " | ".join(_ans_mlines))
             )
         except asyncio.TimeoutError:
-            # No webrtcResp — camera likely requires DTLS despite enableSdes='1'.
-            # Kill ffmpeg (launched before webrtcReq) and signal the caller to
-            # retry with the DTLS path.
-            _status(
-                f"no webrtcResp in {_sdes_answer_timeout:.0f}s"
-                " — SDES handshake failed; aborting ffmpeg and falling back to DTLS"
-            )
-            proc.terminate()
-            try:
-                proc.wait(timeout=2)
-            except Exception:
-                proc.kill()
-            try:
-                os.unlink(sdp_path)
-            except Exception:
-                pass
-            outgoing_q.put_nowait(None)   # signal MQTT thread to exit
-            raise DeviceClient._SdesNoAnswerError()
+            if dtls_fallback_ok:
+                # Camera likely requires DTLS despite enableSdes='1'.  Kill
+                # ffmpeg and signal the caller to retry with the DTLS path.
+                _status(
+                    f"no webrtcResp in {_sdes_answer_timeout:.0f}s"
+                    " — SDES handshake failed; aborting ffmpeg and falling back to DTLS"
+                )
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    proc.kill()
+                try:
+                    os.unlink(sdp_path)
+                except Exception:
+                    pass
+                outgoing_q.put_nowait(None)   # signal MQTT thread to exit
+                raise DeviceClient._SdesNoAnswerError()
+            else:
+                # isDTLS='0': this camera cannot do DTLS so falling back is
+                # pointless.  Some SDES cameras (e.g. LK.IPC.A001064) start
+                # streaming SRTP directly to our ports without sending a
+                # webrtcResp SDP answer.  Keep ffmpeg running — it already
+                # has the SRTP key it needs from the offered SDP, and the
+                # camera's RTP should start arriving momentarily.
+                _status(
+                    f"no webrtcResp in {_sdes_answer_timeout:.0f}s"
+                    " — isDTLS=0: DTLS fallback not available;"
+                    " continuing with ffmpeg (camera may stream without SDP answer)"
+                )
 
         return SdesSession(
             proc=proc,
