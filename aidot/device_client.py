@@ -3550,9 +3550,12 @@ class DeviceClient(object):
         _status(f"webrtcReq sent (SDES)  peerid={peer_id}")
 
         # --- Wait for SDP answer (optional for SDES) ------------------------ #
-        # webrtcResp is not needed to receive the stream: ffmpeg_sdp is built
-        # entirely from our own offered keys and ports.  Log it if it arrives;
-        # fall through silently on timeout (some SDES firmware never sends it).
+        # Wait for the camera's SDP answer.  True SDES cameras (e.g.
+        # LK.IPC.A001513) send webrtcResp within a few seconds.  If no
+        # answer arrives the camera is not operating in SDES mode — most
+        # likely it has enableSdes='1' set incorrectly and actually requires
+        # DTLS.  In that case abort the ffmpeg process and raise
+        # _SdesNoAnswerError so the caller retries with the DTLS path.
         _sdes_answer_timeout = min(timeout, 8.0)
         try:
             answer = await asyncio.wait_for(answer_fut, timeout=_sdes_answer_timeout)
@@ -3563,10 +3566,24 @@ class DeviceClient(object):
                 % (len(_ans_mlines), " | ".join(_ans_mlines))
             )
         except asyncio.TimeoutError:
+            # No webrtcResp — camera likely requires DTLS despite enableSdes='1'.
+            # Kill ffmpeg (launched before webrtcReq) and signal the caller to
+            # retry with the DTLS path.
             _status(
                 f"no webrtcResp in {_sdes_answer_timeout:.0f}s"
-                " — ffmpeg already running; stream should be flowing"
+                " — SDES handshake failed; aborting ffmpeg and falling back to DTLS"
             )
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                proc.kill()
+            try:
+                os.unlink(sdp_path)
+            except Exception:
+                pass
+            outgoing_q.put_nowait(None)   # signal MQTT thread to exit
+            raise DeviceClient._SdesNoAnswerError()
 
         return SdesSession(
             proc=proc,
