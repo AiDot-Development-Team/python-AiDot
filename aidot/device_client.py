@@ -3468,6 +3468,12 @@ class DeviceClient(object):
             "ffmpeg", "-y",
             "-loglevel", "warning",
             "-protocol_whitelist", "file,rtp,udp,srtp",
+            # Give ffmpeg up to 100 s to detect codec parameters from the
+            # incoming SRTP stream.  Without this, ffmpeg uses 0 µs and fails
+            # with "Could not find codec parameters" if the first packets
+            # arrive before the format is fully probed.
+            "-analyzeduration", "100000000",
+            "-probesize", "10000000",
             "-i", sdp_path,
             "-c", "copy",
             dest,
@@ -3478,7 +3484,50 @@ class DeviceClient(object):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
-        _status(f"SDES ffmpeg listening → {dest}  (ffmpeg pid={proc.pid})")
+
+        # Wait until ffmpeg has actually bound the UDP ports before sending
+        # webrtcReq.  Popen() returns as soon as the process is created;
+        # ffmpeg needs additional time to parse the SDP and call bind().
+        # If we send webrtcReq before ffmpeg is listening, the camera's first
+        # SRTP packets hit closed ports, the OS sends ICMP port-unreachable,
+        # and the camera stops streaming — producing 0 frames.
+        def _udp_port_bound(port: int) -> bool:
+            """True if any UDP socket is currently bound to `port`."""
+            port_hex = f"{port:04X}"
+            for _proc_file in ("/proc/net/udp", "/proc/net/udp6"):
+                try:
+                    with open(_proc_file) as _pf:
+                        for _ln in _pf:
+                            _parts = _ln.split()
+                            if len(_parts) >= 2 and ":" in _parts[1]:
+                                if _parts[1].split(":")[1] == port_hex:
+                                    return True
+                except OSError:
+                    pass
+            return False
+
+        _t0 = time.monotonic()
+        _bind_deadline = _t0 + 3.0
+        _bound = False
+        while time.monotonic() < _bind_deadline:
+            if _udp_port_bound(audio_port) and _udp_port_bound(video_port):
+                _bound = True
+                break
+            await asyncio.sleep(0.05)
+
+        _bind_ms = int((time.monotonic() - _t0) * 1000)
+        if _bound:
+            _status(
+                f"SDES ffmpeg ready — audio={audio_port} video={video_port}"
+                f" bound in {_bind_ms} ms  (pid={proc.pid})"
+            )
+        else:
+            # /proc/net/udp unavailable or ffmpeg very slow — use fixed delay
+            _status(
+                f"ffmpeg port bind not confirmed after {_bind_ms} ms"
+                " — sleeping 1.5 s as fallback"
+            )
+            await asyncio.sleep(1.5)
 
         # --- Send webrtcReq — camera starts streaming to ffmpeg's ports ------ #
         webrtc_req_payload = json.dumps({
