@@ -3486,11 +3486,25 @@ class DeviceClient(object):
             dest,
         ]
         _LOGGER.info("SDES ffmpeg cmd: %s", " ".join(cmd))
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            # ffmpeg is not installed — clean up and surface a clear error.
+            try:
+                os.unlink(sdp_path)
+            except Exception:
+                pass
+            outgoing_q.put_nowait(None)   # stop MQTT thread
+            raise RuntimeError(
+                "ffmpeg not found — install ffmpeg to stream SDES-SRTP cameras.\n"
+                "  Ubuntu/Debian:  sudo apt install ffmpeg\n"
+                "  macOS (Homebrew): brew install ffmpeg\n"
+                "  Windows:         https://ffmpeg.org/download.html"
+            )
 
         # Wait until ffmpeg has actually bound the UDP ports before sending
         # webrtcReq.  Popen() returns as soon as the process is created;

@@ -580,6 +580,8 @@ async def run(args: argparse.Namespace) -> None:
                     print(f"    ERROR: {_ie}")
                 except RuntimeError as _re:
                     print(f"    FAILED: {_re}")
+                except Exception as _exc:
+                    print(f"    UNEXPECTED ERROR [{type(_exc).__name__}]: {_exc}")
 
 
 def main() -> None:
@@ -637,6 +639,11 @@ def main() -> None:
                              "isDTLS device property; use to override SDES auto-detection")
 
     args = parser.parse_args()
+
+    # Companion flags imply --webrtc so users don't need to add --webrtc explicitly
+    # when they already specify --webrtc-output, --webrtc-sdes, or --webrtc-dtls.
+    if not args.webrtc and (args.webrtc_output or args.webrtc_sdes or args.webrtc_dtls):
+        args.webrtc = True
 
     # Default: run all tests if no specific flag given
     if not any([args.p2p, args.list_recordings, args.play, args.live,
