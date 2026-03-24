@@ -3276,7 +3276,7 @@ class DeviceClient(object):
                 "srcAddr": f"{terminal_idx}.{user_id}",
                 "seq":     _seq(),
                 "tst":     int(time.time() * 1000),
-                **( {"userId": numeric_uid_raw} if numeric_uid_raw is not None else {} ),
+                **( {"userId": _numeric_uid_raw} if _numeric_uid_raw is not None else {} ),
                 "payload": {
                     "peerid":  peer_id,
                     "devId":   device_id,
