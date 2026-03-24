@@ -3647,7 +3647,7 @@ class DeviceClient(object):
             if _stun_seen:
                 if idle > _idle_limit:
                     break   # ICE done (silence after STUN) — ffmpeg will pick up SRTP
-            elif idle > _pre_stun_idle:
+            elif not _cam_echo_received and idle > _pre_stun_idle:
                 break       # no STUN at all — non-ICE camera, skip window
             try:
                 _rlist, _, _ = _select.select(
