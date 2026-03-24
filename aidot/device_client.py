@@ -2534,11 +2534,12 @@ class DeviceClient(object):
                 _numeric_uid_raw = None
         numeric_user_id = str(_numeric_uid_raw) if _numeric_uid_raw is not None else None
 
-        # Determine whether a DTLS fallback is viable.  If the camera reports
-        # isDTLS='0' in its properties, it cannot perform a DTLS handshake, so
-        # falling back to the DTLS path after SDES timeout is pointless.
-        _props = getattr(self, "_raw_device", {}).get("properties") or {}
-        _dtls_fallback_ok = str(_props.get("isDTLS", "1")) != "0"
+        # Always allow DTLS fallback after SDES timeout.  The isDTLS device
+        # property is unreliable — cameras that set isDTLS='0' often still
+        # support DTLS-SRTP in practice, and SDES cameras may have incorrectly
+        # provisioned properties.  Attempting DTLS is harmless; skipping it
+        # silently leaves the user with zero frames.
+        _dtls_fallback_ok = True
 
         device_id = self.device_id
         peer_id   = self.generate_webrtc_peer_id(
@@ -3373,21 +3374,21 @@ class DeviceClient(object):
         # m-section port.  BUNDLE and ICE attributes cause silent rejection
         # by many firmware parsers that predate the WebRTC extensions.
         # SDES-SRTP cameras use SIP-era plain SDP (RFC 3264 + RFC 3711).
-        # Use RTP/SAVP (not SAVPF) — the WebRTC feedback profile is not
-        # understood by older Leedarson firmware.  Likewise omit a=rtcp-mux;
-        # RTCP multiplexing is a WebRTC extension that predates SDES cameras.
+        # Use RTP/SAVPF (RFC 4585) — Leedarson firmware expects the feedback
+        # profile and silently ignores offers with plain RTP/SAVP.
+        # Omit a=rtcp-mux; RTCP multiplexing is not used by these cameras.
         sdes_offer_sdp = (
             "v=0\r\n"
             f"o=- {ts} {ts} IN IP4 {local_ip}\r\n"
             "s=-\r\n"
             "t=0 0\r\n"
-            f"m=audio {audio_port} RTP/SAVP 0 8\r\n"
+            f"m=audio {audio_port} RTP/SAVPF 0 8\r\n"
             f"c=IN IP4 {local_ip}\r\n"
             "a=recvonly\r\n"
             f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_audio}\r\n"
             "a=rtpmap:0 PCMU/8000\r\n"
             "a=rtpmap:8 PCMA/8000\r\n"
-            f"m=video {video_port} RTP/SAVP 96 97\r\n"
+            f"m=video {video_port} RTP/SAVPF 96 97\r\n"
             f"c=IN IP4 {local_ip}\r\n"
             "a=recvonly\r\n"
             f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_video}\r\n"
@@ -3445,12 +3446,12 @@ class DeviceClient(object):
             f"o=- {ts} {ts} IN IP4 0.0.0.0\r\n"
             "s=aidot-sdes-rx\r\n"
             "t=0 0\r\n"
-            f"m=audio {audio_port} RTP/SAVP 0 8\r\n"
+            f"m=audio {audio_port} RTP/SAVPF 0 8\r\n"
             "c=IN IP4 0.0.0.0\r\n"
             f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_audio}\r\n"
             "a=rtpmap:0 PCMU/8000\r\n"
             "a=rtpmap:8 PCMA/8000\r\n"
-            f"m=video {video_port} RTP/SAVP 96 97\r\n"
+            f"m=video {video_port} RTP/SAVPF 96 97\r\n"
             "c=IN IP4 0.0.0.0\r\n"
             f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_video}\r\n"
             "a=rtpmap:96 H264/90000\r\n"
