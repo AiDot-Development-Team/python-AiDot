@@ -2534,12 +2534,15 @@ class DeviceClient(object):
                 _numeric_uid_raw = None
         numeric_user_id = str(_numeric_uid_raw) if _numeric_uid_raw is not None else None
 
-        # Always allow DTLS fallback after SDES timeout.  The isDTLS device
-        # property is unreliable — cameras that set isDTLS='0' often still
-        # support DTLS-SRTP in practice, and SDES cameras may have incorrectly
-        # provisioned properties.  Attempting DTLS is harmless; skipping it
-        # silently leaves the user with zero frames.
-        _dtls_fallback_ok = True
+        # Respect isDTLS='0': those cameras cannot do DTLS, so falling back
+        # after an SDES timeout would only hang the stream (~30 s with zero
+        # frames).  Cameras such as LK.IPC.A001064 (isDTLS='0', enableSdes='1')
+        # stream SRTP directly to our ports without sending a webrtcResp; the
+        # SDES path handles this by keeping ffmpeg running (lines ~3764-3775).
+        # For cameras where isDTLS is absent or non-zero, allow DTLS fallback
+        # in case enableSdes='1' was incorrectly provisioned.
+        _cam_props = (self._raw_device or {}).get("properties") or {}
+        _dtls_fallback_ok = str(_cam_props.get("isDTLS", "1")) != "0"
 
         device_id = self.device_id
         peer_id   = self.generate_webrtc_peer_id(
@@ -3378,12 +3381,13 @@ class DeviceClient(object):
     # ------------------------------------------------------------------ #
 
     class _SdesNoAnswerError(Exception):
-        """Raised by _open_sdes_stream when no webrtcResp arrives.
+        """Raised by _open_sdes_stream when no webrtcResp arrives and
+        DTLS fallback is permitted (isDTLS != '0').
 
-        Signals async_open_webrtc_stream to retry with the DTLS path.
-        This handles cameras that report ``enableSdes: '1'`` in the API
-        but actually require DTLS (e.g. LK.IPC.A001064 whose property
-        appears to have been incorrectly set after a firmware update).
+        Signals async_open_webrtc_stream to retry with the DTLS path for
+        cameras that report ``enableSdes: '1'`` but actually require DTLS.
+        Cameras with ``isDTLS: '0'`` are excluded from this path; they
+        instead continue with ffmpeg and collect the SRTP stream directly.
         """
 
     async def _open_sdes_stream(
