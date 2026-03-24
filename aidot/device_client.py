@@ -3369,14 +3369,18 @@ class DeviceClient(object):
         srtp_key_audio = base64.b64encode(os.urandom(30)).decode()
         srtp_key_video = base64.b64encode(os.urandom(30)).decode()
         ts = int(time.time())
-        # SDES-SRTP cameras use SIP-era plain SDP: no BUNDLE, no ICE.
-        # The camera sends RTP directly to c=IN IP4 {local_ip} on each
-        # m-section port.  BUNDLE and ICE attributes cause silent rejection
-        # by many firmware parsers that predate the WebRTC extensions.
         # SDES-SRTP cameras use SIP-era plain SDP (RFC 3264 + RFC 3711).
         # Use RTP/SAVPF (RFC 4585) — Leedarson firmware expects the feedback
         # profile and silently ignores offers with plain RTP/SAVP.
-        # Omit a=rtcp-mux; RTCP multiplexing is not used by these cameras.
+        # Include per-m-section ICE credentials and a host candidate so that
+        # newer PTZ firmware (e.g. LK.IPC.A001064) that requires ICE for
+        # address discovery will respond.  Older cameras that don't understand
+        # ICE ignore those attributes and use the port in the m= line directly.
+        import secrets as _secrets
+        _ufrag_a = _secrets.token_urlsafe(4)[:4]
+        _pwd_a   = _secrets.token_urlsafe(24)[:22]
+        _ufrag_v = _secrets.token_urlsafe(4)[:4]
+        _pwd_v   = _secrets.token_urlsafe(24)[:22]
         sdes_offer_sdp = (
             "v=0\r\n"
             f"o=- {ts} {ts} IN IP4 {local_ip}\r\n"
@@ -3385,16 +3389,24 @@ class DeviceClient(object):
             f"m=audio {audio_port} RTP/SAVPF 0 8\r\n"
             f"c=IN IP4 {local_ip}\r\n"
             "a=recvonly\r\n"
+            "a=mid:0\r\n"
+            f"a=ice-ufrag:{_ufrag_a}\r\n"
+            f"a=ice-pwd:{_pwd_a}\r\n"
             f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_audio}\r\n"
             "a=rtpmap:0 PCMU/8000\r\n"
             "a=rtpmap:8 PCMA/8000\r\n"
+            f"a=candidate:1 1 udp 2130706431 {local_ip} {audio_port} typ host\r\n"
             f"m=video {video_port} RTP/SAVPF 96 97\r\n"
             f"c=IN IP4 {local_ip}\r\n"
             "a=recvonly\r\n"
+            "a=mid:1\r\n"
+            f"a=ice-ufrag:{_ufrag_v}\r\n"
+            f"a=ice-pwd:{_pwd_v}\r\n"
             f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_video}\r\n"
             "a=rtpmap:96 H264/90000\r\n"
             "a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n"
             "a=rtpmap:97 H265/90000\r\n"
+            f"a=candidate:1 1 udp 2130706431 {local_ip} {video_port} typ host\r\n"
         )
 
         _status(
@@ -3428,9 +3440,9 @@ class DeviceClient(object):
         # never arrives (same safety as the old fixed 0.5 s sleep, but adaptive).
         try:
             await _asyncio.wait_for(liveplay_echo_ev.wait(), timeout=5.0)
-            _status("livePlayReq echo received — launching ffmpeg then sending webrtcReq")
+            _status("livePlayReq echo received — sending webrtcReq, ICE, then launching ffmpeg")
         except _asyncio.TimeoutError:
-            _status("no livePlayReq echo in 5s — launching ffmpeg then sending webrtcReq anyway")
+            _status("no livePlayReq echo in 5s — sending webrtcReq, ICE, then launching ffmpeg anyway")
 
         # --- Build local-receiver SDP for ffmpeg ----------------------------- #
         # Built BEFORE sending webrtcReq so ffmpeg is already listening on the
@@ -3463,8 +3475,92 @@ class DeviceClient(object):
         with os.fdopen(sdp_fd, "w") as f:
             f.write(ffmpeg_sdp)
 
-        # --- Launch ffmpeg BEFORE sending webrtcReq -------------------------- #
-        # Release the port-reservation sockets so ffmpeg can bind exclusively.
+        # --- Send webrtcReq BEFORE releasing reservation sockets ------------- #
+        # ICE cameras (e.g. LK.IPC.A001064) send STUN binding requests to our
+        # ICE candidates immediately after receiving webrtcReq.  We must respond
+        # from the reservation sockets (which own those ports) BEFORE handing
+        # the ports to ffmpeg.  Non-ICE cameras start streaming SRTP straight
+        # away; any early SRTP packets landing on the reservation sockets are
+        # discarded, but the camera keeps streaming once ffmpeg is bound.
+        _webrtc_req_sdes_payload = json.dumps({
+            "method":  "webrtcReq",
+            "service": "IPC",
+            "devId":   device_id,
+            "srcAddr": f"{terminal_idx}.{user_id}",
+            "seq":     _seq(),
+            "tst":     int(time.time() * 1000),
+            **( {"userId": numeric_uid_raw} if numeric_uid_raw is not None else {} ),
+            "payload": {
+                "peerid":  peer_id,
+                "devId":   device_id,
+                "offer":   {"type": "offer", "sdp": sdes_offer_sdp},
+                "trackId": 0,
+                "dstAddr": user_id,
+            },
+        })
+        outgoing_q.put_nowait((webrtc_req_topic, _webrtc_req_sdes_payload))
+        _status(f"webrtcReq sent (SDES)  peerid={peer_id}")
+
+        # --- ICE STUN responder (runs while reservation sockets are still open) #
+        # Poll reservation sockets for up to 2.5 s, responding to any STUN
+        # binding requests from the camera's ICE agent.  Break early if no
+        # packet arrives for 0.5 s (non-ICE camera, skip the window).
+        import struct as _struct, select as _select
+        _STUN_MAGIC = b'\x21\x12\xa4\x42'
+        _stun_count = 0
+        _stun_deadline = time.monotonic() + 2.5
+        _last_pkt_t = time.monotonic()
+        for _rsock in (_audio_sock, _video_sock):
+            try:
+                _rsock.setblocking(False)
+            except Exception:
+                pass
+        while time.monotonic() < _stun_deadline:
+            # Break early if silent for 0.5 s — camera is not doing ICE
+            if time.monotonic() - _last_pkt_t > 0.5:
+                break
+            try:
+                _rlist, _, _ = _select.select(
+                    [_audio_sock, _video_sock], [], [], 0.1
+                )
+            except Exception:
+                break
+            for _sock in _rlist:
+                _last_pkt_t = time.monotonic()
+                try:
+                    _pkt, _src = _sock.recvfrom(2048)
+                except OSError:
+                    continue
+                if (len(_pkt) >= 20
+                        and _pkt[:2] == b'\x00\x01'
+                        and _pkt[4:8] == _STUN_MAGIC):
+                    _tid = _pkt[8:20]
+                    try:
+                        _ip_parts = [int(x) for x in _src[0].split('.')]
+                        _xip = bytes(
+                            a ^ b for a, b in zip(
+                                _struct.pack('!4B', *_ip_parts), _STUN_MAGIC
+                            )
+                        )
+                        _xport = (_src[1] ^ 0x2112) & 0xFFFF
+                        _xma = (b'\x00\x20\x00\x08\x00\x01'
+                                + _struct.pack('!H', _xport) + _xip)
+                        _resp = (b'\x01\x01'
+                                 + _struct.pack('!H', len(_xma))
+                                 + _STUN_MAGIC + _tid + _xma)
+                        _sock.sendto(_resp, _src)
+                        _stun_count += 1
+                    except Exception:
+                        pass
+        for _rsock in (_audio_sock, _video_sock):
+            try:
+                _rsock.setblocking(True)
+            except Exception:
+                pass
+        if _stun_count:
+            _status(f"ICE: responded to {_stun_count} STUN binding request(s)")
+
+        # --- Release reservation sockets so ffmpeg can bind exclusively ------ #
         for _rsock in (_audio_sock, _video_sock):
             try:
                 _rsock.close()
@@ -3551,27 +3647,7 @@ class DeviceClient(object):
             )
             await asyncio.sleep(1.5)
 
-        # --- Send webrtcReq — camera starts streaming to ffmpeg's ports ------ #
-        webrtc_req_payload = json.dumps({
-            "method":  "webrtcReq",
-            "service": "IPC",
-            "devId":   device_id,
-            "srcAddr": f"{terminal_idx}.{user_id}",
-            "seq":     _seq(),
-            "tst":     int(time.time() * 1000),
-            **( {"userId": numeric_uid_raw} if numeric_uid_raw is not None else {} ),
-            "payload": {
-                "peerid":  peer_id,
-                "devId":   device_id,
-                "offer":   {"type": "offer", "sdp": sdes_offer_sdp},
-                "trackId": 0,
-                "dstAddr": user_id,
-            },
-        })
-        outgoing_q.put_nowait((webrtc_req_topic, webrtc_req_payload))
-        _status(f"webrtcReq sent (SDES)  peerid={peer_id}")
-
-        # --- Wait for SDP answer (optional for SDES) ------------------------ #
+        # --- Wait for SDP answer -------------------------------------------- #
         # Wait for the camera's SDP answer.  True SDES cameras (e.g.
         # LK.IPC.A001513) send webrtcResp within a few seconds.  If no
         # answer arrives the camera is not operating in SDES mode — most
