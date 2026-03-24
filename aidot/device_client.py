@@ -2807,6 +2807,7 @@ class DeviceClient(object):
                     terminal_idx=terminal_idx,
                     outgoing_q=outgoing_q,
                     answer_fut=answer_fut,
+                    camera_offer_fut=camera_offer_fut,
                     loop=loop,
                     timeout=timeout,
                     output_path=output_path,
@@ -3399,6 +3400,7 @@ class DeviceClient(object):
         terminal_idx: str,
         outgoing_q,
         answer_fut,
+        camera_offer_fut,
         loop,
         timeout: float,
         output_path: Optional[str],
@@ -3584,6 +3586,39 @@ class DeviceClient(object):
         outgoing_q.put_nowait((webrtc_req_topic, _webrtc_req_sdes_payload))
         _status(f"webrtcReq sent (SDES)  peerid={peer_id}")
 
+        # --- Acknowledge camera's webrtcReq echo with webrtcResp ------------- #
+        # LK.IPC.A001064 echoes our offer back as webrtcReq before doing ICE.
+        # It will not start streaming until it receives a webrtcResp from us.
+        # Check for the echo within 2 s so the webrtcResp is sent while our
+        # reservation sockets are still open (camera's ICE may arrive next).
+        _cam_echo_received = False
+        try:
+            await _asyncio.wait_for(
+                _asyncio.shield(camera_offer_fut), timeout=2.0
+            )
+            _cam_echo_received = True
+            _status("camera webrtcReq echo received — sending webrtcResp to trigger streaming")
+            _webrtc_resp_sdes_topic = f"iot/v1/s/{user_id}/IPC/webrtcResp"
+            _webrtc_resp_sdes = json.dumps({
+                "method":  "webrtcResp",
+                "service": "IPC",
+                "devId":   device_id,
+                "srcAddr": f"{terminal_idx}.{user_id}",
+                "seq":     _seq(),
+                "tst":     int(time.time() * 1000),
+                **( {"userId": numeric_uid_raw} if numeric_uid_raw is not None else {} ),
+                "payload": {
+                    "peerid":  peer_id,
+                    "devId":   device_id,
+                    "answer":  {"type": "answer", "sdp": sdes_offer_sdp},
+                    "trackId": 0,
+                    "dstAddr": user_id,
+                },
+            })
+            outgoing_q.put_nowait((_webrtc_resp_sdes_topic, _webrtc_resp_sdes))
+        except _asyncio.TimeoutError:
+            pass  # no echo — camera uses a different signalling variant; proceed
+
         # --- ICE STUN responder (runs while reservation sockets are still open) #
         # Poll reservation sockets for up to 2.5 s, responding to any STUN
         # binding requests from the camera's ICE agent.  Break early if no
@@ -3747,7 +3782,14 @@ class DeviceClient(object):
                 % (len(_ans_mlines), " | ".join(_ans_mlines))
             )
         except asyncio.TimeoutError:
-            if dtls_fallback_ok:
+            if _cam_echo_received:
+                # We already sent webrtcResp in response to the camera's echo.
+                # The camera should now be streaming; keep ffmpeg running.
+                _status(
+                    f"no second webrtcResp in {_sdes_answer_timeout:.0f}s"
+                    " — camera acknowledged; continuing with ffmpeg"
+                )
+            elif dtls_fallback_ok:
                 # Camera likely requires DTLS despite enableSdes='1'.  Kill
                 # ffmpeg and signal the caller to retry with the DTLS path.
                 _status(
