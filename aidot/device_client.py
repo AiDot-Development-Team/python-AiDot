@@ -3338,7 +3338,6 @@ class DeviceClient(object):
         import tempfile
         import json
 
-        smarthome_auth = await self._async_get_smarthome_auth()
         user_id = user_id or str(self.user_id)
 
         webrtc_req_topic = f"iot/v1/s/{user_id}/IPC/webrtcReq"
@@ -3627,7 +3626,7 @@ class DeviceClient(object):
             self.seq_num = 1
             await self.login()
             self._connect_and_login = True
-        except Exception as e:
+        except Exception:
             self._connect_and_login = False
         finally:
             self._connecting = False
