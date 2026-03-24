@@ -3620,13 +3620,21 @@ class DeviceClient(object):
             pass  # no echo — camera uses a different signalling variant; proceed
 
         # --- ICE STUN responder (runs while reservation sockets are still open) #
-        # Poll reservation sockets for up to 2.5 s, responding to any STUN
-        # binding requests from the camera's ICE agent.  Break early if no
-        # packet arrives for 0.5 s (non-ICE camera, skip the window).
+        # Two-phase window:
+        #   Normal (no echo-reversal): exit after 0.5 s idle, max 2.5 s total.
+        #   Echo-reversal (A001064):   wait up to 8 s for ICE to start, then
+        #     exit 1.5 s after the last STUN packet (ICE silence = done).
+        #   SRTP early exit: if a non-STUN packet arrives (SRTP), ICE is done —
+        #     close sockets immediately so ffmpeg can bind.
         import struct as _struct, select as _select
         _STUN_MAGIC = b'\x21\x12\xa4\x42'
         _stun_count = 0
-        _stun_deadline = time.monotonic() + 2.5
+        _stun_seen = False
+        _srtp_detected = False
+        _stun_max = 8.0 if _cam_echo_received else 2.5
+        _idle_limit = 1.5      # exit after ICE silence once first STUN seen
+        _pre_stun_idle = 0.5   # exit early if no packet at all (non-ICE camera)
+        _stun_deadline = time.monotonic() + _stun_max
         _last_pkt_t = time.monotonic()
         for _rsock in (_audio_sock, _video_sock):
             try:
@@ -3634,9 +3642,13 @@ class DeviceClient(object):
             except Exception:
                 pass
         while time.monotonic() < _stun_deadline:
-            # Break early if silent for 0.5 s — camera is not doing ICE
-            if time.monotonic() - _last_pkt_t > 0.5:
-                break
+            # Idle-exit: threshold depends on whether we've seen any STUN yet
+            idle = time.monotonic() - _last_pkt_t
+            if _stun_seen:
+                if idle > _idle_limit:
+                    break   # ICE done (silence after STUN) — ffmpeg will pick up SRTP
+            elif idle > _pre_stun_idle:
+                break       # no STUN at all — non-ICE camera, skip window
             try:
                 _rlist, _, _ = _select.select(
                     [_audio_sock, _video_sock], [], [], 0.1
@@ -3652,6 +3664,7 @@ class DeviceClient(object):
                 if (len(_pkt) >= 20
                         and _pkt[:2] == b'\x00\x01'
                         and _pkt[4:8] == _STUN_MAGIC):
+                    _stun_seen = True
                     _tid = _pkt[8:20]
                     try:
                         _ip_parts = [int(x) for x in _src[0].split('.')]
@@ -3670,6 +3683,12 @@ class DeviceClient(object):
                         _stun_count += 1
                     except Exception:
                         pass
+                else:
+                    # Non-STUN packet = SRTP arriving — ICE is done, hand off to ffmpeg now
+                    _srtp_detected = True
+                    break   # inner per-socket loop
+            if _srtp_detected:
+                break       # outer while loop
         for _rsock in (_audio_sock, _video_sock):
             try:
                 _rsock.setblocking(True)
@@ -3677,6 +3696,8 @@ class DeviceClient(object):
                 pass
         if _stun_count:
             _status(f"ICE: responded to {_stun_count} STUN binding request(s)")
+        if _srtp_detected:
+            _status("SRTP detected — exiting STUN window, handing off to ffmpeg")
 
         # --- Release reservation sockets so ffmpeg can bind exclusively ------ #
         for _rsock in (_audio_sock, _video_sock):
