@@ -2577,6 +2577,7 @@ class DeviceClient(object):
         # ------------------------------------------------------------------ #
         outgoing_q:       _q_mod.Queue    = _q_mod.Queue()
         answer_fut:       asyncio.Future  = loop.create_future()
+        camera_offer_fut: asyncio.Future  = loop.create_future()  # set when camera sends webrtcReq (role-reversal)
         ice_q:            asyncio.Queue   = asyncio.Queue()
         camera_ready_ev:  asyncio.Event   = asyncio.Event()  # set when camera is on MQTT
         liveplay_echo_ev: asyncio.Event   = asyncio.Event()  # set when livePlayReq echo arrives
@@ -2660,6 +2661,25 @@ class DeviceClient(object):
                 cand = inner.get("candidate") or {}
                 if cand.get("candidate"):
                     loop.call_soon_threadsafe(ice_q.put_nowait, cand)
+            elif method == "webrtcReq":
+                # Camera acting as WebRTC offerer (role reversal observed on
+                # LK.IPC.A001064).  Set camera_offer_fut so the DTLS path can
+                # respond with a proper webrtcResp answer.
+                resp_pid  = inner.get("peerid")
+                cam_offer = inner.get("offer") or {}
+                if (cam_offer.get("sdp")
+                        and (resp_pid == peer_id
+                             or inner.get("devId") == device_id
+                             or inner.get("dstAddr") == user_id)):
+                    if not camera_offer_fut.done():
+                        loop.call_soon_threadsafe(
+                            camera_offer_fut.set_result, cam_offer
+                        )
+                loop.call_soon_threadsafe(
+                    lambda m=method, p=inner, t=topic: _status(
+                        f"camera replied  topic={t}  method={m!r}  payload={p!r}"
+                    )
+                )
             else:
                 loop.call_soon_threadsafe(
                     lambda m=method, p=inner, t=topic: _status(
@@ -3162,24 +3182,6 @@ class DeviceClient(object):
         # ------------------------------------------------------------------ #
         # Wait for SDP answer from camera
         # ------------------------------------------------------------------ #
-        try:
-            answer = await asyncio.wait_for(answer_fut, timeout=timeout)
-        except asyncio.TimeoutError:
-            _status(f"no webrtcResp in {timeout}s")
-            outgoing_q.put_nowait(None)
-            await pc.close()
-            raise RuntimeError(
-                f"async_open_webrtc_stream: no webrtcResp received within {timeout}s"
-            )
-
-        _ans_sdp = answer["sdp"]
-        _ans_mlines = [ln for ln in _ans_sdp.splitlines() if ln.startswith("m=")]
-        _status(
-            f"webrtcResp received — m=video={_sdp_transport(_ans_sdp, 'video')}"
-            f"  m=audio={_sdp_transport(_ans_sdp, 'audio')}"
-        )
-        _status("Answer m-sections (%d): %s" % (len(_ans_mlines), " | ".join(_ans_mlines)))
-
         def _patch_answer_mid2_for_aiortc(sdp: str) -> str:
             """Make the camera's H265 answer digestible by aiortc.
 
@@ -3216,21 +3218,98 @@ class DeviceClient(object):
                 result.extend(new_sec)
             return '\r\n'.join(result)
 
-        _ans_sdp_aiortc = _patch_answer_mid2_for_aiortc(_ans_sdp)
-        try:
-            await pc.setRemoteDescription(
-                RTCSessionDescription(
-                    sdp=_ans_sdp_aiortc,
-                    type=answer.get("type", "answer"),
-                )
-            )
-        except Exception as exc:
-            _status(f"setRemoteDescription failed: {exc}")
+        # Wait for EITHER webrtcResp (normal) OR webrtcReq from camera (role reversal).
+        # Some firmware (e.g. LK.IPC.A001064) responds to our offer by sending back
+        # its own webrtcReq (counter-offer) instead of a webrtcResp answer.
+        _rr_done, _rr_pending = await asyncio.wait(
+            {answer_fut, camera_offer_fut},
+            timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for _f in _rr_pending:
+            _f.cancel()
+
+        if not _rr_done:
+            _status(f"no webrtcResp in {timeout}s")
             outgoing_q.put_nowait(None)
             await pc.close()
             raise RuntimeError(
-                f"async_open_webrtc_stream: setRemoteDescription failed: {exc}"
-            ) from exc
+                f"async_open_webrtc_stream: no webrtcResp received within {timeout}s"
+            )
+
+        if camera_offer_fut in _rr_done and not answer_fut.done():
+            # ---- ROLE REVERSAL path (e.g. LK.IPC.A001064) ---------------------- #
+            # Camera sent webrtcReq (its offer) instead of webrtcResp.
+            # Treat the camera's SDP as the answer to our local offer, then send
+            # webrtcResp so the camera can complete the DTLS handshake.
+            _camera_offer_sdp = camera_offer_fut.result().get("sdp", "")
+            _status(
+                "camera sent webrtcReq (role reversal) — answering and sending webrtcResp"
+            )
+            # Patch a=setup: actpass → active so the camera is the DTLS client and
+            # we are the DTLS server (passive); camera will connect to our ports.
+            _camera_offer_sdp = _camera_offer_sdp.replace(
+                "a=setup:actpass\r\n", "a=setup:active\r\n"
+            )
+            _cam_sdp_aiortc = _patch_answer_mid2_for_aiortc(_camera_offer_sdp)
+            try:
+                await pc.setRemoteDescription(
+                    RTCSessionDescription(sdp=_cam_sdp_aiortc, type="answer")
+                )
+            except Exception as _exc:
+                _status(f"setRemoteDescription (role-reversal) failed: {_exc}")
+                outgoing_q.put_nowait(None)
+                await pc.close()
+                raise RuntimeError(
+                    f"async_open_webrtc_stream: setRemoteDescription failed: {_exc}"
+                ) from _exc
+            # Send webrtcResp so the camera knows our DTLS fingerprint and ICE params.
+            _webrtc_resp_topic   = f"iot/v1/s/{user_id}/IPC/webrtcResp"
+            _webrtc_resp_payload = json.dumps({
+                "method":  "webrtcResp",
+                "service": "IPC",
+                "devId":   device_id,
+                "srcAddr": f"{terminal_idx}.{user_id}",
+                "seq":     _seq(),
+                "tst":     int(time.time() * 1000),
+                **( {"userId": numeric_uid_raw} if numeric_uid_raw is not None else {} ),
+                "payload": {
+                    "peerid":  peer_id,
+                    "devId":   device_id,
+                    "answer":  {"type": "answer", "sdp": pc.localDescription.sdp},
+                    "trackId": 0,
+                    "dstAddr": user_id,
+                },
+            })
+            outgoing_q.put_nowait((_webrtc_resp_topic, _webrtc_resp_payload))
+            _status("webrtcResp sent (role-reversal answer)")
+
+        else:
+            # ---- NORMAL path: camera sent webrtcResp ---------------------------- #
+            answer   = answer_fut.result()
+            _ans_sdp = answer["sdp"]
+            _ans_mlines = [ln for ln in _ans_sdp.splitlines() if ln.startswith("m=")]
+            _status(
+                f"webrtcResp received — m=video={_sdp_transport(_ans_sdp, 'video')}"
+                f"  m=audio={_sdp_transport(_ans_sdp, 'audio')}"
+            )
+            _status("Answer m-sections (%d): %s" % (len(_ans_mlines), " | ".join(_ans_mlines)))
+
+            _ans_sdp_aiortc = _patch_answer_mid2_for_aiortc(_ans_sdp)
+            try:
+                await pc.setRemoteDescription(
+                    RTCSessionDescription(
+                        sdp=_ans_sdp_aiortc,
+                        type=answer.get("type", "answer"),
+                    )
+                )
+            except Exception as exc:
+                _status(f"setRemoteDescription failed: {exc}")
+                outgoing_q.put_nowait(None)
+                await pc.close()
+                raise RuntimeError(
+                    f"async_open_webrtc_stream: setRemoteDescription failed: {exc}"
+                ) from exc
 
         # ------------------------------------------------------------------ #
         # Apply remote ICE candidates + wait for ICE connection
