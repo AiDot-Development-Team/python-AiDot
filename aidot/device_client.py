@@ -3699,6 +3699,73 @@ class DeviceClient(object):
         if _srtp_detected:
             _status("SRTP detected — exiting STUN window, handing off to ffmpeg")
 
+        # --- Harvest camera's webrtcResp answer (may have arrived during STUN window) --- #
+        # The asyncio event loop was blocked by the synchronous STUN loop.  Any
+        # call_soon_threadsafe(answer_fut.set_result, …) from the MQTT thread is
+        # queued but hasn't fired yet.  One asyncio cycle resolves it.
+        await asyncio.sleep(0)
+        _pre_launch_answer_sdp: str = ""
+        if answer_fut.done():
+            try:
+                _pre_ans = answer_fut.result()
+                _pre_launch_answer_sdp = (_pre_ans or {}).get("sdp", "")
+            except Exception:
+                pass
+        if _pre_launch_answer_sdp:
+            _LOGGER.warning(
+                "_open_sdes_stream: camera webrtcResp answer SDP:\n%s",
+                _pre_launch_answer_sdp,
+            )
+            import re as _re
+
+            def _sdes_key_from_sdp(sdp, media):
+                """Return the inline key from the first a=crypto line in the named m-section."""
+                in_sec = False
+                for ln in sdp.splitlines():
+                    if ln.startswith(f"m={media}"):
+                        in_sec = True
+                    elif ln.startswith("m=") and in_sec:
+                        break
+                    elif in_sec and ln.startswith("a=crypto:"):
+                        _m = _re.search(r"inline:([A-Za-z0-9+/=]+)", ln)
+                        if _m:
+                            return _m.group(1)
+                return ""
+
+            _cam_key_audio = _sdes_key_from_sdp(_pre_launch_answer_sdp, "audio")
+            _cam_key_video = _sdes_key_from_sdp(_pre_launch_answer_sdp, "video")
+            if _cam_key_audio and _cam_key_audio != srtp_key_audio:
+                _status("Using camera's audio SRTP key from answer (was our offer key)")
+                srtp_key_audio = _cam_key_audio
+            if _cam_key_video and _cam_key_video != srtp_key_video:
+                _status("Using camera's video SRTP key from answer (was our offer key)")
+                srtp_key_video = _cam_key_video
+            # Rewrite SDP file on disk with the (potentially updated) keys.
+            _ts = int(time.time())
+            _updated_sdp = (
+                "v=0\r\n"
+                f"o=- {_ts} {_ts} IN IP4 0.0.0.0\r\n"
+                "s=aidot-sdes-rx\r\n"
+                "t=0 0\r\n"
+                f"m=audio {audio_port} RTP/SAVPF 0 8\r\n"
+                "c=IN IP4 0.0.0.0\r\n"
+                f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_audio}\r\n"
+                "a=rtpmap:0 PCMU/8000\r\n"
+                "a=rtpmap:8 PCMA/8000\r\n"
+                f"m=video {video_port} RTP/SAVPF 96 97\r\n"
+                "c=IN IP4 0.0.0.0\r\n"
+                f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_video}\r\n"
+                "a=rtpmap:96 H264/90000\r\n"
+                "a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;"
+                "profile-level-id=42e01f\r\n"
+                "a=rtpmap:97 H265/90000\r\n"
+            )
+            try:
+                with open(sdp_path, "w") as _sdp_f:
+                    _sdp_f.write(_updated_sdp)
+            except Exception as _sdp_exc:
+                _LOGGER.warning("_open_sdes_stream: could not rewrite SDP: %s", _sdp_exc)
+
         # --- Release reservation sockets so ffmpeg can bind exclusively ------ #
         for _rsock in (_audio_sock, _video_sock):
             try:
