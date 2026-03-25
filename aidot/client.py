@@ -310,14 +310,6 @@ class AidotClient:
                         device[CONF_PRODUCT] = product
         except Exception as e:
             raise e
-
-        # Share the full device ID list with every DeviceClient so that
-        # batchGetDeviceUserInfo is called with all IDs (the server may return
-        # empty results when only a single device ID is sent).
-        all_ids = [d.get(CONF_ID) for d in final_device_list if d.get(CONF_ID)]
-        for dc in self._device_clients.values():
-            dc._all_device_ids = all_ids
-
         return {CONF_DEVICE_LIST: final_device_list}
 
     def get_device_client(self, device: dict[str, Any]) -> DeviceClient:
@@ -327,11 +319,6 @@ class AidotClient:
             device_client = DeviceClient(device, self.login_info)
             self._device_clients[device_id] = device_client
             asyncio.get_running_loop().create_task(device_client.ping_task())
-            # Propagate the full device-ID list to all clients (including the
-            # newly created one) so batchGetDeviceUserInfo works correctly.
-            all_ids = list(self._device_clients.keys())
-            for dc in self._device_clients.values():
-                dc._all_device_ids = all_ids
         if self._discover is not None:
             ip = self._discover.discovered_device.get(device_id)
             device_client.update_ip_address(ip)

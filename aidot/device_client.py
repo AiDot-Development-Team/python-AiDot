@@ -1518,13 +1518,6 @@ class DeviceClient(object):
         # Raw device dict retained for transport-type detection (isDTLS field)
         self._raw_device: dict = device
 
-        # Full list of device IDs for this account.  Used when calling
-        # batchGetDeviceUserInfo so the server returns data for this device
-        # (sending only one ID may yield an empty response).  Populated by
-        # AidotClient after the full device list is fetched; falls back to
-        # just this device's ID so standalone DeviceClient usage still works.
-        self._all_device_ids: list = [self.device_id]
-
         if CONF_AES_KEY in device:
             key_string = device[CONF_AES_KEY][0]
             if key_string is not None:
@@ -2528,9 +2521,7 @@ class DeviceClient(object):
         # 1. Additional MQTT subscriptions (cameras may route webrtcResp by numeric ID)
         # 2. Injecting "userId" into the IPC message envelope so camera firmware can
         #    validate the caller (LK.IPC.A001064 silently ignores offers without it).
-        _cam_user_info = await self.async_get_device_user_info(
-            all_device_ids=self._all_device_ids or None
-        )
+        _cam_user_info = await self.async_get_device_user_info()
         _numeric_uid_raw = (_cam_user_info or {}).get("userId")
         if _numeric_uid_raw is not None:
             try:
