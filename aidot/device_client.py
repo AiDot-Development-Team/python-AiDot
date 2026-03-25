@@ -2618,10 +2618,16 @@ class DeviceClient(object):
             method = msg.get("method") or ""
             inner  = msg.get("payload") or {}
             # Fire camera_ready_ev the moment the camera appears on MQTT — either via its
-            # explicit wake-ACK (lowPowerActiveStateResp) or any message on the device channel.
+            # explicit wake-ACK (lowPowerActiveStateResp), any message on the device channel,
+            # OR any message on the user channel whose payload identifies our device.
+            # LK.IPC.A001064 (and similar) responds on the user channel (iot/v1/c/{userId}/…)
+            # rather than the device channel, so the old topic-prefix check never fired —
+            # causing the 17-second getIceConfigReq timeout overhead every session.
             if (method == "lowPowerActiveStateResp"
                     or topic.startswith(f"iot/v1/c/{device_id}/")
-                    or topic.startswith(f"lds/v1/cb/{device_id}/")):
+                    or topic.startswith(f"lds/v1/cb/{device_id}/")
+                    or inner.get("devId") == device_id
+                    or msg.get("devId") == device_id):
                 loop.call_soon_threadsafe(camera_ready_ev.set)
             # livePlayReq echo: broker/camera confirmed delivery of our livePlayReq.
             # Signal _open_sdes_stream to proceed with webrtcReq.
@@ -3631,6 +3637,44 @@ class DeviceClient(object):
             outgoing_q.put_nowait((_webrtc_resp_sdes_topic, _webrtc_resp_sdes))
         except _asyncio.TimeoutError:
             pass  # no echo — camera uses a different signalling variant; proceed
+
+        # --- Announce our ICE candidates via MQTT (iceCandidateReq) ----------- #
+        # The iOS app always sends iceCandidateReq after webrtcReq/webrtcResp.
+        # ICE-capable cameras (e.g. LK.IPC.A001064) wait for this trickle-ICE
+        # message before initiating STUN connectivity checks, even when the same
+        # candidates are already present in the SDP a=candidate lines.  Without
+        # this step the camera sits idle and never sends STUN — resulting in 0
+        # frames.  Non-ICE cameras (e.g. LK.IPC.A001513) ignore iceCandidateReq
+        # and begin streaming immediately from the SDP exchange, so sending these
+        # messages is safe for all camera models.
+        _ice_cand_topic_sdes = f"iot/v1/s/{user_id}/IPC/iceCandidateReq"
+        for _ice_mid, _ice_port in (("0", audio_port), ("1", video_port)):
+            _ice_cand_msg = json.dumps({
+                "method":  "iceCandidateReq",
+                "service": "IPC",
+                "devId":   device_id,
+                "srcAddr": f"{terminal_idx}.{user_id}",
+                "seq":     _seq(),
+                "tst":     int(time.time() * 1000),
+                **( {"userId": numeric_uid_raw} if numeric_uid_raw is not None else {} ),
+                "payload": {
+                    "peerid":    peer_id,
+                    "devId":     device_id,
+                    "candidate": {
+                        "candidate":     (
+                            f"candidate:1 1 udp 2130706431"
+                            f" {local_ip} {_ice_port} typ host"
+                        ),
+                        "sdpMid":        _ice_mid,
+                        "sdpMLineIndex": int(_ice_mid),
+                    },
+                    "dstAddr": user_id,
+                },
+            })
+            outgoing_q.put_nowait((_ice_cand_topic_sdes, _ice_cand_msg))
+        _status(
+            f"iceCandidateReq sent  audio={audio_port}  video={video_port}"
+        )
 
         # --- ICE STUN responder (runs while reservation sockets are still open) #
         # Two-phase window:
