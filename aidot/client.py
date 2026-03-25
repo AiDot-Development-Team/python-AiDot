@@ -310,6 +310,14 @@ class AidotClient:
                         device[CONF_PRODUCT] = product
         except Exception as e:
             raise e
+
+        # Share the full device ID list with every DeviceClient so that
+        # batchGetDeviceUserInfo is called with all IDs (the server may return
+        # empty results when only a single device ID is sent).
+        all_ids = [d.get(CONF_ID) for d in final_device_list if d.get(CONF_ID)]
+        for dc in self._device_clients.values():
+            dc._all_device_ids = all_ids
+
         return {CONF_DEVICE_LIST: final_device_list}
 
     def get_device_client(self, device: dict[str, Any]) -> DeviceClient:
