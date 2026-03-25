@@ -2827,6 +2827,7 @@ class DeviceClient(object):
                     liveplay_echo_ev=liveplay_echo_ev,
                     numeric_uid_raw=_numeric_uid_raw,
                     dtls_fallback_ok=_dtls_fallback_ok,
+                    second_answer_fut=second_answer_fut,
                 )
             except DeviceClient._SdesNoAnswerError:
                 # Camera reported enableSdes='1' but did not respond to our SDES
@@ -3420,6 +3421,7 @@ class DeviceClient(object):
         liveplay_echo_ev,
         numeric_uid_raw=None,
         dtls_fallback_ok: bool = True,
+        second_answer_fut=None,
     ) -> "SdesSession":
         """SDES-SRTP streaming path using a hand-crafted SDP offer and ffmpeg.
 
@@ -3883,14 +3885,14 @@ class DeviceClient(object):
             # For echo-reversal cameras (A001064) the first answer_fut was set by
             # the broker echo of our own webrtcResp.  Wait briefly for the camera's
             # real second webrtcResp, which may carry a different SRTP key.
-            if _cam_echo_received and not second_answer_fut.done():
+            if second_answer_fut is not None and _cam_echo_received and not second_answer_fut.done():
                 try:
                     _second_ans = await asyncio.wait_for(
                         asyncio.shield(second_answer_fut), timeout=5.0
                     )
                 except asyncio.TimeoutError:
                     _second_ans = None
-            elif second_answer_fut.done():
+            elif second_answer_fut is not None and second_answer_fut.done():
                 try:
                     _second_ans = second_answer_fut.result()
                 except Exception:
