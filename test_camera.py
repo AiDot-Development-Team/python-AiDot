@@ -219,6 +219,9 @@ async def run(args: argparse.Namespace) -> None:
         # Run selected tests
         for cam in cameras:
             dc = client.get_device_client(cam)
+            # Ensure batchGetDeviceUserInfo uses all device IDs (server may
+            # return empty results if only a single device ID is sent).
+            dc._all_device_ids = _all_camera_ids
             print(f"\n{'='*60}")
             print(f"Camera: {cam.get('name')}  ({cam.get('id')})")
             print(f"{'='*60}")
