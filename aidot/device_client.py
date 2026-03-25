@@ -3499,26 +3499,40 @@ class DeviceClient(object):
             f"o=- {ts} {ts} IN IP4 {local_ip}\r\n"
             "s=-\r\n"
             "t=0 0\r\n"
+            # audio m-section
+            # a=crypto MUST precede ICE attributes (RFC 4568 §9.1) so that
+            # linear-parsing camera firmware recognises this as an SDES offer
+            # rather than a pure-ICE offer and does not discard the key.
             f"m=audio {audio_port} RTP/SAVPF 0 8\r\n"
             f"c=IN IP4 {local_ip}\r\n"
             "a=recvonly\r\n"
             "a=mid:0\r\n"
-            f"a=ice-ufrag:{_ufrag_a}\r\n"
-            f"a=ice-pwd:{_pwd_a}\r\n"
             f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_audio}\r\n"
             "a=rtpmap:0 PCMU/8000\r\n"
             "a=rtpmap:8 PCMA/8000\r\n"
+            # a=rtcp-mux: multiplexes RTCP onto the RTP port so the camera does
+            # not send RTCP to audio_port+1 (which is never bound), and so that
+            # ffmpeg does not try to open a separate RTCP socket.
+            "a=rtcp-mux\r\n"
+            f"a=ice-ufrag:{_ufrag_a}\r\n"
+            f"a=ice-pwd:{_pwd_a}\r\n"
             f"a=candidate:1 1 udp 2130706431 {local_ip} {audio_port} typ host\r\n"
+            # video m-section
             f"m=video {video_port} RTP/SAVPF 96 97\r\n"
             f"c=IN IP4 {local_ip}\r\n"
             "a=recvonly\r\n"
             "a=mid:1\r\n"
-            f"a=ice-ufrag:{_ufrag_v}\r\n"
-            f"a=ice-pwd:{_pwd_v}\r\n"
             f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_video}\r\n"
             "a=rtpmap:96 H264/90000\r\n"
             "a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n"
             "a=rtpmap:97 H265/90000\r\n"
+            # a=fmtp:97: Leedarson firmware echoes back exactly the fmtp it
+            # received; without this line it may reject PT 97 or downgrade to
+            # H264 only.
+            "a=fmtp:97 level-id=93\r\n"
+            "a=rtcp-mux\r\n"
+            f"a=ice-ufrag:{_ufrag_v}\r\n"
+            f"a=ice-pwd:{_pwd_v}\r\n"
             f"a=candidate:1 1 udp 2130706431 {local_ip} {video_port} typ host\r\n"
         )
 
@@ -3576,12 +3590,17 @@ class DeviceClient(object):
             f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_audio}\r\n"
             "a=rtpmap:0 PCMU/8000\r\n"
             "a=rtpmap:8 PCMA/8000\r\n"
+            # a=rtcp-mux prevents ffmpeg from trying to bind audio_port+1 for
+            # RTCP (a separate socket that is never needed here).
+            "a=rtcp-mux\r\n"
             f"m=video {video_port} RTP/SAVPF 96 97\r\n"
             "c=IN IP4 0.0.0.0\r\n"
             f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_video}\r\n"
             "a=rtpmap:96 H264/90000\r\n"
             "a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n"
             "a=rtpmap:97 H265/90000\r\n"
+            "a=fmtp:97 level-id=93\r\n"
+            "a=rtcp-mux\r\n"
         )
 
         sdp_fd, sdp_path = tempfile.mkstemp(suffix=".sdp", prefix="aidot_sdes_")
