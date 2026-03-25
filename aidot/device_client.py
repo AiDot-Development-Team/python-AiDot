@@ -2579,8 +2579,9 @@ class DeviceClient(object):
         # MQTT ↔ asyncio bridge
         # ------------------------------------------------------------------ #
         outgoing_q:       _q_mod.Queue    = _q_mod.Queue()
-        answer_fut:       asyncio.Future  = loop.create_future()
-        camera_offer_fut: asyncio.Future  = loop.create_future()  # set when camera sends webrtcReq (role-reversal)
+        answer_fut:        asyncio.Future = loop.create_future()
+        second_answer_fut: asyncio.Future = loop.create_future()   # captures discarded broker-echo camera's real webrtcResp
+        camera_offer_fut:  asyncio.Future = loop.create_future()  # set when camera sends webrtcReq (role-reversal)
         ice_q:            asyncio.Queue   = asyncio.Queue()
         camera_ready_ev:  asyncio.Event   = asyncio.Event()  # set when camera is on MQTT
         liveplay_echo_ev: asyncio.Event   = asyncio.Event()  # set when livePlayReq echo arrives
@@ -2655,6 +2656,16 @@ class DeviceClient(object):
                     return
                 if not answer_fut.done():
                     loop.call_soon_threadsafe(answer_fut.set_result, answer)
+                else:
+                    # Second webrtcResp — likely the camera's real answer (the first
+                    # was the broker echo of our own webrtcResp).  Capture and log it.
+                    _LOGGER.warning(
+                        "SDES: second webrtcResp received (answer_fut already set)"
+                        " — camera real answer SDP:\n%s",
+                        answer.get("sdp", "<empty>"),
+                    )
+                    if not second_answer_fut.done():
+                        loop.call_soon_threadsafe(second_answer_fut.set_result, answer)
             elif method == "iceCandidateReq":
                 resp_pid = inner.get("peerid")
                 if (resp_pid != peer_id
@@ -3869,6 +3880,90 @@ class DeviceClient(object):
                 "webrtcResp received (SDES) — answer m-sections (%d): %s"
                 % (len(_ans_mlines), " | ".join(_ans_mlines))
             )
+            # For echo-reversal cameras (A001064) the first answer_fut was set by
+            # the broker echo of our own webrtcResp.  Wait briefly for the camera's
+            # real second webrtcResp, which may carry a different SRTP key.
+            if _cam_echo_received and not second_answer_fut.done():
+                try:
+                    _second_ans = await asyncio.wait_for(
+                        asyncio.shield(second_answer_fut), timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    _second_ans = None
+            elif second_answer_fut.done():
+                try:
+                    _second_ans = second_answer_fut.result()
+                except Exception:
+                    _second_ans = None
+            else:
+                _second_ans = None
+
+            if _second_ans:
+                _second_sdp = _second_ans.get("sdp", "")
+                if _second_sdp:
+                    _status("camera real webrtcResp — extracting SRTP keys")
+                    import re as _re2
+
+                    def _extract_key(sdp, media):
+                        _in_sec = False
+                        for _ln in sdp.splitlines():
+                            if _ln.startswith(f"m={media}"):
+                                _in_sec = True
+                            elif _ln.startswith("m=") and _in_sec:
+                                break
+                            elif _in_sec and _ln.startswith("a=crypto:"):
+                                _km = _re2.search(r"inline:([A-Za-z0-9+/=]+)", _ln)
+                                if _km:
+                                    return _km.group(1)
+                        return ""
+
+                    _real_key_audio = _extract_key(_second_sdp, "audio")
+                    _real_key_video = _extract_key(_second_sdp, "video")
+                    _keys_changed = False
+                    if _real_key_audio and _real_key_audio != srtp_key_audio:
+                        _status("camera audio SRTP key differs from offer — restarting ffmpeg")
+                        srtp_key_audio = _real_key_audio
+                        _keys_changed = True
+                    if _real_key_video and _real_key_video != srtp_key_video:
+                        _status("camera video SRTP key differs from offer — restarting ffmpeg")
+                        srtp_key_video = _real_key_video
+                        _keys_changed = True
+                    if _keys_changed:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=2)
+                        except Exception:
+                            proc.kill()
+                        _ts2 = int(time.time())
+                        _new_sdp = (
+                            "v=0\r\n"
+                            f"o=- {_ts2} {_ts2} IN IP4 0.0.0.0\r\n"
+                            "s=aidot-sdes-rx\r\n"
+                            "t=0 0\r\n"
+                            f"m=audio {audio_port} RTP/SAVPF 0 8\r\n"
+                            "c=IN IP4 0.0.0.0\r\n"
+                            f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_audio}\r\n"
+                            "a=rtpmap:0 PCMU/8000\r\n"
+                            "a=rtpmap:8 PCMA/8000\r\n"
+                            f"m=video {video_port} RTP/SAVPF 96 97\r\n"
+                            "c=IN IP4 0.0.0.0\r\n"
+                            f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_video}\r\n"
+                            "a=rtpmap:96 H264/90000\r\n"
+                            "a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;"
+                            "profile-level-id=42e01f\r\n"
+                            "a=rtpmap:97 H265/90000\r\n"
+                        )
+                        try:
+                            with open(sdp_path, "w") as _f2:
+                                _f2.write(_new_sdp)
+                        except Exception as _sdp_exc2:
+                            _LOGGER.warning("could not rewrite SDP for restart: %s", _sdp_exc2)
+                        proc = subprocess.Popen(
+                            cmd,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                        )
+                        _status("ffmpeg restarted with camera's SRTP keys")
         except asyncio.TimeoutError:
             if _cam_echo_received:
                 # We already sent webrtcResp in response to the camera's echo.
