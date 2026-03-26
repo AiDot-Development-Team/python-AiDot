@@ -1518,6 +1518,9 @@ class DeviceClient(object):
         # Raw device dict retained for transport-type detection (isDTLS field)
         self._raw_device: dict = device
 
+        self.password = device.get(CONF_PASSWORD)
+        self.device_id = device.get(CONF_ID)
+
         # Full list of device IDs for this account.  Used when calling
         # batchGetDeviceUserInfo so the server returns data for this device
         # (sending only one ID may yield an empty response).  Populated by
@@ -1531,9 +1534,6 @@ class DeviceClient(object):
                 self.aes_key = bytearray(16)
                 key_bytes = key_string.encode()
                 self.aes_key[: len(key_bytes)] = key_bytes
-
-        self.password = device.get(CONF_PASSWORD)
-        self.device_id = device.get(CONF_ID)
         self._simpleVersion = device.get("simpleVersion")
 
     # -- Camera helpers ------------------------------------------------------ #
