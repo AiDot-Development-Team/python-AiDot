@@ -2291,12 +2291,25 @@ class DeviceClient(object):
 
         uid = await self.async_get_p2p_uid()
         if not uid:
-            _LOGGER.error(
-                "async_open_live_stream: p2pId not available for %s. "
-                "Ensure batchGetDeviceUserInfo returns data (check auth/request "
-                "format) or that the smarthome getP2pId endpoint is reachable.",
-                self.device_id,
-            )
+            props = getattr(self, "_raw_device", {}).get("properties") or {}
+            is_webrtc = (str(props.get("enableSdes", "0")) == "1"
+                         or str(props.get("liveType", "0")) == "2")
+            if is_webrtc:
+                _LOGGER.error(
+                    "async_open_live_stream: p2pId not available for %s — "
+                    "this camera uses WebRTC streaming (enableSdes=%s, liveType=%s); "
+                    "use async_open_webrtc_stream() for live video.",
+                    self.device_id,
+                    props.get("enableSdes", "0"),
+                    props.get("liveType", "0"),
+                )
+            else:
+                _LOGGER.error(
+                    "async_open_live_stream: p2pId not available for %s. "
+                    "Ensure batchGetDeviceUserInfo returns data (check auth/request "
+                    "format) or that the smarthome getP2pId endpoint is reachable.",
+                    self.device_id,
+                )
             return None
 
         _LOGGER.debug(

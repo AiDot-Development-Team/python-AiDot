@@ -498,13 +498,15 @@ async def run(args: argparse.Namespace) -> None:
                         for _logline in _sniff_status.get("log", [])[-10:]:
                             print(f"      paho: {_logline}")
 
-            if args.live and not args.diag_mqtt:
+            if args.live and not args.diag_mqtt and not args.webrtc:
                 print(f"\n[LIVE] Opening live stream for {cam.get('name', cam.get('id'))} ...")
                 print("    (Ctrl+C to stop early)")
 
                 session = await dc.async_open_live_stream(on_frame)
                 if session is None:
                     print("    FAILED to open live stream session.")
+                    if dc.is_sdes_camera:
+                        print("    (This camera uses WebRTC/SDES streaming — try --webrtc)")
                 else:
                     print(f"    Session open — streaming for {args.live_seconds}s ...")
                     try:
