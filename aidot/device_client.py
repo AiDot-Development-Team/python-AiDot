@@ -2013,7 +2013,17 @@ class DeviceClient(object):
                 return data.get(self.device_id) or next(iter(data.values()), None)
             if isinstance(data, list):
                 for item in data:
-                    if isinstance(item, dict) and item.get("deviceId") == self.device_id:
+                    # Server may use "deviceId", "devId", or "id" as the device
+                    # identifier field.  Try all variants so that the correct
+                    # camera's entry is returned even when the field name differs
+                    # from the most-common "deviceId".  Without this, the code
+                    # falls back to data[0] (the first camera in the batch),
+                    # producing the wrong numeric userId and broken MQTT topics.
+                    if isinstance(item, dict) and (
+                        item.get("deviceId") == self.device_id
+                        or item.get("devId") == self.device_id
+                        or item.get("id") == self.device_id
+                    ):
                         return item
                 return data[0] if data else None
         except Exception as exc:
@@ -3850,6 +3860,7 @@ class DeviceClient(object):
                 f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_audio}\r\n"
                 "a=rtpmap:0 PCMU/8000\r\n"
                 "a=rtpmap:8 PCMA/8000\r\n"
+                "a=rtcp-mux\r\n"
                 f"m=video {video_port} RTP/SAVPF 96 97\r\n"
                 "c=IN IP4 0.0.0.0\r\n"
                 f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_video}\r\n"
@@ -3857,6 +3868,8 @@ class DeviceClient(object):
                 "a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;"
                 "profile-level-id=42e01f\r\n"
                 "a=rtpmap:97 H265/90000\r\n"
+                "a=fmtp:97 level-id=93\r\n"
+                "a=rtcp-mux\r\n"
             )
             try:
                 with open(sdp_path, "w") as _sdp_f:
@@ -4032,6 +4045,7 @@ class DeviceClient(object):
                             f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_audio}\r\n"
                             "a=rtpmap:0 PCMU/8000\r\n"
                             "a=rtpmap:8 PCMA/8000\r\n"
+                            "a=rtcp-mux\r\n"
                             f"m=video {video_port} RTP/SAVPF 96 97\r\n"
                             "c=IN IP4 0.0.0.0\r\n"
                             f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_video}\r\n"
@@ -4039,6 +4053,8 @@ class DeviceClient(object):
                             "a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;"
                             "profile-level-id=42e01f\r\n"
                             "a=rtpmap:97 H265/90000\r\n"
+                            "a=fmtp:97 level-id=93\r\n"
+                            "a=rtcp-mux\r\n"
                         )
                         try:
                             with open(sdp_path, "w") as _f2:
