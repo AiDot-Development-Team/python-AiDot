@@ -107,7 +107,8 @@ class DeviceClient(object):
     _ip_address: str = None
     device_id: str
     _is_close: bool = False
-    _status_fresh_cb: Any = None
+    on_status_update: Any = None
+    _receive_task: Any = None
     @property
     def connect_and_login(self) -> bool:
         return self._connect_and_login
@@ -225,19 +226,24 @@ class DeviceClient(object):
             self.ascNumber = json_data[CONF_PAYLOAD][CONF_ASCNUMBER]
             self.ascNumber += 1
             self.status.online = True
-            asyncio.get_running_loop().create_task(self.reveive_data())
+            self._receive_task = asyncio.create_task(
+                self.reveive_data(),
+                name=f"aidot_receive_{self.device_id}"
+            )
+            self._schedule_ping()
             _LOGGER.info(f"connect device success: {self._ip_address}")
             await self.send_action({}, "getDevAttrReq")
         except Exception as e:
             _LOGGER.error(f"connect device error : {e}")
             return
 
-        
-
     async def reveive_data(self) -> None:
         while True:
             try:
                 data = await self.reader.read(1024)
+            except asyncio.CancelledError:
+                _LOGGER.debug("Receive task cancelled")
+                raise
             except (BrokenPipeError, ConnectionResetError) as e:
                 _LOGGER.error(f"{self.device_id} read status error {e}")
                 await self.reset()
@@ -269,56 +275,13 @@ class DeviceClient(object):
             if payload is not None:
                 self.ascNumber = payload.get(CONF_ASCNUMBER)
                 self.status.update(payload.get(CONF_ATTR))
-                # _LOGGER.info(f"recv status : {payload}")
-                if self._status_fresh_cb:
-                    self._status_fresh_cb(self.status)
-    def set_status_fresh_cb(self, callback) -> None:
-        self._status_fresh_cb = callback
-    async def read_status(self) -> DeviceStatusData:
-        # if self._connect_and_login is False:
-        #     await asyncio.sleep(2)
-        #     raise AidotNotLogin
-        # try:
-        #     data = await self.reader.read(1024)
-        # except (BrokenPipeError, ConnectionResetError) as e:
-        #     _LOGGER.error(f"{self.device_id} read status error {e}")
-        #     await self.reset()
-        #     self.status.online = False
-        #     return self.status
-        # except Exception as e:
-        #     _LOGGER.error(f"recv data error {e}")
-        #     return self.status
-        # data_len = len(data)
-        # if data_len <= 0:
-        #     _LOGGER.error("recv data error len")
-        #     await self.reset()
-        #     self.status.online = False
-        #     return self.status
-        # try:
-        #     magic, msgtype, bodysize = struct.unpack(">HHI", data[:8])
-        #     decrypted_data = aes_decrypt(data[8:], self.aes_key)
-        #     json_data = json.loads(decrypted_data)
-        # except Exception as e:
-        #     _LOGGER.error(f"recv json error : {e}")
-        #     return await self.read_status()
-
-        # if "service" in json_data:
-        #     if "test" == json_data["service"]:
-        #         self.ping_count = 0
-        #         return await self.read_status()
-        # payload = json_data.get(CONF_PAYLOAD)
-        # if payload is not None:
-        #     self.ascNumber = payload.get(CONF_ASCNUMBER)
-        #     self.status.update(payload.get(CONF_ATTR))
-        return self.status
-
-    async def ping_task(self) -> None:
-        while True:
-            if self._is_close:
-                return
-            await asyncio.sleep(5)
-            await self.send_ping_action()
-            await asyncio.sleep(5)
+                if self.on_status_update:
+                    self.on_status_update(self.status)
+    
+    def _schedule_ping(self):
+        loop = asyncio.get_running_loop()
+        loop.create_task(self.send_ping_action())
+        self._ping_timer = loop.call_later(10, self._schedule_ping)
 
     async def send_dev_attr(self, dev_attr) -> None:
         if not self._connect_and_login:
@@ -393,6 +356,8 @@ class DeviceClient(object):
             _LOGGER.error(f"{self.device_id} send action error {e}")
 
     async def send_ping_action(self) -> int:
+        if self._is_close:
+            return -1
         ping = {
             "service": "test",
             "method": "pingreq",
@@ -419,6 +384,15 @@ class DeviceClient(object):
             return -1
 
     async def reset(self) -> None:
+        if self._ping_timer:
+            self._ping_timer.cancel()
+        self._timer = None
+        if self._receive_task and not self._receive_task.done():
+            self._receive_task.cancel()
+            try:
+                await self.receive_task()
+            except asyncio.CancelledError:
+                pass
         try:
             if self.writer:
                 self.writer.close()
@@ -428,6 +402,7 @@ class DeviceClient(object):
         self._connect_and_login = False
         self.status.online = False
         self.ping_count = 0
+        self._notify_status_update()
 
     async def close(self) -> None:
         self._is_close = True

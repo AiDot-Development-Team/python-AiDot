@@ -86,6 +86,7 @@ class Discover:
     _broadcast_protocol: BroadcastProtocol = None
     discovered_device: dict[str, str]
     _is_close: bool = False
+    _timer_handle: asyncio.TimerHandle | None = None
 
     def __init__(self, login_info, callback):
         self.discovered_device = {}
@@ -112,17 +113,31 @@ class Discover:
         await self.try_create_broadcast()
         self._broadcast_protocol.send_broadcast()
 
-    async def repeat_broadcast(self) -> None:
+    def start_repeat_broadcast(self) -> None:
+        """启动定时广播"""
         self._is_close = False
-        while True:
+        self._schedule_broadcast()
+
+    def _schedule_broadcast(self) -> None:
+        """调度下一次广播"""
+        if self._is_close:
+            return
+        loop = asyncio.get_running_loop()
+        loop.create_task(self._do_broadcast())
+        self._timer_handle = loop.call_later(
+            _DISCOVER_TIME,
+            self._schedule_broadcast
+        )
+
+    async def _do_broadcast(self) -> None:
+        """执行广播"""
+        try:
             await self.send_broadcast()
-            for i in range(_DISCOVER_TIME):
-                await asyncio.sleep(1)  # 每秒检查一次是否需要取消任务
-                if self._is_close is True:
-                    return
+        except Exception as e:
+            _LOGGER.error(f"Broadcast failed: {e}")
 
     async def fetch_devices_info(self) -> dict[str, str]:
-        self.try_create_broadcast()
+        await self.try_create_broadcast()
         self._broadcast_protocol.send_broadcast()
         await asyncio.sleep(2)
         return self.discovered_device
@@ -134,6 +149,9 @@ class Discover:
 
     def close(self) -> None:
         self._is_close = True
+        if self._timer_handle is not None:
+            self._timer_handle.cancel()
+            self._timer_handle = None
         if self._broadcast_protocol is not None:
             self._broadcast_protocol.close()
             self._broadcast_protocol = None

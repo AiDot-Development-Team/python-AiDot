@@ -93,7 +93,7 @@ class AidotClient:
             self._region = token[CONF_REGION]
             self.country_name = token[CONF_COUNTRY]
             self._base_url = f"https://prod-{self._region}-api.arnoo.com/v17"
-
+        self.setup_discover()
     def set_token_fresh_cb(self, callback) -> None:
         self._token_fresh_cb = callback
 
@@ -237,7 +237,6 @@ class AidotClient:
         if device_client is None:
             device_client = DeviceClient(device, self.login_info)
             self._device_clients[device_id] = device_client
-            asyncio.get_running_loop().create_task(device_client.ping_task())
         if self._discover is not None:
             ip = self._discover.discovered_device.get(device_id)
             device_client.update_ip_address(ip)
@@ -249,7 +248,8 @@ class AidotClient:
             await device_client.close()
             del self._device_clients[dev_id]
 
-    def start_discover(self) -> None:
+    def setup_discover(self) -> None:
+        """初始化完成后调用，启动设备发现"""
         if self._discover is not None:
             return
 
@@ -260,14 +260,17 @@ class AidotClient:
                 device_client.update_ip_address(device_ip)
 
         self._discover = Discover(self.login_info, _discover_callback)
-        asyncio.get_running_loop().create_task(self._discover.repeat_broadcast())
+        self._discover.start_repeat_broadcast()
 
-    def stop_discover(self) -> None:
-        self._discover.close()
-        self._discover = None
-
-    def cleanup(self) -> None:
-        self.stop_discover()
+    async def async_close(self) -> None:
+        """关闭客户端，清理资源"""
+        if self._discover is not None:
+            self._discover.close()
+            self._discover = None
         for client in self._device_clients.values():
-            asyncio.get_running_loop().create_task(client.close())
+            await client.close()
         self._device_clients.clear()
+
+    async def async_cleanup(self) -> None:
+        """清理所有资源"""
+        await self.async_close()
