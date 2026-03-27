@@ -3217,6 +3217,16 @@ class DeviceClient(object):
                     f" raddr {candidate.relatedAddress}"
                     f" rport {candidate.relatedPort}"
                 )
+            # Include sdpMid/sdpMLineIndex so the camera can map the candidate
+            # to the correct m-section.  A001064 and similar firmware needs these
+            # fields; without them the camera may silently ignore the candidates.
+            _cand_obj: dict = {"candidate": cand_str}
+            _c_mid     = getattr(candidate, "sdpMid",        None)
+            _c_mid_idx = getattr(candidate, "sdpMLineIndex",  None)
+            if _c_mid is not None:
+                _cand_obj["sdpMid"] = _c_mid
+            if _c_mid_idx is not None:
+                _cand_obj["sdpMLineIndex"] = _c_mid_idx
             payload = json.dumps({
                 "method":  "iceCandidateReq",
                 "service": "IPC",
@@ -3224,10 +3234,11 @@ class DeviceClient(object):
                 "srcAddr": f"{terminal_idx}.{user_id}",
                 "seq":     _seq(),
                 "tst":     int(time.time() * 1000),
+                **( {"userId": _numeric_uid_raw} if _numeric_uid_raw is not None else {} ),
                 "payload": {
                     "peerid":    peer_id,
                     "devId":     device_id,
-                    "candidate": {"candidate": cand_str},
+                    "candidate": _cand_obj,
                     "dstAddr":   user_id,
                 },
             })
@@ -3396,6 +3407,72 @@ class DeviceClient(object):
             outgoing_q.put_nowait((_webrtc_resp_topic, _webrtc_resp_payload))
             _status("webrtcResp sent (role-reversal answer, setup=passive)")
 
+            # Re-announce our ICE candidates now that the camera has the full
+            # signalling picture (livePlayReq + webrtcResp).  iOS app telemetry
+            # shows iceCandidateReq is always sent *after* webrtcResp; the
+            # @pc.on("icecandidate") callbacks above sent them earlier (during
+            # ICE gathering) which may be before the camera's MQTT session is
+            # ready to process them.  Sending them again here ensures the camera
+            # sees the candidates at the right time and can initiate STUN checks.
+            import re as _rr_re
+            _rr_local_sdp = pc.localDescription.sdp
+            _rr_local_ip  = ""
+            # Extract first non-loopback host candidate IP from the local SDP.
+            for _rr_ln in _rr_local_sdp.splitlines():
+                _rr_m = _rr_re.match(
+                    r'a=candidate:\S+ 1 udp \d+ (\d+\.\d+\.\d+\.\d+) \d+ typ host',
+                    _rr_ln,
+                )
+                if _rr_m and not _rr_m.group(1).startswith("127."):
+                    _rr_local_ip = _rr_m.group(1)
+                    break
+            # Walk m-sections to collect port for mid:0 (audio) and mid:1 (video).
+            _rr_mid_ports: list[tuple[str, int, int]] = []  # (sdpMid, sdpMLineIndex, port)
+            _rr_mid_idx   = -1
+            for _rr_ln in _rr_local_sdp.splitlines():
+                if _rr_ln.startswith("m="):
+                    _rr_mid_idx += 1
+                    _rr_pm = _rr_re.match(r'm=(\S+) (\d+)', _rr_ln)
+                    if _rr_pm and _rr_mid_idx <= 2:   # audio (0), video (1), H265 (2)
+                        _rr_mid_ports.append(
+                            (str(_rr_mid_idx), _rr_mid_idx, int(_rr_pm.group(2)))
+                        )
+            _rr_ice_topic = f"iot/v1/s/{user_id}/IPC/iceCandidateReq"
+            for _rr_smid, _rr_smidx, _rr_port in _rr_mid_ports:
+                if _rr_port == 0 or not _rr_local_ip:
+                    continue
+                _rr_cand_msg = json.dumps({
+                    "method":  "iceCandidateReq",
+                    "service": "IPC",
+                    "devId":   device_id,
+                    "srcAddr": f"{terminal_idx}.{user_id}",
+                    "seq":     _seq(),
+                    "tst":     int(time.time() * 1000),
+                    **( {"userId": _numeric_uid_raw} if _numeric_uid_raw is not None else {} ),
+                    "payload": {
+                        "peerid":    peer_id,
+                        "devId":     device_id,
+                        "candidate": {
+                            "candidate":     (
+                                f"candidate:1 1 udp 2130706431"
+                                f" {_rr_local_ip} {_rr_port} typ host"
+                            ),
+                            "sdpMid":        _rr_smid,
+                            "sdpMLineIndex": _rr_smidx,
+                        },
+                        "dstAddr": user_id,
+                    },
+                })
+                outgoing_q.put_nowait((_rr_ice_topic, _rr_cand_msg))
+            if _rr_mid_ports and _rr_local_ip:
+                _rr_ports_str = " ".join(
+                    f"mid:{s}={p}" for s, _, p in _rr_mid_ports
+                )
+                _status(
+                    f"iceCandidateReq sent (role-reversal, post-webrtcResp)"
+                    f"  {_rr_ports_str}  ip={_rr_local_ip}"
+                )
+
         else:
             # ---- NORMAL path: camera sent webrtcResp ---------------------------- #
             answer   = answer_fut.result()
@@ -3430,13 +3507,22 @@ class DeviceClient(object):
 
         @pc.on("connectionstatechange")
         async def _on_conn_state() -> None:
-            _LOGGER.debug("WebRTC connectionState: %s", pc.connectionState)
+            _status(f"WebRTC connectionState → {pc.connectionState}")
             if pc.connectionState in ("connected", "completed"):
                 connected_ev.set()
             elif pc.connectionState in ("failed", "closed"):
                 connected_ev.set()   # unblock the wait; session will detect failure
 
+        @pc.on("iceconnectionstatechange")
+        async def _on_ice_state() -> None:
+            _status(f"ICE connectionState → {pc.iceConnectionState}")
+
+        @pc.on("icegatheringstatechange")
+        async def _on_ice_gather() -> None:
+            _LOGGER.info("webrtc: ICE gatheringState → %s", pc.iceGatheringState)
+
         deadline = time.monotonic() + timeout
+        _last_ice_log = time.monotonic()
         while not connected_ev.is_set() and time.monotonic() < deadline:
             # Drain incoming ICE candidates from the camera
             while True:
@@ -3454,10 +3540,19 @@ class DeviceClient(object):
                 try:
                     ice_cand = candidate_from_sdp(cand_line)
                     await pc.addIceCandidate(ice_cand)
+                    _status(f"addIceCandidate: {cand_line[:80]}")
                 except Exception as exc:
                     _LOGGER.debug(
                         "async_open_webrtc_stream: addIceCandidate error: %s", exc
                     )
+            # Periodic ICE state heartbeat so we know the loop is alive.
+            if time.monotonic() - _last_ice_log >= 5.0:
+                _status(
+                    f"ICE wait  connState={pc.connectionState}"
+                    f"  iceState={pc.iceConnectionState}"
+                    f"  remaining={deadline - time.monotonic():.0f}s"
+                )
+                _last_ice_log = time.monotonic()
             await asyncio.sleep(0.1)
 
         if pc.connectionState not in ("connected", "completed"):
@@ -3465,7 +3560,8 @@ class DeviceClient(object):
             await pc.close()
             raise RuntimeError(
                 f"async_open_webrtc_stream: ICE connection not established "
-                f"(state={pc.connectionState}) within {timeout}s"
+                f"(connState={pc.connectionState}"
+                f"  iceState={pc.iceConnectionState}) within {timeout}s"
             )
 
         if recorder:
