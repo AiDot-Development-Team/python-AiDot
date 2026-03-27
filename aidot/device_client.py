@@ -3306,48 +3306,27 @@ class DeviceClient(object):
         if camera_offer_fut in _rr_done and answer_fut not in _rr_done:
             # ---- ROLE REVERSAL path (e.g. LK.IPC.A001064) ---------------------- #
             # Camera sent webrtcReq (its offer) instead of webrtcResp.
-            # Treat the camera's SDP as the answer to our local offer, then send
-            # webrtcResp so the camera can complete the DTLS handshake.
-            _camera_offer_sdp = camera_offer_fut.result().get("sdp", "")
+            # Protocol: we send webrtcResp (our answer), then the camera sends its
+            # real webrtcResp (captured in second_answer_fut) with its own ICE
+            # credentials and candidates.  We MUST use that real answer for
+            # setRemoteDescription so aiortc's ICE agent can authenticate the
+            # camera's STUN binding requests.  Using our own local SDP (old
+            # approach) caused ICE to stay in "checking" forever because the
+            # camera's STUN ufrag/pwd didn't match our self-referential credentials.
             _status(
                 "camera sent webrtcReq (role reversal) — answering and sending webrtcResp"
             )
-            # Synthesize the remote "answer" from our own local offer SDP rather
-            # than using the camera's echo.  The camera echoes our MQTT-patched
-            # offer which has PT 103 for mid:2; pc.localDescription still has
-            # aiortc's PTs 97-102.  Using the echo as type="answer" causes
-            # setRemoteDescription to fail with "Failed to set remote video
-            # description send parameters" because PT 103 is not present in the
-            # local offer.  Using pc.localDescription.sdp as the base guarantees
-            # PT consistency and avoids the _patch_answer_mid2_for_aiortc call.
-            _cam_sdp_aiortc = pc.localDescription.sdp
-            # Camera is the DTLS client (active), we are the passive server.
-            _cam_sdp_aiortc = _cam_sdp_aiortc.replace('a=setup:actpass\r\n', 'a=setup:active\r\n')
-            # Camera is the audio/video sender; our transceivers are direction="recvonly".
-            _cam_sdp_aiortc = _cam_sdp_aiortc.replace('a=recvonly\r\n', 'a=sendonly\r\n')
-            try:
-                await pc.setRemoteDescription(
-                    RTCSessionDescription(sdp=_cam_sdp_aiortc, type="answer")
-                )
-            except Exception as _exc:
-                _status(f"setRemoteDescription (role-reversal) failed: {_exc}")
-                outgoing_q.put_nowait(None)
-                await pc.close()
-                raise RuntimeError(
-                    f"async_open_webrtc_stream: setRemoteDescription failed: {_exc}"
-                ) from _exc
             # ---- Fingerprint bypass for echo-reversal --------------------------- #
-            # The camera echoed our offer verbatim, so the remote description
-            # contains OUR DTLS fingerprint (not the camera's).  When the camera
+            # The camera echoes our fingerprint in its SDP.  When the camera
             # (DTLS active/client) presents its own self-signed certificate during
             # the handshake, aiortc's _validate_peer_identity would compare the
             # camera's cert digest against our echoed fingerprint → always fails,
             # leaving the DTLS transport in State.FAILED and producing 0 frames.
             #
-            # Fix: replace _validate_peer_identity on each DTLS transport in this
-            # peer connection with a version that overwrites the stored fingerprint
-            # with the camera's actual certificate digest before the check, so
-            # verification always succeeds for the camera's real certificate.
+            # Patch each DTLS transport to overwrite the stored fingerprint with
+            # the camera's actual certificate digest so verification always succeeds.
+            # This must be applied before the DTLS handshake starts (i.e. before
+            # ICE connects), but does NOT require setRemoteDescription first.
             import types as _types
             try:
                 from aiortc.rtcdtlstransport import (
@@ -3477,6 +3456,39 @@ class DeviceClient(object):
                     f"iceCandidateReq sent (role-reversal, post-webrtcResp)"
                     f"  {_rr_ports_str}  ip={_rr_local_ip}"
                 )
+
+            # ---- Use camera's real answer for setRemoteDescription -------------- #
+            # After we send webrtcResp the camera responds with its own webrtcResp
+            # containing its real ICE ufrag/pwd and candidates (second_answer_fut).
+            # answer_fut was cancelled above so the real answer goes to
+            # second_answer_fut.  We must use those credentials; without them
+            # aiortc expects STUN from itself (loopback) and the camera's STUN
+            # checks fail authentication → ICE never leaves "checking".
+            try:
+                _rr_real_answer = await asyncio.wait_for(
+                    asyncio.shield(second_answer_fut), timeout=8.0
+                )
+                _rr_real_sdp = _rr_real_answer.get("sdp", "")
+                _rr_real_sdp = _patch_answer_mid2_for_aiortc(_rr_real_sdp)
+                # Camera is the audio/video sender; our transceivers are recvonly.
+                _rr_real_sdp = _rr_real_sdp.replace('a=recvonly\r\n', 'a=sendonly\r\n')
+                _status("role-reversal: received camera real answer — setting remote description")
+            except asyncio.TimeoutError:
+                _status("role-reversal: camera real answer timeout (8s) — ICE likely to fail")
+                _rr_real_sdp = None
+
+            if _rr_real_sdp is not None:
+                try:
+                    await pc.setRemoteDescription(
+                        RTCSessionDescription(sdp=_rr_real_sdp, type="answer")
+                    )
+                except Exception as _exc:
+                    _status(f"setRemoteDescription (role-reversal) failed: {_exc}")
+                    outgoing_q.put_nowait(None)
+                    await pc.close()
+                    raise RuntimeError(
+                        f"async_open_webrtc_stream: setRemoteDescription failed: {_exc}"
+                    ) from _exc
 
         else:
             # ---- NORMAL path: camera sent webrtcResp ---------------------------- #
