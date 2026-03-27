@@ -3319,6 +3319,15 @@ class DeviceClient(object):
             _camera_offer_sdp = _re.sub(
                 r'a=setup:actpass\r?\n', 'a=setup:active\r\n', _camera_offer_sdp
             )
+            # The camera echoed our offer verbatim including a=recvonly.  Correct
+            # the direction to a=sendonly: the camera IS the sender of audio/video,
+            # and aiortc's setRemoteDescription(type="answer") requires the remote
+            # direction to be sendonly when our transceivers are direction="recvonly".
+            # Without this fix aiortc raises "Failed to set remote video description
+            # send parameters" because recvonly→recvonly is an invalid negotiation.
+            _camera_offer_sdp = _camera_offer_sdp.replace(
+                'a=recvonly\r\n', 'a=sendonly\r\n'
+            )
             _cam_sdp_aiortc = _patch_answer_mid2_for_aiortc(_camera_offer_sdp)
             try:
                 await pc.setRemoteDescription(
