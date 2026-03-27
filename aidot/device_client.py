@@ -3312,23 +3312,19 @@ class DeviceClient(object):
             _status(
                 "camera sent webrtcReq (role reversal) — answering and sending webrtcResp"
             )
-            # Patch a=setup: actpass → active so the camera is the DTLS client and
-            # we are the DTLS server (passive); camera will connect to our ports.
-            # Use regex to handle both \r\n and \n line endings in the camera's SDP.
-            import re as _re
-            _camera_offer_sdp = _re.sub(
-                r'a=setup:actpass\r?\n', 'a=setup:active\r\n', _camera_offer_sdp
-            )
-            # The camera echoed our offer verbatim including a=recvonly.  Correct
-            # the direction to a=sendonly: the camera IS the sender of audio/video,
-            # and aiortc's setRemoteDescription(type="answer") requires the remote
-            # direction to be sendonly when our transceivers are direction="recvonly".
-            # Without this fix aiortc raises "Failed to set remote video description
-            # send parameters" because recvonly→recvonly is an invalid negotiation.
-            _camera_offer_sdp = _camera_offer_sdp.replace(
-                'a=recvonly\r\n', 'a=sendonly\r\n'
-            )
-            _cam_sdp_aiortc = _patch_answer_mid2_for_aiortc(_camera_offer_sdp)
+            # Synthesize the remote "answer" from our own local offer SDP rather
+            # than using the camera's echo.  The camera echoes our MQTT-patched
+            # offer which has PT 103 for mid:2; pc.localDescription still has
+            # aiortc's PTs 97-102.  Using the echo as type="answer" causes
+            # setRemoteDescription to fail with "Failed to set remote video
+            # description send parameters" because PT 103 is not present in the
+            # local offer.  Using pc.localDescription.sdp as the base guarantees
+            # PT consistency and avoids the _patch_answer_mid2_for_aiortc call.
+            _cam_sdp_aiortc = pc.localDescription.sdp
+            # Camera is the DTLS client (active), we are the passive server.
+            _cam_sdp_aiortc = _cam_sdp_aiortc.replace('a=setup:actpass\r\n', 'a=setup:active\r\n')
+            # Camera is the audio/video sender; our transceivers are direction="recvonly".
+            _cam_sdp_aiortc = _cam_sdp_aiortc.replace('a=recvonly\r\n', 'a=sendonly\r\n')
             try:
                 await pc.setRemoteDescription(
                     RTCSessionDescription(sdp=_cam_sdp_aiortc, type="answer")
