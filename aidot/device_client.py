@@ -3318,6 +3318,13 @@ class DeviceClient(object):
                     f"async_open_webrtc_stream: setRemoteDescription failed: {_exc}"
                 ) from _exc
             # Send webrtcResp so the camera knows our DTLS fingerprint and ICE params.
+            # We are the DTLS server (passive); the camera must be the DTLS client
+            # (active) and initiate the handshake to our ICE candidates.
+            # Replace a=setup:actpass with a=setup:passive so the camera sees an
+            # unambiguous "you are DTLS active, connect to me" instruction.
+            _rr_answer_sdp = pc.localDescription.sdp.replace(
+                "a=setup:actpass\r\n", "a=setup:passive\r\n"
+            )
             _webrtc_resp_topic   = f"iot/v1/s/{user_id}/IPC/webrtcResp"
             _webrtc_resp_payload = json.dumps({
                 "method":  "webrtcResp",
@@ -3330,13 +3337,13 @@ class DeviceClient(object):
                 "payload": {
                     "peerid":  peer_id,
                     "devId":   device_id,
-                    "answer":  {"type": "answer", "sdp": pc.localDescription.sdp},
+                    "answer":  {"type": "answer", "sdp": _rr_answer_sdp},
                     "trackId": 0,
                     "dstAddr": user_id,
                 },
             })
             outgoing_q.put_nowait((_webrtc_resp_topic, _webrtc_resp_payload))
-            _status("webrtcResp sent (role-reversal answer)")
+            _status("webrtcResp sent (role-reversal answer, setup=passive)")
 
         else:
             # ---- NORMAL path: camera sent webrtcResp ---------------------------- #
