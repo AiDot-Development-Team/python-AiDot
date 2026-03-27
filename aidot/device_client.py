@@ -3890,13 +3890,16 @@ class DeviceClient(object):
         # any SRTP packets.  The camera appears to require DTLS (peerid _2)
         # despite reporting enableSdes='1' in its device properties.
         # Detect this by checking: echo-reversal received (_cam_echo_received)
-        # AND no STUN in the ICE window AND no early SRTP AND DTLS is allowed.
-        # In that case abort before launching ffmpeg (which would only produce
-        # 0 frames after a 30-second timeout) and fall back to the DTLS path.
+        # AND no STUN in the ICE window AND no early SRTP.
+        # Note: dtls_fallback_ok is NOT checked here.  _cam_echo_received=True
+        # only for cameras that mirror our webrtcReq (e.g. A001064); non-echo
+        # SDES cameras (e.g. A001513) have _cam_echo_received=False and are
+        # never affected.  For echo-reversal cameras that send no STUN/SRTP the
+        # SDES path is definitively broken so the isDTLS='0' property (which is
+        # unreliable for A001064) should not prevent the DTLS retry.
         if (_cam_echo_received
                 and _stun_count == 0
-                and not _srtp_detected
-                and dtls_fallback_ok):
+                and not _srtp_detected):
             _status(
                 "echo-reversal camera: no STUN or SRTP received in ICE window"
                 " — camera likely requires DTLS; falling back"
