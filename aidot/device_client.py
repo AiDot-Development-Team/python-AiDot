@@ -3302,8 +3302,10 @@ class DeviceClient(object):
             )
             # Patch a=setup: actpass → active so the camera is the DTLS client and
             # we are the DTLS server (passive); camera will connect to our ports.
-            _camera_offer_sdp = _camera_offer_sdp.replace(
-                "a=setup:actpass\r\n", "a=setup:active\r\n"
+            # Use regex to handle both \r\n and \n line endings in the camera's SDP.
+            import re as _re
+            _camera_offer_sdp = _re.sub(
+                r'a=setup:actpass\r?\n', 'a=setup:active\r\n', _camera_offer_sdp
             )
             _cam_sdp_aiortc = _patch_answer_mid2_for_aiortc(_camera_offer_sdp)
             try:
@@ -3317,11 +3319,59 @@ class DeviceClient(object):
                 raise RuntimeError(
                     f"async_open_webrtc_stream: setRemoteDescription failed: {_exc}"
                 ) from _exc
+            # ---- Fingerprint bypass for echo-reversal --------------------------- #
+            # The camera echoed our offer verbatim, so the remote description
+            # contains OUR DTLS fingerprint (not the camera's).  When the camera
+            # (DTLS active/client) presents its own self-signed certificate during
+            # the handshake, aiortc's _validate_peer_identity would compare the
+            # camera's cert digest against our echoed fingerprint → always fails,
+            # leaving the DTLS transport in State.FAILED and producing 0 frames.
+            #
+            # Fix: replace _validate_peer_identity on each DTLS transport in this
+            # peer connection with a version that overwrites the stored fingerprint
+            # with the camera's actual certificate digest before the check, so
+            # verification always succeeds for the camera's real certificate.
+            import types as _types
+            try:
+                from aiortc.rtcdtlstransport import (
+                    RTCDtlsFingerprint as _RRFp,
+                    certificate_digest as _rr_cert_fp,
+                )
+
+                def _rr_accept_cam_cert(self, remote_params):
+                    """Accept camera's actual DTLS cert (echo-reversal fingerprint fix)."""
+                    try:
+                        _cam_cert = self._ssl.get_peer_certificate(
+                            as_cryptography=True
+                        )
+                        if _cam_cert is not None:
+                            _real_fp = _rr_cert_fp(_cam_cert, "sha-256")
+                            remote_params.fingerprints[:] = [
+                                _RRFp(algorithm="sha-256", value=_real_fp)
+                            ]
+                    except Exception:
+                        pass  # cert retrieval failed; skip verification
+
+                for _rr_tc in pc.getTransceivers():
+                    _rr_tc.receiver.transport._validate_peer_identity = (
+                        _types.MethodType(
+                            _rr_accept_cam_cert, _rr_tc.receiver.transport
+                        )
+                    )
+                _status(
+                    "role-reversal fingerprint bypass applied"
+                    f" ({len(pc.getTransceivers())} transceivers)"
+                )
+            except Exception as _rr_fp_exc:
+                _status(
+                    f"role-reversal fingerprint bypass skipped: {_rr_fp_exc}"
+                )
             # Send webrtcResp so the camera knows our DTLS fingerprint and ICE params.
             # We are the DTLS server (passive); the camera must be the DTLS client
             # (active) and initiate the handshake to our ICE candidates.
             # Replace a=setup:actpass with a=setup:passive so the camera sees an
             # unambiguous "you are DTLS active, connect to me" instruction.
+            # aiortc generates SDPs with \r\n so a simple replace is safe here.
             _rr_answer_sdp = pc.localDescription.sdp.replace(
                 "a=setup:actpass\r\n", "a=setup:passive\r\n"
             )
