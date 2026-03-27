@@ -2568,11 +2568,11 @@ class DeviceClient(object):
 
         # Respect isDTLS='0': those cameras cannot do DTLS, so falling back
         # after an SDES timeout would only hang the stream (~30 s with zero
-        # frames).  Cameras such as LK.IPC.A001064 (isDTLS='0', enableSdes='1')
-        # stream SRTP directly to our ports without sending a webrtcResp; the
-        # SDES path handles this by keeping ffmpeg running (lines ~3764-3775).
-        # For cameras where isDTLS is absent or non-zero, allow DTLS fallback
-        # in case enableSdes='1' was incorrectly provisioned.
+        # frames).  For cameras where isDTLS is absent or non-zero, allow DTLS
+        # fallback in case enableSdes='1' was incorrectly provisioned.
+        # LK.IPC.A001064 (enableSdes='1') echoes our MQTT messages but does
+        # not send STUN or SRTP — the echo-reversal DTLS fallback path at the
+        # end of _open_sdes_stream handles this without launching ffmpeg.
         _cam_props = (self._raw_device or {}).get("properties") or {}
         _dtls_fallback_ok = str(_cam_props.get("isDTLS", "1")) != "0"
 
@@ -3883,6 +3883,30 @@ class DeviceClient(object):
                 _rsock.close()
             except Exception:
                 pass
+
+        # --- DTLS fallback: echo-reversal camera did not do ICE or SRTP ----- #
+        # LK.IPC.A001064 echoes our webrtcReq offer and webrtcResp answer back
+        # over MQTT but then never initiates STUN connectivity checks or sends
+        # any SRTP packets.  The camera appears to require DTLS (peerid _2)
+        # despite reporting enableSdes='1' in its device properties.
+        # Detect this by checking: echo-reversal received (_cam_echo_received)
+        # AND no STUN in the ICE window AND no early SRTP AND DTLS is allowed.
+        # In that case abort before launching ffmpeg (which would only produce
+        # 0 frames after a 30-second timeout) and fall back to the DTLS path.
+        if (_cam_echo_received
+                and _stun_count == 0
+                and not _srtp_detected
+                and dtls_fallback_ok):
+            _status(
+                "echo-reversal camera: no STUN or SRTP received in ICE window"
+                " — camera likely requires DTLS; falling back"
+            )
+            try:
+                os.unlink(sdp_path)
+            except Exception:
+                pass
+            outgoing_q.put_nowait(None)   # stop MQTT thread
+            raise DeviceClient._SdesNoAnswerError()
 
         dest = output_path or "/dev/null"
         cmd = [
