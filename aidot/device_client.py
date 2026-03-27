@@ -3265,8 +3265,9 @@ class DeviceClient(object):
                     continue
                 new_sec = []
                 for ln in sec:
-                    if _re.match(r'^a=rtpmap:96 H265/', ln):
-                        new_sec.append('a=rtpmap:96 H264/90000')
+                    _h265_m = _re.match(r'^a=rtpmap:(\d+) H265/', ln)
+                    if _h265_m:
+                        new_sec.append(f'a=rtpmap:{_h265_m.group(1)} H264/90000')
                     else:
                         new_sec.append(ln)
                 result.extend(new_sec)
@@ -3291,7 +3292,7 @@ class DeviceClient(object):
                 f"async_open_webrtc_stream: no webrtcResp received within {timeout}s"
             )
 
-        if camera_offer_fut in _rr_done and not answer_fut.done():
+        if camera_offer_fut in _rr_done and answer_fut not in _rr_done:
             # ---- ROLE REVERSAL path (e.g. LK.IPC.A001064) ---------------------- #
             # Camera sent webrtcReq (its offer) instead of webrtcResp.
             # Treat the camera's SDP as the answer to our local offer, then send
