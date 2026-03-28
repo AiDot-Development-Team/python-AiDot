@@ -3470,8 +3470,27 @@ class DeviceClient(object):
                 )
                 _rr_real_sdp = _rr_real_answer.get("sdp", "")
                 _rr_real_sdp = _patch_answer_mid2_for_aiortc(_rr_real_sdp)
+                # Normalize all m-section ICE credentials to the BUNDLE master (mid:0).
+                # The camera's real answer violates RFC 8843 by advertising different
+                # ice-ufrag/pwd per section (gKeJ/mid:0, 1P85/mid:1, bDOS/mid:2, Rs9S/mid:3).
+                # When aiortc processes the answer it may update the shared BUNDLE transport's
+                # remote ufrag with each section's value, leaving a non-mid:0 ufrag (e.g.
+                # Rs9S) as the final stored credential.  The camera's role-reversal ICE session
+                # sends STUN with USERNAME=gKeJ:OUR_UFRAG (the counter-offer ufrag).  If
+                # aiortc expects Rs9S, auth fails → no peer-reflexive candidate → ICE hangs.
+                # Normalizing to mid:0 (gKeJ) ensures aiortc consistently accepts the camera's
+                # STUN probes regardless of how it sequences per-section credential updates.
+                _rr_real_sdp = _normalize_bundle_ice_credentials(_rr_real_sdp)
                 # Camera is the audio/video sender; our transceivers are recvonly.
                 _rr_real_sdp = _rr_real_sdp.replace('a=recvonly\r\n', 'a=sendonly\r\n')
+                # Align DTLS setup role with the role-reversal exchange.
+                # Our webrtcResp declared a=setup:passive (we are DTLS server); the camera's
+                # counter-offer had a=setup:actpass so the camera becomes DTLS active (client).
+                # The real answer echoes a=setup:passive, which would make aiortc DTLS active
+                # too — both sides attempting to be the DTLS client causes a conflict.
+                # Replacing passive→active here tells aiortc to be DTLS passive (server),
+                # matching our webrtcResp, so the camera (active) initiates the handshake.
+                _rr_real_sdp = _rr_real_sdp.replace('a=setup:passive\r\n', 'a=setup:active\r\n')
                 # Strip echoed ICE candidates: camera mirrors our own offer candidates
                 # back in its answer SDP.  Retaining them causes aiortc to send loopback
                 # STUN checks to our own IP/ports, which RFC 8445 §7.3.1 requires aioice
@@ -3488,8 +3507,9 @@ class DeviceClient(object):
                     .replace('a=end-of-candidates\r\n', '')
                     .replace('a=end-of-candidates\n', '')
                 )
-                _status("role-reversal: received camera real answer — setting remote description"
-                        " (echoed candidates stripped; relying on peer-reflexive from camera STUN)")
+                _status("role-reversal: received camera real answer — "
+                        "ICE creds normalized (gKeJ), setup→active, candidates stripped; "
+                        "relying on peer-reflexive from camera STUN")
             except asyncio.TimeoutError:
                 _status("role-reversal: camera real answer timeout (8s) — ICE likely to fail")
                 _rr_real_sdp = None
