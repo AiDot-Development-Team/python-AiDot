@@ -3472,7 +3472,24 @@ class DeviceClient(object):
                 _rr_real_sdp = _patch_answer_mid2_for_aiortc(_rr_real_sdp)
                 # Camera is the audio/video sender; our transceivers are recvonly.
                 _rr_real_sdp = _rr_real_sdp.replace('a=recvonly\r\n', 'a=sendonly\r\n')
-                _status("role-reversal: received camera real answer — setting remote description")
+                # Strip echoed ICE candidates: camera mirrors our own offer candidates
+                # back in its answer SDP.  Retaining them causes aiortc to send loopback
+                # STUN checks to our own IP/ports, which RFC 8445 §7.3.1 requires aioice
+                # to silently discard (source IP matches a local candidate) — so the
+                # check list exhausts without ever succeeding.  With no remote candidates
+                # aiortc's ICE agent waits for incoming STUN from the camera's real IP;
+                # aioice creates a peer-reflexive candidate from that STUN and ICE
+                # connects via a triggered check.
+                _rr_real_sdp = _rr_re.sub(
+                    r'a=candidate:[^\r\n]*\r?\n', '', _rr_real_sdp
+                )
+                _rr_real_sdp = (
+                    _rr_real_sdp
+                    .replace('a=end-of-candidates\r\n', '')
+                    .replace('a=end-of-candidates\n', '')
+                )
+                _status("role-reversal: received camera real answer — setting remote description"
+                        " (echoed candidates stripped; relying on peer-reflexive from camera STUN)")
             except asyncio.TimeoutError:
                 _status("role-reversal: camera real answer timeout (8s) — ICE likely to fail")
                 _rr_real_sdp = None
