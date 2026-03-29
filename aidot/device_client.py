@@ -3375,7 +3375,12 @@ class DeviceClient(object):
             # aioice creates peer-reflexive candidates and ICE connects.
             import re as _rr_re
             _rr_synth_sdp = camera_offer_fut.result().get("sdp", "")
-            _rr_synth_sdp = _patch_answer_mid2_for_aiortc(_rr_synth_sdp)
+            # NOTE: do NOT apply _patch_answer_mid2_for_aiortc here.
+            # The counter-offer echoes our local offer's PT=103=H265 for mid:2.
+            # Patching H265→H264 produces a codec-name mismatch (local says H265,
+            # remote says H264 for the same PT=103), causing setRemoteDescription to
+            # raise "Failed to set remote video description send parameters".
+            # Instead, mid:2 is rejected below with port=0.
             _rr_synth_sdp = _normalize_bundle_ice_credentials(_rr_synth_sdp)
             # Strip echoed candidates (camera mirrors our own ports; probing them
             # is loopback — aioice silently discards self-directed checks).
@@ -3387,13 +3392,6 @@ class DeviceClient(object):
                 .replace('a=end-of-candidates\r\n', '')
                 .replace('a=end-of-candidates\n', '')
             )
-            # Camera sends media; our transceivers are recvonly so remote is sendonly.
-            _rr_synth_sdp = _rr_synth_sdp.replace('a=recvonly\r\n', 'a=sendonly\r\n')
-            # DTLS: camera offered actpass; our webrtcResp will say passive (server).
-            # Tell aiortc the remote is active (client) so aiortc stays passive.
-            _rr_synth_sdp = _rr_synth_sdp.replace(
-                'a=setup:actpass\r\n', 'a=setup:active\r\n'
-            )
             # Strip echoed SSRC lines: the camera mirrors our own local SSRCs back in
             # its counter-offer.  If we pass these to setRemoteDescription as the
             # remote sender's SSRCs, aiortc raises "Failed to set remote video
@@ -3401,6 +3399,33 @@ class DeviceClient(object):
             # local transceivers.  Removing them lets aiortc accept any incoming RTP
             # from the camera regardless of SSRC value.
             _rr_synth_sdp = _rr_re.sub(r'a=ssrc(?:-group)?:[^\r\n]*\r?\n', '', _rr_synth_sdp)
+            # Camera sends media; our transceivers are recvonly so remote is sendonly.
+            _rr_synth_sdp = _rr_synth_sdp.replace('a=recvonly\r\n', 'a=sendonly\r\n')
+            # DTLS: camera offered actpass; our webrtcResp will say passive (server).
+            # Tell aiortc the remote is active (client) so aiortc stays passive.
+            _rr_synth_sdp = _rr_synth_sdp.replace(
+                'a=setup:actpass\r\n', 'a=setup:active\r\n'
+            )
+            # Reject mid:2 (H265/PT=103) with port=0: aiortc cannot receive H265 and
+            # the PT=103 codec in the counter-offer matches our local offer's PT=103
+            # name (H265), so there is no safe way to remap it.  port=0 tells aiortc
+            # to ignore this m-section; we only need mid:0 audio + mid:1 video.
+            _rr_synth_lines = _rr_synth_sdp.split('\r\n')
+            _rr_in_mid2 = False
+            for _rr_i, _rr_ln in enumerate(_rr_synth_lines):
+                if _rr_ln.startswith('m=') and _rr_in_mid2:
+                    _rr_in_mid2 = False
+                if _rr_ln == 'a=mid:2':
+                    _rr_in_mid2 = True
+                    # Walk backwards to find the m= line for this section.
+                    for _rr_j in range(_rr_i - 1, -1, -1):
+                        if _rr_synth_lines[_rr_j].startswith('m='):
+                            _rr_synth_lines[_rr_j] = _rr_re.sub(
+                                r'^(m=\S+ )\d+', r'\g<1>0',
+                                _rr_synth_lines[_rr_j]
+                            )
+                            break
+            _rr_synth_sdp = '\r\n'.join(_rr_synth_lines)
             try:
                 await pc.setRemoteDescription(
                     RTCSessionDescription(sdp=_rr_synth_sdp, type="answer")
