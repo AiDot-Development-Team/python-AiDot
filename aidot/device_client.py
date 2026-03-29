@@ -3368,8 +3368,10 @@ class DeviceClient(object):
             # Replace a=setup:actpass with a=setup:passive so the camera sees an
             # unambiguous "you are DTLS active, connect to me" instruction.
             # aiortc generates SDPs with \r\n so a simple replace is safe here.
-            _rr_answer_sdp = pc.localDescription.sdp.replace(
-                "a=setup:actpass\r\n", "a=setup:passive\r\n"
+            _rr_answer_sdp = _normalize_bundle_ice_credentials(
+                pc.localDescription.sdp.replace(
+                    "a=setup:actpass\r\n", "a=setup:passive\r\n"
+                )
             )
             _webrtc_resp_topic   = f"iot/v1/s/{user_id}/IPC/webrtcResp"
             _webrtc_resp_payload = json.dumps({
@@ -3507,8 +3509,14 @@ class DeviceClient(object):
                     .replace('a=end-of-candidates\r\n', '')
                     .replace('a=end-of-candidates\n', '')
                 )
+                _rr_master_ufrag = next(
+                    (ln.split(":", 1)[1].strip()
+                     for ln in _rr_real_sdp.splitlines()
+                     if ln.startswith("a=ice-ufrag:")),
+                    "?",
+                )
                 _status("role-reversal: received camera real answer — "
-                        "ICE creds normalized (gKeJ), setup→active, candidates stripped; "
+                        f"ICE creds normalized ({_rr_master_ufrag}), setup→active, candidates stripped; "
                         "relying on peer-reflexive from camera STUN")
             except asyncio.TimeoutError:
                 _status("role-reversal: camera real answer timeout (8s) — ICE likely to fail")
