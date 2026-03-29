@@ -3362,6 +3362,57 @@ class DeviceClient(object):
                 _status(
                     f"role-reversal fingerprint bypass skipped: {_rr_fp_exc}"
                 )
+            # ---- Early setRemoteDescription from camera's counter-offer ---------- #
+            # The camera starts STUN probing as soon as it receives our webrtcResp +
+            # iceCandidateReq.  If we wait for second_answer_fut (up to 8 s) before
+            # calling setRemoteDescription, the camera's initial binding checks may
+            # expire before aiortc's ICE agent starts — leaving ICE stuck in
+            # "checking" indefinitely.  Instead, call setRemoteDescription NOW using
+            # the counter-offer SDP (already available synchronously).  The camera
+            # echoes our ICE credentials, so the counter-offer carries the identical
+            # ufrag/pwd that the real answer would carry.  aiortc enters ICE "checking"
+            # immediately; when the camera's STUN probes arrive after iceCandidateReq,
+            # aioice creates peer-reflexive candidates and ICE connects.
+            import re as _rr_re
+            _rr_synth_sdp = camera_offer_fut.result().get("sdp", "")
+            _rr_synth_sdp = _patch_answer_mid2_for_aiortc(_rr_synth_sdp)
+            _rr_synth_sdp = _normalize_bundle_ice_credentials(_rr_synth_sdp)
+            # Strip echoed candidates (camera mirrors our own ports; probing them
+            # is loopback — aioice silently discards self-directed checks).
+            _rr_synth_sdp = _rr_re.sub(
+                r'a=candidate:[^\r\n]*\r?\n', '', _rr_synth_sdp
+            )
+            _rr_synth_sdp = (
+                _rr_synth_sdp
+                .replace('a=end-of-candidates\r\n', '')
+                .replace('a=end-of-candidates\n', '')
+            )
+            # Camera sends media; our transceivers are recvonly so remote is sendonly.
+            _rr_synth_sdp = _rr_synth_sdp.replace('a=recvonly\r\n', 'a=sendonly\r\n')
+            # DTLS: camera offered actpass; our webrtcResp will say passive (server).
+            # Tell aiortc the remote is active (client) so aiortc stays passive.
+            _rr_synth_sdp = _rr_synth_sdp.replace(
+                'a=setup:actpass\r\n', 'a=setup:active\r\n'
+            )
+            try:
+                await pc.setRemoteDescription(
+                    RTCSessionDescription(sdp=_rr_synth_sdp, type="answer")
+                )
+                _status(
+                    "role-reversal: setRemoteDescription from counter-offer"
+                    " — ICE now checking"
+                )
+            except Exception as _rr_srd_exc:
+                _status(
+                    f"role-reversal: early setRemoteDescription failed:"
+                    f" {_rr_srd_exc}"
+                )
+                outgoing_q.put_nowait(None)
+                await pc.close()
+                raise RuntimeError(
+                    f"async_open_webrtc_stream: setRemoteDescription failed:"
+                    f" {_rr_srd_exc}"
+                ) from _rr_srd_exc
             # Send webrtcResp so the camera knows our DTLS fingerprint and ICE params.
             # We are the DTLS server (passive); the camera must be the DTLS client
             # (active) and initiate the handshake to our ICE candidates.
@@ -3400,7 +3451,6 @@ class DeviceClient(object):
             # ICE gathering) which may be before the camera's MQTT session is
             # ready to process them.  Sending them again here ensures the camera
             # sees the candidates at the right time and can initiate STUN checks.
-            import re as _rr_re
             _rr_local_sdp = pc.localDescription.sdp
             _rr_local_ip  = ""
             # Extract first non-loopback host candidate IP from the local SDP.
@@ -3458,82 +3508,6 @@ class DeviceClient(object):
                     f"iceCandidateReq sent (role-reversal, post-webrtcResp)"
                     f"  {_rr_ports_str}  ip={_rr_local_ip}"
                 )
-
-            # ---- Use camera's real answer for setRemoteDescription -------------- #
-            # After we send webrtcResp the camera responds with its own webrtcResp
-            # containing its real ICE ufrag/pwd and candidates (second_answer_fut).
-            # answer_fut was cancelled above so the real answer goes to
-            # second_answer_fut.  We must use those credentials; without them
-            # aiortc expects STUN from itself (loopback) and the camera's STUN
-            # checks fail authentication → ICE never leaves "checking".
-            try:
-                _rr_real_answer = await asyncio.wait_for(
-                    asyncio.shield(second_answer_fut), timeout=8.0
-                )
-                _rr_real_sdp = _rr_real_answer.get("sdp", "")
-                _rr_real_sdp = _patch_answer_mid2_for_aiortc(_rr_real_sdp)
-                # Normalize all m-section ICE credentials to the BUNDLE master (mid:0).
-                # The camera's real answer violates RFC 8843 by advertising different
-                # ice-ufrag/pwd per section (gKeJ/mid:0, 1P85/mid:1, bDOS/mid:2, Rs9S/mid:3).
-                # When aiortc processes the answer it may update the shared BUNDLE transport's
-                # remote ufrag with each section's value, leaving a non-mid:0 ufrag (e.g.
-                # Rs9S) as the final stored credential.  The camera's role-reversal ICE session
-                # sends STUN with USERNAME=gKeJ:OUR_UFRAG (the counter-offer ufrag).  If
-                # aiortc expects Rs9S, auth fails → no peer-reflexive candidate → ICE hangs.
-                # Normalizing to mid:0 (gKeJ) ensures aiortc consistently accepts the camera's
-                # STUN probes regardless of how it sequences per-section credential updates.
-                _rr_real_sdp = _normalize_bundle_ice_credentials(_rr_real_sdp)
-                # Camera is the audio/video sender; our transceivers are recvonly.
-                _rr_real_sdp = _rr_real_sdp.replace('a=recvonly\r\n', 'a=sendonly\r\n')
-                # Align DTLS setup role with the role-reversal exchange.
-                # Our webrtcResp declared a=setup:passive (we are DTLS server); the camera's
-                # counter-offer had a=setup:actpass so the camera becomes DTLS active (client).
-                # The real answer echoes a=setup:passive, which would make aiortc DTLS active
-                # too — both sides attempting to be the DTLS client causes a conflict.
-                # Replacing passive→active here tells aiortc to be DTLS passive (server),
-                # matching our webrtcResp, so the camera (active) initiates the handshake.
-                _rr_real_sdp = _rr_real_sdp.replace('a=setup:passive\r\n', 'a=setup:active\r\n')
-                # Strip echoed ICE candidates: camera mirrors our own offer candidates
-                # back in its answer SDP.  Retaining them causes aiortc to send loopback
-                # STUN checks to our own IP/ports, which RFC 8445 §7.3.1 requires aioice
-                # to silently discard (source IP matches a local candidate) — so the
-                # check list exhausts without ever succeeding.  With no remote candidates
-                # aiortc's ICE agent waits for incoming STUN from the camera's real IP;
-                # aioice creates a peer-reflexive candidate from that STUN and ICE
-                # connects via a triggered check.
-                _rr_real_sdp = _rr_re.sub(
-                    r'a=candidate:[^\r\n]*\r?\n', '', _rr_real_sdp
-                )
-                _rr_real_sdp = (
-                    _rr_real_sdp
-                    .replace('a=end-of-candidates\r\n', '')
-                    .replace('a=end-of-candidates\n', '')
-                )
-                _rr_master_ufrag = next(
-                    (ln.split(":", 1)[1].strip()
-                     for ln in _rr_real_sdp.splitlines()
-                     if ln.startswith("a=ice-ufrag:")),
-                    "?",
-                )
-                _status("role-reversal: received camera real answer — "
-                        f"ICE creds normalized ({_rr_master_ufrag}), setup→active, candidates stripped; "
-                        "relying on peer-reflexive from camera STUN")
-            except asyncio.TimeoutError:
-                _status("role-reversal: camera real answer timeout (8s) — ICE likely to fail")
-                _rr_real_sdp = None
-
-            if _rr_real_sdp is not None:
-                try:
-                    await pc.setRemoteDescription(
-                        RTCSessionDescription(sdp=_rr_real_sdp, type="answer")
-                    )
-                except Exception as _exc:
-                    _status(f"setRemoteDescription (role-reversal) failed: {_exc}")
-                    outgoing_q.put_nowait(None)
-                    await pc.close()
-                    raise RuntimeError(
-                        f"async_open_webrtc_stream: setRemoteDescription failed: {_exc}"
-                    ) from _exc
 
         else:
             # ---- NORMAL path: camera sent webrtcResp ---------------------------- #
