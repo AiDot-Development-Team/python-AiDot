@@ -3394,6 +3394,13 @@ class DeviceClient(object):
             _rr_synth_sdp = _rr_synth_sdp.replace(
                 'a=setup:actpass\r\n', 'a=setup:active\r\n'
             )
+            # Strip echoed SSRC lines: the camera mirrors our own local SSRCs back in
+            # its counter-offer.  If we pass these to setRemoteDescription as the
+            # remote sender's SSRCs, aiortc raises "Failed to set remote video
+            # description send parameters" because those SSRCs already belong to our
+            # local transceivers.  Removing them lets aiortc accept any incoming RTP
+            # from the camera regardless of SSRC value.
+            _rr_synth_sdp = _rr_re.sub(r'a=ssrc(?:-group)?:[^\r\n]*\r?\n', '', _rr_synth_sdp)
             try:
                 await pc.setRemoteDescription(
                     RTCSessionDescription(sdp=_rr_synth_sdp, type="answer")
