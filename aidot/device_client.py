@@ -109,6 +109,11 @@ class DeviceClient(object):
     _is_close: bool = False
     on_status_update: Any = None
     _receive_task: Any = None
+    _login_task: Any = None
+    _reconnect_handle: Any = None
+    _ping_timer: Any = None
+    writer: Any = None
+    reader: Any = None
     @property
     def connect_and_login(self) -> bool:
         return self._connect_and_login
@@ -155,7 +160,8 @@ class DeviceClient(object):
             return
         self._ip_address = ip
         if self._connecting is not True and self._connect_and_login is not True:
-            asyncio.get_running_loop().create_task(self.async_login())
+            self._login_task = asyncio.create_task(self.async_login())
+
         
     async def async_login(self) -> None:
         if self._ip_address is None:
@@ -176,6 +182,11 @@ class DeviceClient(object):
         packet = magic + _msgtype + bodysize + send_data
 
         return packet
+    
+    def _notify_status_update(self) -> None:
+        if self.on_status_update:
+            self.on_status_update(self.status)
+        
 
     async def login(self) -> None:
         login_seq = str(int(time.time() * 1000) + self._login_uuid)[-9:]
@@ -227,9 +238,14 @@ class DeviceClient(object):
             self.ascNumber += 1
             self.status.online = True
             self._receive_task = asyncio.create_task(
-                self.reveive_data(),
+                self.receive_data(),
                 name=f"aidot_receive_{self.device_id}"
             )
+            if self._ping_timer:
+                self._ping_timer.cancel()
+            if self._reconnect_handle:
+                self._reconnect_handle.cancel()
+                self._reconnect_handle = None
             self._schedule_ping()
             _LOGGER.info(f"connect device success: {self._ip_address}")
             await self.send_action({}, "getDevAttrReq")
@@ -237,33 +253,32 @@ class DeviceClient(object):
             _LOGGER.error(f"connect device error : {e}")
             return
 
-    async def reveive_data(self) -> None:
+    # TCP容易拼包，需要谨慎处理
+    async def receive_data(self) -> None:
         while True:
             try:
-                data = await self.reader.read(1024)
+                # 先读取 8 字节头
+                header = await self.reader.readexactly(8)
+                magic, msgtype, bodysize = struct.unpack(">HHI", header)
+                
+                # 再读取 body
+                body = await self.reader.readexactly(bodysize)
+                
+                # 解密
+                decrypted_data = aes_decrypt(body, self.aes_key)
+                json_data = json.loads(decrypted_data)
+                # _LOGGER.info(f"reveive_data : {json_data}")
             except asyncio.CancelledError:
                 _LOGGER.debug("Receive task cancelled")
                 raise
-            except (BrokenPipeError, ConnectionResetError) as e:
+            except (BrokenPipeError, ConnectionResetError, asyncio.IncompleteReadError) as e:
                 _LOGGER.error(f"{self.device_id} read status error {e}")
                 await self.reset()
                 self.status.online = False
+                self._notify_status_update()
                 return
             except Exception as e:
-                _LOGGER.error(f"recv data error {e}")
-                return
-            data_len = len(data)
-            if data_len <= 0:
-                _LOGGER.error("recv data error len, exit socket")
-                await self.reset()
-                self.status.online = False
-                return
-            try:
-                magic, msgtype, bodysize = struct.unpack(">HHI", data[:8])
-                decrypted_data = aes_decrypt(data[8:], self.aes_key)
-                json_data = json.loads(decrypted_data)
-            except Exception as e:
-                _LOGGER.error(f"recv json error : {e}")
+                _LOGGER.error(f"recv error: {e}")
                 continue
 
             if "service" in json_data:
@@ -275,8 +290,7 @@ class DeviceClient(object):
             if payload is not None:
                 self.ascNumber = payload.get(CONF_ASCNUMBER)
                 self.status.update(payload.get(CONF_ATTR))
-                if self.on_status_update:
-                    self.on_status_update(self.status)
+                self._notify_status_update()
     
     def _schedule_ping(self):
         loop = asyncio.get_running_loop()
@@ -365,6 +379,7 @@ class DeviceClient(object):
             "srcAddr": "x.xxxxxxx",
             CONF_PAYLOAD: {},
         }
+        _LOGGER.info(f"{self.device_id} send_ping_action {ping}")
         try:
             if self.ping_count >= 2:
                 _LOGGER.error(
@@ -386,25 +401,45 @@ class DeviceClient(object):
     async def reset(self) -> None:
         if self._ping_timer:
             self._ping_timer.cancel()
-        self._timer = None
+        if self._reconnect_handle:
+            self._reconnect_handle.cancel()
+            self._reconnect_handle = None
+
         if self._receive_task and not self._receive_task.done():
             self._receive_task.cancel()
             try:
-                await self.receive_task()
-            except asyncio.CancelledError:
+                await self._receive_task
+            except asyncio.CancelledError as e:
+                _LOGGER.error(f"{self.device_id} writer close error {e}")
                 pass
         try:
             if self.writer:
                 self.writer.close()
                 await self.writer.wait_closed()
         except Exception as e:
-            _LOGGER.error(f"{self.device_id} writer close error {e}")
+            _LOGGER.error(f"{self.device_id} writer/reader close error {e}")
+        self.writer = self.reader = None;
+
         self._connect_and_login = False
         self.status.online = False
         self.ping_count = 0
         self._notify_status_update()
+        # 自动重连（如果没有主动关闭）
+        if not self._is_close and self._ip_address:
+            self._schedule_reconnect()
 
     async def close(self) -> None:
         self._is_close = True
         await self.reset()
         _LOGGER.info(f"{self.device_id} connect close by user")
+
+    def _schedule_reconnect(self) -> None:
+        """延迟重连"""
+        _LOGGER.info(f"{self.device_id} _schedule_reconnect")
+        loop = asyncio.get_running_loop()
+        # self._reconnect_handle = loop.call_later(
+        #     10,  # 10秒后重连
+        #     lambda: asyncio.create_task(self.async_login())
+        # )
+        self._reconnect_handle = loop.call_later(15, self._schedule_reconnect)
+        self._login_task = asyncio.create_task(self.async_login())

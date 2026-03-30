@@ -9,7 +9,9 @@ from typing import Any, Optional
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding
-
+import uuid
+from pathlib import Path
+import hashlib
 from .exceptions import AidotAuthFailed, AidotUserOrPassIncorrect
 from .device_client import DeviceClient
 from .discover import Discover
@@ -102,17 +104,35 @@ class AidotClient:
 
     def update_password(self, password: str) -> None:
         self.password = password
+    
+    def get_terminal_id(self) -> str:
+        file_path = Path.home() / ".aidot_terminal_id"
+        if file_path.exists():
+            raw_id = file_path.read_text().strip()
+        else:
+            node = uuid.getnode()
+            is_random = (node >> 40) & 1
+            
+            if is_random:
+                raw_id = str(uuid.uuid4())
+            else:
+                raw_id = format(node, 'x')
+            file_path.write_text(raw_id)
+        return hashlib.md5(raw_id.encode()).hexdigest()
 
     async def async_post_login(self) -> dict[str, Any]:
         """Login the user input allows us to connect."""
         url = f"{self._base_url}/users/loginWithFreeVerification"
         headers = {CONF_APP_ID: APP_ID, CONF_TERMINAL: "app"}
         # f"{region}:{self.country_name.strip()}",
+        terminalId = self.get_terminal_id()
+        if terminalId is None:
+            terminalId = "gvz3gjae10l4zii00t7y0"
         data = {
             "countryKey": f"region:{self.country_name.strip()}",
             "username": self.username,
             "password": rsa_password_encrypt(self.password),
-            "terminalId": "gvz3gjae10l4zii00t7y0",
+            "terminalId": terminalId,
             "webVersion": "0.5.0",
             "area": "Asia/Shanghai",
             "UTC": "UTC+8",
@@ -126,6 +146,7 @@ class AidotClient:
             self.login_info[CONF_PASSWORD] = self.password
             self.login_info[CONF_REGION] = self._region
             self.login_info[CONF_COUNTRY] = self.country_name
+            self.setup_discover()
             return self.login_info
         except aiohttp.ClientError as e:
             _LOGGER.info(f"async_post_login ClientError {e}")
@@ -250,6 +271,8 @@ class AidotClient:
 
     def setup_discover(self) -> None:
         """初始化完成后调用，启动设备发现"""
+        if self.login_info.get(CONF_ID) is None:
+            return
         if self._discover is not None:
             return
 
@@ -273,4 +296,5 @@ class AidotClient:
 
     async def async_cleanup(self) -> None:
         """清理所有资源"""
+        _LOGGER.info(f"async_cleanup")
         await self.async_close()

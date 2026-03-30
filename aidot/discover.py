@@ -10,8 +10,10 @@ from .const import CONF_ID, CONF_IPADDRESS
 from .exceptions import AidotOSError
 
 _LOGGER = logging.getLogger(__name__)
-_DISCOVER_TIME = 5
+# _DISCOVER_TIME = 15
 
+_DISCOVER_FAST = 5      # 启动时快速发现
+_DISCOVER_SLOW = 120    # 稳定后慢速维持
 
 class BroadcastProtocol:
     _is_closed = False
@@ -49,6 +51,7 @@ class BroadcastProtocol:
                 "timestamp": str(current_timestamp_milliseconds),
             },
         }
+        _LOGGER.info(f"send_broadcast {message}")
         send_data = aes_encrypt(json.dumps(message).encode(), self.aes_key)
         try:
             self.transport.sendto(send_data, ("255.255.255.255", 6666))
@@ -58,6 +61,7 @@ class BroadcastProtocol:
     def datagram_received(self, data, addr) -> None:
         data_str = aes_decrypt(data, self.aes_key)
         data_json = json.loads(data_str)
+        _LOGGER.info(f"datagram_received {data_json}")
         if "payload" in data_json:
             if "mac" in data_json["payload"]:
                 devId = data_json["payload"]["devId"]
@@ -85,62 +89,51 @@ class Discover:
     _login_info: dict[str, Any] = None
     _broadcast_protocol: BroadcastProtocol = None
     discovered_device: dict[str, str]
-    _is_close: bool = False
     _timer_handle: asyncio.TimerHandle | None = None
 
     def __init__(self, login_info, callback):
         self.discovered_device = {}
         self._login_info = login_info
         self._callback = callback
-
+    
     async def try_create_broadcast(self) -> None:
-        if self._broadcast_protocol is None:
-            self._broadcast_protocol = BroadcastProtocol(
-                self._discover_callback, self._login_info[CONF_ID]
+        if self._broadcast_protocol is not None:
+            return
+        try:
+            protocol = BroadcastProtocol(self._discover_callback, self._login_info[CONF_ID])
+            self._transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+                lambda: protocol,
+                local_addr=("0.0.0.0", 0),
             )
-            try:
-                (
-                    transport,
-                    protocol,
-                ) = await asyncio.get_event_loop().create_datagram_endpoint(
-                    lambda: self._broadcast_protocol,
-                    local_addr=("0.0.0.0", 0),
-                )
-            except OSError:
-                raise AidotOSError
-
-    async def send_broadcast(self) -> None:
-        await self.try_create_broadcast()
-        self._broadcast_protocol.send_broadcast()
+            self._broadcast_protocol = protocol  # 成功后再赋值
+        except OSError:
+            raise AidotOSError
 
     def start_repeat_broadcast(self) -> None:
-        """启动定时广播"""
         self._is_close = False
+        self._fast_discover_count = 6  # 前6次快速（30秒内）
         self._schedule_broadcast()
 
     def _schedule_broadcast(self) -> None:
-        """调度下一次广播"""
-        if self._is_close:
-            return
+        _LOGGER.debug(f"_schedule_broadcast")
+        # 前几次快速发现，之后慢速
+        if self._fast_discover_count > 0:
+            interval = _DISCOVER_FAST
+            self._fast_discover_count -= 1
+        else:
+            interval = _DISCOVER_SLOW
+        
         loop = asyncio.get_running_loop()
-        loop.create_task(self._do_broadcast())
-        self._timer_handle = loop.call_later(
-            _DISCOVER_TIME,
-            self._schedule_broadcast
-        )
+        asyncio.create_task(self._do_broadcast())
+        self._timer_handle = loop.call_later(interval, self._schedule_broadcast)
 
     async def _do_broadcast(self) -> None:
         """执行广播"""
         try:
-            await self.send_broadcast()
+            await self.try_create_broadcast()
+            self._broadcast_protocol.send_broadcast()
         except Exception as e:
             _LOGGER.error(f"Broadcast failed: {e}")
-
-    async def fetch_devices_info(self) -> dict[str, str]:
-        await self.try_create_broadcast()
-        self._broadcast_protocol.send_broadcast()
-        await asyncio.sleep(2)
-        return self.discovered_device
 
     def _discover_callback(self, dev_id, event: dict[str, str]) -> None:
         self.discovered_device[dev_id] = event[CONF_IPADDRESS]
@@ -148,7 +141,6 @@ class Discover:
             self._callback(dev_id, event)
 
     def close(self) -> None:
-        self._is_close = True
         if self._timer_handle is not None:
             self._timer_handle.cancel()
             self._timer_handle = None
