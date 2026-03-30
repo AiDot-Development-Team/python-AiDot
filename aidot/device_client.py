@@ -3398,10 +3398,12 @@ class DeviceClient(object):
             _rr_synth_sdp = _rr_re.sub(r'a=ssrc(?:-group)?:[^\r\n]*\r?\n', '', _rr_synth_sdp)
             # Camera sends media to us → its answer direction is sendonly.
             _rr_synth_sdp = _rr_synth_sdp.replace('a=recvonly\r\n', 'a=sendonly\r\n')
-            # DTLS: our webrtcResp says passive (server); tell aiortc the remote is
-            # active (client) so aiortc's DTLS layer stays in server/passive role.
+            # DTLS: our webrtcResp says active (client); tell aiortc the remote is
+            # passive (server) so aiortc's DTLS layer is active/client and will
+            # initiate the handshake once ICE peer-reflexive candidates are found.
+            # RFC 5763: offerer actpass + remote answer passive → offerer is DTLS active.
             _rr_synth_sdp = _rr_synth_sdp.replace(
-                'a=setup:actpass\r\n', 'a=setup:active\r\n'
+                'a=setup:actpass\r\n', 'a=setup:passive\r\n'
             )
             try:
                 await pc.setRemoteDescription(
@@ -3423,14 +3425,17 @@ class DeviceClient(object):
                     f" {_rr_srd_exc}"
                 ) from _rr_srd_exc
             # Send webrtcResp so the camera knows our DTLS fingerprint and ICE params.
-            # We are the DTLS server (passive); the camera must be the DTLS client
-            # (active) and initiate the handshake to our ICE candidates.
-            # Replace a=setup:actpass with a=setup:passive so the camera sees an
-            # unambiguous "you are DTLS active, connect to me" instruction.
+            # We are the DTLS client (active); the camera is the DTLS server
+            # (passive) — consistent with its real answer (second webrtcResp,
+            # a=setup:passive).  Replace a=setup:actpass with a=setup:active so
+            # the camera sees an unambiguous "you are DTLS passive server" signal.
+            # When the camera receives a=setup:active it will send ICE binding
+            # requests to our ports (iceCandidateReq) so we can discover its
+            # address via peer-reflexive candidates.
             # aiortc generates SDPs with \r\n so a simple replace is safe here.
             _rr_answer_sdp = _normalize_bundle_ice_credentials(
                 pc.localDescription.sdp.replace(
-                    "a=setup:actpass\r\n", "a=setup:passive\r\n"
+                    "a=setup:actpass\r\n", "a=setup:active\r\n"
                 )
             )
             _webrtc_resp_topic   = f"iot/v1/s/{user_id}/IPC/webrtcResp"
@@ -3451,7 +3456,7 @@ class DeviceClient(object):
                 },
             })
             outgoing_q.put_nowait((_webrtc_resp_topic, _webrtc_resp_payload))
-            _status("webrtcResp sent (role-reversal answer, setup=passive)")
+            _status("webrtcResp sent (role-reversal answer, setup=active)")
 
             # Re-announce our ICE candidates now that the camera has the full
             # signalling picture (livePlayReq + webrtcResp).  iOS app telemetry
