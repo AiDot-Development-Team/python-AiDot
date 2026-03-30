@@ -3306,13 +3306,13 @@ class DeviceClient(object):
         if camera_offer_fut in _rr_done and answer_fut not in _rr_done:
             # ---- ROLE REVERSAL path (e.g. LK.IPC.A001064) ---------------------- #
             # Camera sent webrtcReq (its offer) instead of webrtcResp.
-            # Protocol: we send webrtcResp (our answer), then the camera sends its
-            # real webrtcResp (captured in second_answer_fut) with its own ICE
-            # credentials and candidates.  We MUST use that real answer for
-            # setRemoteDescription so aiortc's ICE agent can authenticate the
-            # camera's STUN binding requests.  Using our own local SDP (old
-            # approach) caused ICE to stay in "checking" forever because the
-            # camera's STUN ufrag/pwd didn't match our self-referential credentials.
+            # Protocol: we send webrtcResp (our answer to the camera's counter-offer),
+            # then the camera sends its real second webrtcResp (captured in
+            # second_answer_fut, ignored here — ICE timing).
+            # We call setRemoteDescription NOW using a synthetic answer built from
+            # pc.localDescription.sdp (for correct codec PTs) but patched with the
+            # camera's own ICE credentials from the counter-offer (so aioice can
+            # authenticate the camera's incoming STUN binding requests).
             _status(
                 "camera sent webrtcReq (role reversal) — answering and sending webrtcResp"
             )
@@ -3367,18 +3367,29 @@ class DeviceClient(object):
             # iceCandidateReq.  If we wait for second_answer_fut (up to 8 s) before
             # calling setRemoteDescription, the camera's initial binding checks may
             # expire before aiortc's ICE agent starts — leaving ICE stuck in
-            # "checking" indefinitely.  Instead, call setRemoteDescription NOW using
-            # the counter-offer SDP (already available synchronously).  The camera
-            # echoes our ICE credentials, so the counter-offer carries the identical
-            # ufrag/pwd that the real answer would carry.  aiortc enters ICE "checking"
-            # immediately; when the camera's STUN probes arrive after iceCandidateReq,
-            # aioice creates peer-reflexive candidates and ICE connects.
+            # "checking" indefinitely.  Instead, call setRemoteDescription NOW with
+            # a synthetic answer (built from our local offer but with the camera's
+            # ICE credentials injected).  aiortc enters ICE "checking" immediately;
+            # when the camera's STUN probes arrive after iceCandidateReq, aioice
+            # creates peer-reflexive candidates and ICE connects.
             import re as _rr_re
+            # Extract camera's ICE credentials from its counter-offer.
+            # The camera (LK.IPC.A001064) uses its OWN credentials in both the
+            # counter-offer (webrtcReq) and its real second answer — it does NOT echo
+            # ours.  We inject these into the synthetic remote description so aioice
+            # can authenticate the camera's incoming STUN binding requests.  Without
+            # this, every STUN probe from the camera fails auth → ICE stuck checking.
+            _cam_counter_sdp = (camera_offer_fut.result() or {}).get("sdp", "")
+            _cam_ice_ufrag: str | None = None
+            _cam_ice_pwd:   str | None = None
+            for _rr_cln in _cam_counter_sdp.splitlines():
+                if _rr_cln.startswith("a=ice-ufrag:") and _cam_ice_ufrag is None:
+                    _cam_ice_ufrag = _rr_cln.strip()
+                if _rr_cln.startswith("a=ice-pwd:") and _cam_ice_pwd is None:
+                    _cam_ice_pwd = _rr_cln.strip()
             # Use pc.localDescription.sdp (the unpatched aiortc offer) as the
             # synthetic answer base so the codec list matches aiortc's internal state
             # (VP8/H264 PT=97-102 for all m-sections, no PT=103=H265).
-            # The camera echoes our ICE credentials, so after normalisation the
-            # ufrag/pwd will match what the camera uses in its STUN binding requests.
             _rr_synth_sdp = pc.localDescription.sdp
             _rr_synth_sdp = _normalize_bundle_ice_credentials(_rr_synth_sdp)
             # Strip our own local ICE candidates — they are useless as "remote"
@@ -3396,14 +3407,24 @@ class DeviceClient(object):
             # not appear as remote sender SSRCs.  Removing them lets aiortc accept
             # incoming RTP from the camera regardless of its actual SSRC.
             _rr_synth_sdp = _rr_re.sub(r'a=ssrc(?:-group)?:[^\r\n]*\r?\n', '', _rr_synth_sdp)
+            # Replace our local ICE credentials with the camera's so aioice
+            # authenticates the camera's STUN probes correctly.
+            if _cam_ice_ufrag:
+                _rr_synth_sdp = _rr_re.sub(
+                    r'a=ice-ufrag:[^\r\n]*', _cam_ice_ufrag, _rr_synth_sdp
+                )
+            if _cam_ice_pwd:
+                _rr_synth_sdp = _rr_re.sub(
+                    r'a=ice-pwd:[^\r\n]*', _cam_ice_pwd, _rr_synth_sdp
+                )
             # Camera sends media to us → its answer direction is sendonly.
             _rr_synth_sdp = _rr_synth_sdp.replace('a=recvonly\r\n', 'a=sendonly\r\n')
-            # DTLS: our webrtcResp says active (client); tell aiortc the remote is
-            # passive (server) so aiortc's DTLS layer is active/client and will
-            # initiate the handshake once ICE peer-reflexive candidates are found.
-            # RFC 5763: offerer actpass + remote answer passive → offerer is DTLS active.
+            # DTLS: camera's real second answer says a=setup:active (camera is DTLS
+            # client).  Tell aiortc the remote is active so aiortc acts as DTLS
+            # passive/server and waits for the camera's ClientHello.
+            # RFC 5763: remote=active → local=passive (server).
             _rr_synth_sdp = _rr_synth_sdp.replace(
-                'a=setup:actpass\r\n', 'a=setup:passive\r\n'
+                'a=setup:actpass\r\n', 'a=setup:active\r\n'
             )
             try:
                 await pc.setRemoteDescription(
@@ -3425,17 +3446,15 @@ class DeviceClient(object):
                     f" {_rr_srd_exc}"
                 ) from _rr_srd_exc
             # Send webrtcResp so the camera knows our DTLS fingerprint and ICE params.
-            # We are the DTLS client (active); the camera is the DTLS server
-            # (passive) — consistent with its real answer (second webrtcResp,
-            # a=setup:passive).  Replace a=setup:actpass with a=setup:active so
-            # the camera sees an unambiguous "you are DTLS passive server" signal.
-            # When the camera receives a=setup:active it will send ICE binding
-            # requests to our ports (iceCandidateReq) so we can discover its
-            # address via peer-reflexive candidates.
+            # We are DTLS passive/server; the camera is DTLS active/client — it will
+            # initiate the ClientHello once ICE connects.  Replace a=setup:actpass
+            # with a=setup:passive so the camera sees an unambiguous signal that it
+            # should be DTLS active (consistent with its real second answer where it
+            # already declares a=setup:active).
             # aiortc generates SDPs with \r\n so a simple replace is safe here.
             _rr_answer_sdp = _normalize_bundle_ice_credentials(
                 pc.localDescription.sdp.replace(
-                    "a=setup:actpass\r\n", "a=setup:active\r\n"
+                    "a=setup:actpass\r\n", "a=setup:passive\r\n"
                 )
             )
             _webrtc_resp_topic   = f"iot/v1/s/{user_id}/IPC/webrtcResp"
@@ -3456,7 +3475,7 @@ class DeviceClient(object):
                 },
             })
             outgoing_q.put_nowait((_webrtc_resp_topic, _webrtc_resp_payload))
-            _status("webrtcResp sent (role-reversal answer, setup=active)")
+            _status("webrtcResp sent (role-reversal answer, setup=passive)")
 
             # Re-announce our ICE candidates now that the camera has the full
             # signalling picture (livePlayReq + webrtcResp).  iOS app telemetry
