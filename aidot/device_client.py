@@ -2615,6 +2615,7 @@ class DeviceClient(object):
         second_answer_fut: asyncio.Future = loop.create_future()   # captures discarded broker-echo camera's real webrtcResp
         camera_offer_fut:  asyncio.Future = loop.create_future()  # set when camera sends webrtcReq (role-reversal)
         ice_q:            asyncio.Queue   = asyncio.Queue()
+        cam_ip_q:         asyncio.Queue   = asyncio.Queue()  # camera IP from setDevAttrNotif
         camera_ready_ev:  asyncio.Event   = asyncio.Event()  # set when camera is on MQTT
         liveplay_echo_ev: asyncio.Event   = asyncio.Event()  # set when livePlayReq echo arrives
 
@@ -2732,6 +2733,20 @@ class DeviceClient(object):
                         f"camera replied  topic={t}  method={m!r}  payload={p!r}"
                     )
                 )
+            elif method == "setDevAttrNotif":
+                # Camera broadcasts its real LAN IP shortly after ICE starts.
+                # Capture it so the role-reversal path can inject synthetic
+                # remote candidates (camera-IP + echoed ports) to give aiortc
+                # a concrete target for STUN probes when the camera is ICE-lite
+                # and won't send its own binding requests.
+                _cam_ip = inner.get("ipAddress") or msg.get("ipAddress")
+                if _cam_ip:
+                    loop.call_soon_threadsafe(cam_ip_q.put_nowait, _cam_ip)
+                    loop.call_soon_threadsafe(
+                        lambda ip=_cam_ip: _status(
+                            f"setDevAttrNotif: camera IP = {ip}"
+                        )
+                    )
             else:
                 loop.call_soon_threadsafe(
                     lambda m=method, p=inner, t=topic: _status(
@@ -3303,6 +3318,10 @@ class DeviceClient(object):
                 f"async_open_webrtc_stream: no webrtcResp received within {timeout}s"
             )
 
+        # Ports from camera counter-offer for synthetic candidate injection.
+        # Populated in the role-reversal path below; consumed in the ICE wait loop.
+        _rr_cam_ports: list = []  # list of (sdpMid, sdpMLineIndex, port)
+
         if camera_offer_fut in _rr_done and answer_fut not in _rr_done:
             # ---- ROLE REVERSAL path (e.g. LK.IPC.A001064) ---------------------- #
             # Camera sent webrtcReq (its offer) instead of webrtcResp.
@@ -3382,11 +3401,21 @@ class DeviceClient(object):
             _cam_counter_sdp = (camera_offer_fut.result() or {}).get("sdp", "")
             _cam_ice_ufrag: str | None = None
             _cam_ice_pwd:   str | None = None
+            _rr_cm_idx = -1
             for _rr_cln in _cam_counter_sdp.splitlines():
                 if _rr_cln.startswith("a=ice-ufrag:") and _cam_ice_ufrag is None:
                     _cam_ice_ufrag = _rr_cln.strip()
                 if _rr_cln.startswith("a=ice-pwd:") and _cam_ice_pwd is None:
                     _cam_ice_pwd = _rr_cln.strip()
+                # Collect ports from the camera counter-offer m-lines for later
+                # synthetic candidate injection (cam-IP + echoed port).
+                if _rr_cln.startswith("m="):
+                    _rr_cm_idx += 1
+                    _rr_pm = _rr_re.match(r'm=\S+ (\d+)', _rr_cln)
+                    if _rr_pm:
+                        _rr_cp = int(_rr_pm.group(1))
+                        if _rr_cp != 0 and _rr_cm_idx <= 2:
+                            _rr_cam_ports.append((str(_rr_cm_idx), _rr_cm_idx, _rr_cp))
             # Use pc.localDescription.sdp (the unpatched aiortc offer) as the
             # synthetic answer base so the codec list matches aiortc's internal state
             # (VP8/H264 PT=97-102 for all m-sections, no PT=103=H265).
@@ -3614,6 +3643,34 @@ class DeviceClient(object):
                     _LOGGER.debug(
                         "async_open_webrtc_stream: addIceCandidate error: %s", exc
                     )
+            # Drain camera-IP queue (setDevAttrNotif) and inject synthetic candidates.
+            # When a role-reversal camera (e.g. LK.IPC.A001064) is ICE-lite it will
+            # not send STUN binding requests on its own; it only responds to ours.
+            # With no remote candidates in the synthetic answer, aiortc has nothing
+            # to probe.  When setDevAttrNotif delivers the camera's real LAN IP we
+            # synthesize host candidates using that IP + the ports the camera echoed
+            # in its counter-offer, giving aiortc concrete targets to STUN-probe.
+            while True:
+                try:
+                    _cam_ip_addr = cam_ip_q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if _rr_cam_ports:
+                    for _c_smid, _c_smidx, _c_port in _rr_cam_ports:
+                        _synth_cand_line = (
+                            f"1 1 udp 2130706431 {_cam_ip_addr} {_c_port} typ host"
+                        )
+                        try:
+                            _synth_ice = candidate_from_sdp(_synth_cand_line)
+                            await pc.addIceCandidate(_synth_ice)
+                            _status(
+                                f"addIceCandidate (cam-IP synth):"
+                                f" {_cam_ip_addr}:{_c_port}  mid:{_c_smid}"
+                            )
+                        except Exception as _synth_exc:
+                            _LOGGER.debug(
+                                "addIceCandidate (cam-IP synth) error: %s", _synth_exc
+                            )
             # Periodic ICE state heartbeat so we know the loop is alive.
             if time.monotonic() - _last_ice_log >= 5.0:
                 _status(
