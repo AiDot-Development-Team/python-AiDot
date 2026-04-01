@@ -2566,6 +2566,16 @@ class DeviceClient(object):
                 _numeric_uid_raw = None
         numeric_user_id = str(_numeric_uid_raw) if _numeric_uid_raw is not None else None
 
+        # Also extract the camera's local IP address from batchGetDeviceUserInfo if present.
+        # Used to pre-seed cam_ip_q in the role-reversal ICE wait loop as a fallback when
+        # setDevAttrNotif doesn't arrive or uses an unexpected IP field name.
+        _cam_local_ip: str | None = (
+            (_cam_user_info or {}).get("localIp")
+            or (_cam_user_info or {}).get("ipAddress")
+            or (_cam_user_info or {}).get("ip")
+            or (_cam_user_info or {}).get("localIPAddress")
+        ) or None
+
         # Respect isDTLS='0': those cameras cannot do DTLS, so falling back
         # after an SDES timeout would only hang the stream (~30 s with zero
         # frames).  For cameras where isDTLS is absent or non-zero, allow DTLS
@@ -2739,13 +2749,24 @@ class DeviceClient(object):
                 # remote candidates (camera-IP + echoed ports) to give aiortc
                 # a concrete target for STUN probes when the camera is ICE-lite
                 # and won't send its own binding requests.
-                _cam_ip = inner.get("ipAddress") or msg.get("ipAddress")
+                # Check multiple field name variants — firmware differs across models.
+                _cam_ip = (inner.get("ipAddress") or inner.get("ip")
+                           or inner.get("localIp") or inner.get("localIPAddress")
+                           or msg.get("ipAddress") or msg.get("ip")
+                           or msg.get("localIp") or msg.get("localIPAddress"))
                 if _cam_ip:
                     loop.call_soon_threadsafe(cam_ip_q.put_nowait, _cam_ip)
                     loop.call_soon_threadsafe(
                         lambda ip=_cam_ip: _status(
                             f"setDevAttrNotif: camera IP = {ip}"
                         )
+                    )
+                else:
+                    _LOGGER.warning(
+                        "setDevAttrNotif: no IP address field found;"
+                        " inner_keys=%s  msg_keys=%s",
+                        list(inner.keys()),
+                        [k for k in msg if k != "payload"],
                     )
             else:
                 loop.call_soon_threadsafe(
@@ -3474,6 +3495,14 @@ class DeviceClient(object):
                     f"async_open_webrtc_stream: setRemoteDescription failed:"
                     f" {_rr_srd_exc}"
                 ) from _rr_srd_exc
+            # Pre-seed cam_ip_q with camera IP from user info (fallback if setDevAttrNotif
+            # doesn't arrive).  Must be done after _rr_cam_ports is populated and after
+            # setRemoteDescription so aiortc is in ICE "checking" state when the ICE wait
+            # loop picks up the candidate and calls addIceCandidate.
+            if _cam_local_ip and _rr_cam_ports and cam_ip_q.empty():
+                cam_ip_q.put_nowait(_cam_local_ip)
+                _status(f"pre-seeded cam_ip_q from user-info IP: {_cam_local_ip}")
+
             # Send webrtcResp so the camera knows our DTLS fingerprint and ICE params.
             # We are DTLS passive/server; the camera is DTLS active/client — it will
             # initiate the ClientHello once ICE connects.  Replace a=setup:actpass
