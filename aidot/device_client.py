@@ -2585,7 +2585,7 @@ class DeviceClient(object):
                 " — no IP field in batchGetDeviceUserInfo and no LAN-discovered IP."
                 " Synthetic ICE candidates cannot be injected; ICE will fail for"
                 " ICE-lite cameras (e.g. LK.IPC.A001064).  user_info_keys=%s",
-                device_id,
+                self.device_id,
                 sorted((_cam_user_info or {}).keys()),
             )
 
