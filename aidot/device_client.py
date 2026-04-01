@@ -2637,6 +2637,7 @@ class DeviceClient(object):
         answer_fut:        asyncio.Future = loop.create_future()
         second_answer_fut: asyncio.Future = loop.create_future()   # captures discarded broker-echo camera's real webrtcResp
         camera_offer_fut:  asyncio.Future = loop.create_future()  # set when camera sends webrtcReq (role-reversal)
+        ice_config_fut:    asyncio.Future = loop.create_future()  # TURN credentials from getIceConfigResp
         ice_q:            asyncio.Queue   = asyncio.Queue()
         cam_ip_q:         asyncio.Queue   = asyncio.Queue()  # camera IP from setDevAttrNotif
         camera_ready_ev:  asyncio.Event   = asyncio.Event()  # set when camera is on MQTT
@@ -2781,6 +2782,15 @@ class DeviceClient(object):
                         list(inner.keys()),
                         [k for k in msg if k != "payload"],
                     )
+            elif method == "getIceConfigResp":
+                # Capture TURN server credentials so aiortc can use them.
+                # getIceConfigResp arrives before RTCPeerConnection is created,
+                # so we store it in ice_config_fut and consume it later.
+                _ice_inner = inner if isinstance(inner, dict) else {}
+                if not _ice_inner and isinstance(msg.get("data"), dict):
+                    _ice_inner = msg["data"]
+                if ("app" in _ice_inner or "dev" in _ice_inner) and not ice_config_fut.done():
+                    loop.call_soon_threadsafe(ice_config_fut.set_result, _ice_inner)
             else:
                 loop.call_soon_threadsafe(
                     lambda m=method, p=inner, t=topic: _status(
@@ -2946,10 +2956,29 @@ class DeviceClient(object):
         # aiortc peer connection (DTLS-SRTP path)
         # ------------------------------------------------------------------ #
         from aiortc import RTCConfiguration, RTCIceServer
+        _ice_servers = [RTCIceServer(urls=["stun:stun.l.google.com:19302"])]
+        if ice_config_fut.done():
+            try:
+                _ice_data = ice_config_fut.result()
+                for _entry in (_ice_data.get("app") or []):
+                    _uris = _entry.get("uris") or _entry.get("dnsUris") or []
+                    _uid  = str(_entry.get("id") or "")
+                    _cred = str(_entry.get("token") or "")
+                    if _uris:
+                        _ice_servers.append(
+                            RTCIceServer(urls=_uris, username=_uid, credential=_cred)
+                        )
+                if len(_ice_servers) > 1:
+                    _status(
+                        f"Using TURN servers from getIceConfigResp:"
+                        f" {[s.urls for s in _ice_servers[1:]]}"
+                    )
+            except Exception as _ice_exc:
+                _LOGGER.warning(
+                    "Failed to parse getIceConfigResp ICE config: %s", _ice_exc
+                )
         pc = RTCPeerConnection(
-            configuration=RTCConfiguration(
-                iceServers=[RTCIceServer(urls=["stun:stun.l.google.com:19302"])]
-            )
+            configuration=RTCConfiguration(iceServers=_ice_servers)
         )
         pc.addTransceiver("audio", direction="recvonly")   # mid:0  audio
         pc.addTransceiver("video", direction="recvonly")   # mid:1  H264 (primary video)
@@ -3630,6 +3659,27 @@ class DeviceClient(object):
                 raise RuntimeError(
                     f"async_open_webrtc_stream: setRemoteDescription failed: {exc}"
                 ) from exc
+
+            # Extract ICE candidates embedded in the SDP answer body.
+            # The AiDot camera includes its host candidate as a=candidate: lines
+            # inside the answer SDP.  The browser WebRTC API processes these
+            # automatically; aiortc requires explicit addIceCandidate() calls.
+            import re as _re
+            for _m_sdp_cand in _re.finditer(
+                r'(?m)^a=candidate:(.+)$', _ans_sdp_aiortc
+            ):
+                _sdp_cand_line = _re.sub(
+                    r'\s+generation\s+\d+.*$',
+                    '',
+                    _m_sdp_cand.group(1).strip(),
+                )
+                try:
+                    await pc.addIceCandidate(candidate_from_sdp(_sdp_cand_line))
+                    _status(f"addIceCandidate (answer SDP): {_sdp_cand_line[:80]}")
+                except Exception as _sdp_exc:
+                    _LOGGER.debug(
+                        "addIceCandidate (answer SDP) error: %s", _sdp_exc
+                    )
 
         # ------------------------------------------------------------------ #
         # Apply remote ICE candidates + wait for ICE connection
