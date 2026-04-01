@@ -114,6 +114,7 @@ class DeviceClient(object):
     _ping_timer: Any = None
     writer: Any = None
     reader: Any = None
+    _TAG: str = "DeviceClient"
     @property
     def connect_and_login(self) -> bool:
         return self._connect_and_login
@@ -138,9 +139,11 @@ class DeviceClient(object):
         self.password = device.get(CONF_PASSWORD)
         self.device_id = device.get(CONF_ID)
         self._simpleVersion = device.get("simpleVersion")
+        self._TAG = f"{self.device_id}";
+        _LOGGER.warning(f"{self._TAG}:{device}")
 
     async def connect(self, ip_address) -> None:
-        _LOGGER.info(f"connect device : {ip_address}")
+        _LOGGER.warning(f"{self._TAG}:connect device: {ip_address}")
         self.reader = self.writer = None
         self._connecting = True
         try:
@@ -208,34 +211,20 @@ class DeviceClient(object):
         try:
             self.writer.write(self.get_send_packet(json.dumps(message).encode(), 1))
             await self.writer.drain()
-            data = await self.reader.read(1024)
-        except (BrokenPipeError, ConnectionResetError) as e:
-            _LOGGER.error(f"{self.device_id} login read status error {e}")
-        except Exception as e:
-            _LOGGER.error(f"recv data error {e}")
-
-        data_len = len(data)
-        if data_len <= 0:
-            return
-        
-        try:
-            magic, msgtype, bodysize = struct.unpack(">HHI", data[:8])
-            encrypted_data = data[8:]
-            if self.aes_key is not None:
-                decrypted_data = aes_decrypt(encrypted_data, self.aes_key)
-            else:
-                decrypted_data = encrypted_data
-
+            header = await self.reader.readexactly(8)
+            magic, msgtype, bodysize = struct.unpack(">HHI", header)
+            body = await self.reader.readexactly(bodysize)
+            decrypted_data = aes_decrypt(body, self.aes_key) if self.aes_key else body
             json_data = json.loads(decrypted_data)
             code = json_data[CONF_ACK][CONF_CODE]
+        
             if code != 200:
                 # 登录失败
-                _LOGGER.error(f"{self.device_id} login error, code: {code}")
+                _LOGGER.error(f"{self._TAG}:login error, code: {code}")
                 await self.reset()
                 return
 
-            self.ascNumber = json_data[CONF_PAYLOAD][CONF_ASCNUMBER]
-            self.ascNumber += 1
+            self.ascNumber = json_data[CONF_PAYLOAD][CONF_ASCNUMBER] + 1
             self.status.online = True
             self._receive_task = asyncio.create_task(
                 self.receive_data(),
@@ -247,38 +236,35 @@ class DeviceClient(object):
                 self._reconnect_handle.cancel()
                 self._reconnect_handle = None
             self._schedule_ping()
-            _LOGGER.info(f"connect device success: {self._ip_address}")
+            _LOGGER.warning(f"{self._TAG}:connect success: {self._ip_address}")
             await self.send_action({}, "getDevAttrReq")
-        except Exception as e:
-            _LOGGER.error(f"connect device error : {e}")
-            return
+        except (BrokenPipeError, ConnectionResetError, Exception) as e:
+            _LOGGER.error(f"{self.device_id} login read status error {e}")
 
     # TCP容易拼包，需要谨慎处理
     async def receive_data(self) -> None:
         while True:
             try:
-                # 先读取 8 字节头
                 header = await self.reader.readexactly(8)
                 magic, msgtype, bodysize = struct.unpack(">HHI", header)
-                
-                # 再读取 body
+                self.ping_count = 0 #有读到数据就把ping清零
                 body = await self.reader.readexactly(bodysize)
-                
-                # 解密
                 decrypted_data = aes_decrypt(body, self.aes_key)
                 json_data = json.loads(decrypted_data)
-                # _LOGGER.info(f"reveive_data : {json_data}")
+                _LOGGER.warning(f"{self._TAG}:reveive_data : {json_data}")
             except asyncio.CancelledError:
-                _LOGGER.debug("Receive task cancelled")
+                _LOGGER.debug(f"{self._TAG}:Receive task cancelled")
                 raise
             except (BrokenPipeError, ConnectionResetError, asyncio.IncompleteReadError) as e:
-                _LOGGER.error(f"{self.device_id} read status error {e}")
-                await self.reset()
-                self.status.online = False
-                self._notify_status_update()
+                _LOGGER.error(f"{self._TAG}:read status error {e}")
+                # await self.reset()
+                syncio.get_running_loop().call_soon(
+                    lambda: asyncio.create_task(self.reset())
+                )
                 return
             except Exception as e:
-                _LOGGER.error(f"recv error: {e}")
+                _LOGGER.error(f"{self._TAG}:recv error: {e}")
+                self.ping_count = 0
                 continue
 
             if "service" in json_data:
@@ -295,7 +281,7 @@ class DeviceClient(object):
     def _schedule_ping(self):
         loop = asyncio.get_running_loop()
         loop.create_task(self.send_ping_action())
-        self._ping_timer = loop.call_later(10, self._schedule_ping)
+        self._ping_timer = loop.call_later(30, self._schedule_ping)
 
     async def send_dev_attr(self, dev_attr) -> None:
         if not self._connect_and_login:
@@ -364,10 +350,10 @@ class DeviceClient(object):
             self.writer.write(self.get_send_packet(json.dumps(action).encode(), 1))
             await self.writer.drain()
         except (BrokenPipeError, ConnectionResetError) as e:
-            _LOGGER.error(f"{self.device_id} send action error {e}")
+            _LOGGER.error(f"{self._TAG}:send action error {e}")
             await self.reset()
         except Exception as e:
-            _LOGGER.error(f"{self.device_id} send action error {e}")
+            _LOGGER.error(f"{self._TAG}:send action error {e}")
 
     async def send_ping_action(self) -> int:
         if self._is_close:
@@ -379,11 +365,11 @@ class DeviceClient(object):
             "srcAddr": "x.xxxxxxx",
             CONF_PAYLOAD: {},
         }
-        _LOGGER.info(f"{self.device_id} send_ping_action {ping}")
+        # _LOGGER.info(f"{self.device_id} send_ping_action {ping}")
         try:
-            if self.ping_count >= 2:
+            if self.ping_count >= 3:
                 _LOGGER.error(
-                    f"Last ping did not return within 20 seconds. device id:{self.device_id}"
+                    f"{self._TAG}:Device unresponsive within 90 seconds, disconnecting."
                 )
                 await self.reset()
                 return -1
