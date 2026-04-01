@@ -216,12 +216,38 @@ async def run(args: argparse.Namespace) -> None:
                 return
             print(f"    Filtered to device {args.device!r}")
 
+        # Brief LAN broadcast discovery so ICE-lite cameras (e.g. LK.IPC.A001064)
+        # get their local IP populated in dc._ip_address before the WebRTC session.
+        # Without this, batchGetDeviceUserInfo returns no IP field for these cameras
+        # and synthetic ICE candidates cannot be injected — ICE fails after 30 s.
+        _disc_ips: dict = {}
+        try:
+            from aidot.discover import Discover as _Discover
+            print("\n[LAN] Discovering cameras on local network ...")
+            _disc = _Discover(client.login_info, None)
+            await _disc.send_broadcast()
+            await asyncio.sleep(2.0)
+            _disc.close()
+            for _cam in cameras:
+                _disc_ip = _disc.discovered_device.get(_cam.get("id"))
+                if _disc_ip:
+                    _disc_ips[_cam.get("id")] = _disc_ip
+                    print(f"    LAN discovery: {_cam.get('name')} → {_disc_ip}")
+            if not _disc_ips:
+                print("    No cameras responded to LAN broadcast (may be remote/offline)")
+        except Exception as _disc_exc:
+            print(f"    LAN discovery skipped: {_disc_exc}")
+
         # Run selected tests
         for cam in cameras:
             dc = client.get_device_client(cam)
             # Ensure batchGetDeviceUserInfo uses all device IDs (server may
             # return empty results if only a single device ID is sent).
             dc._all_device_ids = _all_camera_ids
+            # Apply LAN-discovered IP so async_open_webrtc_stream can inject
+            # synthetic ICE candidates for ICE-lite cameras.
+            if cam.get("id") in _disc_ips:
+                dc._ip_address = _disc_ips[cam.get("id")]
             print(f"\n{'='*60}")
             print(f"Camera: {cam.get('name')}  ({cam.get('id')})")
             print(f"{'='*60}")

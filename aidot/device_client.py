@@ -2569,12 +2569,25 @@ class DeviceClient(object):
         # Also extract the camera's local IP address from batchGetDeviceUserInfo if present.
         # Used to pre-seed cam_ip_q in the role-reversal ICE wait loop as a fallback when
         # setDevAttrNotif doesn't arrive or uses an unexpected IP field name.
+        # Final fallback: self._ip_address populated by LAN broadcast discovery
+        # (update_ip_address / Discover.send_broadcast) — covers ICE-lite cameras such as
+        # LK.IPC.A001064 whose batchGetDeviceUserInfo response contains no IP field.
         _cam_local_ip: str | None = (
             (_cam_user_info or {}).get("localIp")
             or (_cam_user_info or {}).get("ipAddress")
             or (_cam_user_info or {}).get("ip")
             or (_cam_user_info or {}).get("localIPAddress")
+            or self._ip_address
         ) or None
+        if not _cam_local_ip:
+            _LOGGER.warning(
+                "async_open_webrtc_stream: camera IP unknown for %s"
+                " — no IP field in batchGetDeviceUserInfo and no LAN-discovered IP."
+                " Synthetic ICE candidates cannot be injected; ICE will fail for"
+                " ICE-lite cameras (e.g. LK.IPC.A001064).  user_info_keys=%s",
+                device_id,
+                sorted((_cam_user_info or {}).keys()),
+            )
 
         # Respect isDTLS='0': those cameras cannot do DTLS, so falling back
         # after an SDES timeout would only hang the stream (~30 s with zero
