@@ -3482,12 +3482,12 @@ class DeviceClient(object):
                 )
             # Camera sends media to us → its answer direction is sendonly.
             _rr_synth_sdp = _rr_synth_sdp.replace('a=recvonly\r\n', 'a=sendonly\r\n')
-            # DTLS: camera's real second answer says a=setup:active (camera is DTLS
-            # client).  Tell aiortc the remote is active so aiortc acts as DTLS
-            # passive/server and waits for the camera's ClientHello.
-            # RFC 5763: remote=active → local=passive (server).
+            # DTLS: camera's real second answer says a=setup:passive (camera is DTLS
+            # passive/server).  Tell aiortc the remote is passive so aiortc becomes
+            # DTLS active/client and initiates the ClientHello after ICE connects.
+            # RFC 5763: remote=passive → local=active (client).
             _rr_synth_sdp = _rr_synth_sdp.replace(
-                'a=setup:actpass\r\n', 'a=setup:active\r\n'
+                'a=setup:actpass\r\n', 'a=setup:passive\r\n'
             )
             try:
                 await pc.setRemoteDescription(
@@ -3517,15 +3517,14 @@ class DeviceClient(object):
                 _status(f"pre-seeded cam_ip_q from user-info IP: {_cam_local_ip}")
 
             # Send webrtcResp so the camera knows our DTLS fingerprint and ICE params.
-            # We are DTLS passive/server; the camera is DTLS active/client — it will
-            # initiate the ClientHello once ICE connects.  Replace a=setup:actpass
-            # with a=setup:passive so the camera sees an unambiguous signal that it
-            # should be DTLS active (consistent with its real second answer where it
-            # already declares a=setup:active).
+            # We are DTLS active/client — we initiate the ClientHello after ICE
+            # connects.  Replace a=setup:actpass with a=setup:active so the camera
+            # sees an unambiguous signal that it should be DTLS passive/server
+            # (consistent with its real second answer where it declares a=setup:passive).
             # aiortc generates SDPs with \r\n so a simple replace is safe here.
             _rr_answer_sdp = _normalize_bundle_ice_credentials(
                 pc.localDescription.sdp.replace(
-                    "a=setup:actpass\r\n", "a=setup:passive\r\n"
+                    "a=setup:actpass\r\n", "a=setup:active\r\n"
                 )
             )
             _webrtc_resp_topic   = f"iot/v1/s/{user_id}/IPC/webrtcResp"
@@ -3546,72 +3545,64 @@ class DeviceClient(object):
                 },
             })
             outgoing_q.put_nowait((_webrtc_resp_topic, _webrtc_resp_payload))
-            _status("webrtcResp sent (role-reversal answer, setup=passive)")
+            _status("webrtcResp sent (role-reversal answer, setup=active)")
 
-            # Re-announce our ICE candidates now that the camera has the full
-            # signalling picture (livePlayReq + webrtcResp).  iOS app telemetry
-            # shows iceCandidateReq is always sent *after* webrtcResp; the
-            # @pc.on("icecandidate") callbacks above sent them earlier (during
-            # ICE gathering) which may be before the camera's MQTT session is
-            # ready to process them.  Sending them again here ensures the camera
-            # sees the candidates at the right time and can initiate STUN checks.
-            _rr_local_sdp = pc.localDescription.sdp
-            _rr_local_ip  = ""
-            # Extract first non-loopback host candidate IP from the local SDP.
-            for _rr_ln in _rr_local_sdp.splitlines():
-                _rr_m = _rr_re.match(
-                    r'a=candidate:\S+ 1 udp \d+ (\d+\.\d+\.\d+\.\d+) \d+ typ host',
-                    _rr_ln,
-                )
-                if _rr_m and not _rr_m.group(1).startswith("127."):
-                    _rr_local_ip = _rr_m.group(1)
-                    break
-            # Walk m-sections to collect port for mid:0 (audio) and mid:1 (video).
-            _rr_mid_ports: list[tuple[str, int, int]] = []  # (sdpMid, sdpMLineIndex, port)
-            _rr_mid_idx   = -1
-            for _rr_ln in _rr_local_sdp.splitlines():
-                if _rr_ln.startswith("m="):
-                    _rr_mid_idx += 1
-                    _rr_pm = _rr_re.match(r'm=(\S+) (\d+)', _rr_ln)
-                    if _rr_pm and _rr_mid_idx <= 2:   # audio (0), video (1), H265 (2)
-                        _rr_mid_ports.append(
-                            (str(_rr_mid_idx), _rr_mid_idx, int(_rr_pm.group(2)))
-                        )
-            _rr_ice_topic = f"iot/v1/s/{user_id}/IPC/iceCandidateReq"
-            for _rr_smid, _rr_smidx, _rr_port in _rr_mid_ports:
-                if _rr_port == 0 or not _rr_local_ip:
-                    continue
-                _rr_cand_msg = json.dumps({
-                    "method":  "iceCandidateReq",
-                    "service": "IPC",
-                    "devId":   device_id,
-                    "srcAddr": f"{terminal_idx}.{user_id}",
-                    "seq":     _seq(),
-                    "tst":     int(time.time() * 1000),
-                    **( {"userId": _numeric_uid_raw} if _numeric_uid_raw is not None else {} ),
-                    "payload": {
-                        "peerid":    peer_id,
-                        "devId":     device_id,
-                        "candidate": {
-                            "candidate":     (
-                                f"candidate:1 1 udp 2130706431"
-                                f" {_rr_local_ip} {_rr_port} typ host"
-                            ),
-                            "sdpMid":        _rr_smid,
-                            "sdpMLineIndex": _rr_smidx,
+            # Re-announce ALL our gathered ICE candidates (host + srflx/prflx) after
+            # sending webrtcResp.  The @pc.on("icecandidate") callbacks fired during
+            # ICE gathering (possibly before the camera's MQTT session was ready to
+            # process them).  We resend here to ensure the camera sees every candidate
+            # at the right time so it can initiate STUN checks against us.
+            #
+            # Key fix: the previous version only sent the first private-LAN host
+            # candidate (e.g. 192.168.1.175), which is unreachable from a remote
+            # camera.  We now send ALL gathered candidates including server-reflexive
+            # ones (e.g. 72.84.199.230 public IP) so a remote camera can reach us
+            # even when NAT traversal without TURN is possible.
+            _rr_local_sdp  = pc.localDescription.sdp
+            _rr_ice_topic  = f"iot/v1/s/{user_id}/IPC/iceCandidateReq"
+            _rr_cand_count = 0
+            _rr_cur_midx   = -1
+            for _rr_ln in _rr_re.split(r'\r?\n', _rr_local_sdp):
+                if _rr_ln.startswith('m='):
+                    _rr_cur_midx += 1
+                    if _rr_cur_midx > 2:   # only mid:0 audio, mid:1 video, mid:2 H265
+                        break
+                elif _rr_ln.startswith('a=candidate:') and _rr_cur_midx >= 0:
+                    # Skip loopback candidates (unreachable from any remote peer).
+                    _rr_cip_m = _rr_re.search(
+                        r'a=candidate:\S+ \d+ \w+ \d+ (\S+)', _rr_ln
+                    )
+                    if _rr_cip_m:
+                        _rr_cip = _rr_cip_m.group(1)
+                        if _rr_cip.startswith('127.') or _rr_cip == '::1':
+                            continue
+                    # Convert SDP attribute form (a=candidate:...) to MQTT form
+                    # (candidate:...) — the leading "a=" is an SDP-layer decoration.
+                    _rr_cand_str = 'candidate:' + _rr_ln.split('a=candidate:', 1)[-1]
+                    outgoing_q.put_nowait((_rr_ice_topic, json.dumps({
+                        "method":  "iceCandidateReq",
+                        "service": "IPC",
+                        "devId":   device_id,
+                        "srcAddr": f"{terminal_idx}.{user_id}",
+                        "seq":     _seq(),
+                        "tst":     int(time.time() * 1000),
+                        **( {"userId": _numeric_uid_raw} if _numeric_uid_raw is not None else {} ),
+                        "payload": {
+                            "peerid":    peer_id,
+                            "devId":     device_id,
+                            "candidate": {
+                                "candidate":     _rr_cand_str,
+                                "sdpMid":        str(_rr_cur_midx),
+                                "sdpMLineIndex": _rr_cur_midx,
+                            },
+                            "dstAddr": user_id,
                         },
-                        "dstAddr": user_id,
-                    },
-                })
-                outgoing_q.put_nowait((_rr_ice_topic, _rr_cand_msg))
-            if _rr_mid_ports and _rr_local_ip:
-                _rr_ports_str = " ".join(
-                    f"mid:{s}={p}" for s, _, p in _rr_mid_ports
-                )
-                _status(
-                    f"iceCandidateReq sent (role-reversal, post-webrtcResp)"
-                    f"  {_rr_ports_str}  ip={_rr_local_ip}"
-                )
+                    })))
+                    _rr_cand_count += 1
+            _status(
+                f"iceCandidateReq sent (role-reversal, post-webrtcResp,"
+                f" {_rr_cand_count} candidates)"
+            )
 
         else:
             # ---- NORMAL path: camera sent webrtcResp ---------------------------- #
