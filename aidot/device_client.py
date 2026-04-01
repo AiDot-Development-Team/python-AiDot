@@ -3517,14 +3517,14 @@ class DeviceClient(object):
                 _status(f"pre-seeded cam_ip_q from user-info IP: {_cam_local_ip}")
 
             # Send webrtcResp so the camera knows our DTLS fingerprint and ICE params.
-            # We are DTLS active/client — we initiate the ClientHello after ICE
-            # connects.  Replace a=setup:actpass with a=setup:active so the camera
-            # sees an unambiguous signal that it should be DTLS passive/server
-            # (consistent with its real second answer where it declares a=setup:passive).
+            # The camera (offerer with setup:actpass) always declares setup:active in
+            # its real second answer, meaning it acts as the DTLS client and will
+            # send the ClientHello.  We must therefore be setup:passive (DTLS server)
+            # so the two sides don't both wait for the other to initiate.
             # aiortc generates SDPs with \r\n so a simple replace is safe here.
             _rr_answer_sdp = _normalize_bundle_ice_credentials(
                 pc.localDescription.sdp.replace(
-                    "a=setup:actpass\r\n", "a=setup:active\r\n"
+                    "a=setup:actpass\r\n", "a=setup:passive\r\n"
                 )
             )
             _webrtc_resp_topic   = f"iot/v1/s/{user_id}/IPC/webrtcResp"
@@ -3545,7 +3545,7 @@ class DeviceClient(object):
                 },
             })
             outgoing_q.put_nowait((_webrtc_resp_topic, _webrtc_resp_payload))
-            _status("webrtcResp sent (role-reversal answer, setup=active)")
+            _status("webrtcResp sent (role-reversal answer, setup=passive)")
 
             # Re-announce ALL our gathered ICE candidates (host + srflx/prflx) after
             # sending webrtcResp.  The @pc.on("icecandidate") callbacks fired during

@@ -226,7 +226,9 @@ async def run(args: argparse.Namespace) -> None:
             print("\n[LAN] Discovering cameras on local network ...")
             _disc = _Discover(client.login_info, None)
             await _disc.send_broadcast()
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(3.0)
+            await _disc.send_broadcast()   # second broadcast for cameras that miss the first
+            await asyncio.sleep(3.0)
             _disc.close()
             for _cam in cameras:
                 _disc_ip = _disc.discovered_device.get(_cam.get("id"))
