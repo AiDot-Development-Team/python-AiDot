@@ -2787,12 +2787,38 @@ class DeviceClient(object):
             elif method == "getIceConfigResp":
                 # Capture TURN server credentials so aiortc can use them.
                 # getIceConfigResp arrives before RTCPeerConnection is created,
-                # so we store it in ice_config_fut and consume it later.
+                # so we store it in ice_config_fut and consumed later when
+                # building the RTCPeerConnection configuration.
+                #
+                # Accept any non-empty response regardless of key names —
+                # the actual structure is normalised in the extraction code
+                # below.  Previously this block silently dropped responses
+                # whose payload didn't have top-level "app"/"dev" keys,
+                # which prevented TURN credentials from reaching aiortc.
                 _ice_inner = inner if isinstance(inner, dict) else {}
                 if not _ice_inner and isinstance(msg.get("data"), dict):
                     _ice_inner = msg["data"]
-                if ("app" in _ice_inner or "dev" in _ice_inner) and not ice_config_fut.done():
+                # Accept anything that looks like ICE config data.
+                _has_known_keys = ("app" in _ice_inner or "dev" in _ice_inner
+                                   or "iceServers" in _ice_inner
+                                   or "turnServers" in _ice_inner)
+                if not _has_known_keys and _ice_inner:
+                    # Log the actual structure so we can learn the format.
+                    _LOGGER.warning(
+                        "getIceConfigResp: unexpected structure (no app/dev/iceServers)"
+                        " — storing raw for extraction attempt.  keys=%s",
+                        list(_ice_inner.keys())[:20],
+                    )
+                if _ice_inner and not ice_config_fut.done():
                     loop.call_soon_threadsafe(ice_config_fut.set_result, _ice_inner)
+                elif not _ice_inner and not ice_config_fut.done():
+                    # No usable payload — store the whole message as fallback.
+                    _LOGGER.warning(
+                        "getIceConfigResp: empty inner payload; storing full msg."
+                        " msg_keys=%s", list(msg.keys())
+                    )
+                    if msg and not ice_config_fut.done():
+                        loop.call_soon_threadsafe(ice_config_fut.set_result, msg)
             else:
                 loop.call_soon_threadsafe(
                     lambda m=method, p=inner, t=topic: _status(
@@ -2986,6 +3012,29 @@ class DeviceClient(object):
         if ice_config_fut.done():
             try:
                 _ice_data = ice_config_fut.result()
+                # Normalise multiple possible response shapes:
+                #   Arnoo format:   {app: [{uris, id, token}, ...], dev: [...]}
+                #   Standard W3C:  {iceServers: [{urls, username, credential}, ...]}
+                #   Nested:        {data: {app: [...], ...}} or {data: {iceServers: [...]}}
+                #   Wrapped:       {payload: {app: [...], ...}} or {code, data: {...}}
+                def _unwrap(d):
+                    """Recursively unwrap common envelope keys to reach the list."""
+                    if not isinstance(d, dict):
+                        return d
+                    for _k in ("data", "payload", "result"):
+                        if _k in d and isinstance(d[_k], dict):
+                            inner = d[_k]
+                            if any(k in inner for k in
+                                   ("app", "dev", "iceServers", "turnServers")):
+                                return inner
+                            # one more level
+                            unwrapped = _unwrap(inner)
+                            if unwrapped is not inner:
+                                return unwrapped
+                    return d
+                _ice_data = _unwrap(_ice_data)
+
+                # Arnoo app-side list: [{uris, id, token}, ...]
                 for _entry in (_ice_data.get("app") or []):
                     _uris = _entry.get("uris") or _entry.get("dnsUris") or []
                     _uid  = str(_entry.get("id") or "")
@@ -2994,10 +3043,28 @@ class DeviceClient(object):
                         _ice_servers.append(
                             RTCIceServer(urls=_uris, username=_uid, credential=_cred)
                         )
+                # Standard W3C / plain iceServers list
+                for _entry in (_ice_data.get("iceServers")
+                               or _ice_data.get("turnServers") or []):
+                    _uris = (_entry.get("urls") or _entry.get("uris")
+                             or _entry.get("dnsUris") or [])
+                    if isinstance(_uris, str):
+                        _uris = [_uris]
+                    _uid  = str(_entry.get("username") or _entry.get("id") or "")
+                    _cred = str(_entry.get("credential") or _entry.get("token") or "")
+                    if _uris:
+                        _ice_servers.append(
+                            RTCIceServer(urls=_uris, username=_uid, credential=_cred)
+                        )
                 if len(_ice_servers) > 1:
                     _status(
                         f"Using TURN servers from getIceConfigResp:"
                         f" {[s.urls for s in _ice_servers[1:]]}"
+                    )
+                else:
+                    _LOGGER.warning(
+                        "getIceConfigResp received but no TURN servers extracted."
+                        " ice_data keys=%s", list(_ice_data.keys())[:20]
                     )
             except Exception as _ice_exc:
                 _LOGGER.warning(
