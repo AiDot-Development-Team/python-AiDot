@@ -3131,13 +3131,14 @@ class DeviceClient(object):
             configuration=RTCConfiguration(iceServers=_ice_servers)
         )
         pc.addTransceiver("audio", direction="recvonly")   # mid:0  audio
-        pc.addTransceiver("video", direction="recvonly")   # mid:1  H264 (primary video)
-        pc.addTransceiver("video", direction="recvonly")   # mid:2  H265 (camera firmware always sends both)
-        pc.createDataChannel("data")                        # mid:3  SCTP datachannel
-        # Live capture confirms AiDot cameras (LK.IPC.A000088 and others) answer
-        # with a 4-section SDP: audio + H264-video + H265-video + application/SCTP.
-        # The offer must have the same number of m-sections or aiortc's
-        # setRemoteDescription will reject the answer.
+        pc.addTransceiver("video", direction="recvonly")   # mid:1  video (H264; H265 injected below)
+        pc.createDataChannel("data")                        # mid:2  SCTP datachannel
+        # HAR capture of the official AiDot web app confirms cameras answer with a
+        # 3-section SDP: audio (PCMA) + video (H264 PT 103) + application/SCTP.
+        # H265 is advertised alongside H264 in the single video m-section (mid:1),
+        # matching Chrome's behaviour.  A separate H265 m-section is wrong and causes
+        # aiortc's setRemoteDescription to misalign sections (datachannel answer mapped
+        # to our H265 video transceiver), breaking ICE/DTLS/media.
 
         track_tasks: list = []
 
@@ -3220,40 +3221,25 @@ class DeviceClient(object):
                     out.append(line)   # includes a=max-message-size (keep as-is)
             return '\r\n'.join(out)
 
-        def _patch_offer_mid2_h265(sdp: str) -> str:
-            """Replace mid:2 video codecs with H265-only, using an unused PT.
+        def _inject_h265_into_mid1(sdp: str) -> str:
+            """Append H265 codec lines to mid:1 (the single video m-section).
 
-            aiortc cannot offer H265 natively, so it generates H264+VP8 for
-            every video transceiver.  Cameras with liveType=2 require H265 to
-            appear in the offer for mid:2 before they will respond with
-            webrtcResp.  This function rewrites the mid:2 m-section in-place:
+            The AiDot web app (Chrome) puts ALL video codecs — VP8, VP9, H264, and
+            H265 — into a single m=video section (mid:1).  Cameras with liveType=2
+            require H265 to appear in that section before they will respond with
+            webrtcResp.  aiortc cannot offer H265 natively, so this function injects
+            the necessary lines after the existing codec list.
 
-              m=video PORT PROTO <h265_pt>
-              a=mid:2
-              a=recvonly          ← kept
-              a=rtcp-mux          ← kept
-              a=ice-*/a=fingerprint/a=setup/a=extmap  ← kept
-              a=rtpmap:<h265_pt> H265/90000   ← injected
-              (all H264/VP8 rtpmap/fmtp/ssrc lines removed)
-
-            The PT number for H265 is chosen dynamically: the function scans
-            the full SDP for every PT already in use and picks the lowest
-            unused value in the dynamic range 96–127.  Standard aiortc offers
-            assign PT 96 (opus), 97–102 (VP8/H264 variants), 0 and 8 (PCMU/A),
-            so the selection reliably lands on PT 103.  Using an unused PT
-            avoids violating RFC 8843 §9.2, which requires every PT to be
-            globally unique across all m-sections in a BUNDLE group — a
-            collision (e.g. PT 96 for both opus and H265) causes conformant
-            camera firmware to silently discard the offer without sending
-            webrtcResp.
+            H265 is assigned a dynamically chosen PT that does not collide with any
+            already-used PT in the SDP (RFC 8843 §9.2 requires globally unique PTs
+            across all BUNDLE m-sections).  Standard aiortc offers use PT 96–102 for
+            audio/video variants, so the selection reliably lands on PT 103 or higher.
             """
             import re as _re
 
-            # Scan the entire SDP for PT numbers already in use so we can
-            # assign H265 a PT that does not collide with audio or mid:1.
+            # Collect all PTs already declared anywhere in the SDP.
             _used_pts: set = set()
             for _ln in _re.split(r'\r?\n', sdp):
-                # m-lines list their PTs after the protocol token
                 _mm = _re.match(r'^m=\S+ \d+ \S+ (.+)$', _ln)
                 if _mm:
                     for _pt in _mm.group(1).split():
@@ -3261,15 +3247,12 @@ class DeviceClient(object):
                             _used_pts.add(int(_pt))
                         except ValueError:
                             pass  # "webrtc-datachannel" and similar
-                # a=rtpmap:<pt> lines are an additional cross-check
                 _rm = _re.match(r'^a=rtpmap:(\d+) ', _ln)
                 if _rm:
                     _used_pts.add(int(_rm.group(1)))
-            # Pick the first unused dynamic PT
             _h265_pt = next(pt for pt in range(96, 128) if pt not in _used_pts)
 
             lines = _re.split(r'\r?\n', sdp)
-            # Split into sections: list of (m_line_index, [lines]) for each m-section
             sections: list[list[str]] = []
             current: list[str] = []
             for ln in lines:
@@ -3283,32 +3266,36 @@ class DeviceClient(object):
 
             result: list[str] = []
             for sec in sections:
-                if not any(a.rstrip() == 'a=mid:2' for a in sec):
+                if not any(a.rstrip() == 'a=mid:1' for a in sec):
                     result.extend(sec)
                     continue
-                # This is mid:2 — patch it
+                # This is mid:1 (video) — add H265 PT to m-line and append codec attrs.
                 new_sec: list[str] = []
-                mid2_inserted = False
                 for ln in sec:
                     if ln.startswith('m=video '):
-                        # Replace codec list with the chosen H265 PT
-                        parts = ln.split()
-                        # parts: ['m=video', port, proto, pt1, pt2, ...]
-                        new_sec.append(' '.join(parts[:3]) + f' {_h265_pt}')
-                    elif (ln.startswith('a=rtpmap:') or
-                          ln.startswith('a=fmtp:') or
-                          ln.startswith('a=ssrc:') or
-                          ln.startswith('a=ssrc-group:') or
-                          ln.startswith('a=rtcp-fb:')):
-                        pass  # drop all codec/SSRC/RTCP-FB lines
+                        # Append the H265 PT to the codec list on the m-line.
+                        new_sec.append(ln.rstrip() + f' {_h265_pt}')
                     else:
                         new_sec.append(ln)
-                        if ln.rstrip() == 'a=mid:2' and not mid2_inserted:
-                            new_sec.append(f'a=rtpmap:{_h265_pt} H265/90000')
-                            mid2_inserted = True
-                if not mid2_inserted:
-                    # fallback: append at end of section
-                    new_sec.append(f'a=rtpmap:{_h265_pt} H265/90000')
+                # Insert H265 codec lines after the last existing codec attribute.
+                # Find the last rtpmap/fmtp/rtcp-fb line and insert after it.
+                last_codec_idx = -1
+                for i, ln in enumerate(new_sec):
+                    if (ln.startswith('a=rtpmap:') or
+                            ln.startswith('a=fmtp:') or
+                            ln.startswith('a=rtcp-fb:')):
+                        last_codec_idx = i
+                h265_lines = [
+                    f'a=rtpmap:{_h265_pt} H265/90000',
+                    f'a=fmtp:{_h265_pt} level-id=180;profile-id=1;tier-flag=0;tx-mode=SRST',
+                    f'a=rtcp-fb:{_h265_pt} nack',
+                    f'a=rtcp-fb:{_h265_pt} goog-remb',
+                    f'a=rtcp-fb:{_h265_pt} transport-cc',
+                ]
+                if last_codec_idx >= 0:
+                    new_sec[last_codec_idx + 1:last_codec_idx + 1] = h265_lines
+                else:
+                    new_sec.extend(h265_lines)
                 result.extend(new_sec)
             return '\r\n'.join(result)
 
@@ -3404,7 +3391,7 @@ class DeviceClient(object):
 
         _offer_sdp = _reorder_m_section_ice_attrs(
             _normalize_bundle_ice_credentials(
-                _patch_offer_mid2_h265(_upgrade_sctp(pc.localDescription.sdp))
+                _inject_h265_into_mid1(_upgrade_sctp(pc.localDescription.sdp))
             )
         )
         _patched_mlines = [ln for ln in _offer_sdp.splitlines() if ln.startswith("m=")]
@@ -3493,49 +3480,13 @@ class DeviceClient(object):
             })
             outgoing_q.put_nowait((ice_cand_topic, payload))
 
-        # ------------------------------------------------------------------ #
-        # Wait for SDP answer from camera
-        # ------------------------------------------------------------------ #
-        def _patch_answer_mid2_for_aiortc(sdp: str) -> str:
-            """Make the camera's H265 answer digestible by aiortc.
-
-            The camera answers mid:2 with `a=rtpmap:96 H265/90000`.  aiortc
-            doesn't know H265 so setRemoteDescription would raise.  Swapping
-            the rtpmap to H264 lets aiortc accept the answer; the actual RTP
-            payload type (96) remains unchanged so the ICE/DTLS path works.
-            Mid:2 video will be undecoded but we only record mid:1 anyway.
-            """
-            import re as _re
-            lines = _re.split(r'\r?\n', sdp)
-            sections: list[list[str]] = []
-            current: list[str] = []
-            for ln in lines:
-                if ln.startswith('m=') and current:
-                    sections.append(current)
-                    current = [ln]
-                else:
-                    current.append(ln)
-            if current:
-                sections.append(current)
-
-            result: list[str] = []
-            for sec in sections:
-                if not any(a.rstrip() == 'a=mid:2' for a in sec):
-                    result.extend(sec)
-                    continue
-                new_sec = []
-                for ln in sec:
-                    _h265_m = _re.match(r'^a=rtpmap:(\d+) H265/', ln)
-                    if _h265_m:
-                        new_sec.append(f'a=rtpmap:{_h265_m.group(1)} H264/90000')
-                    else:
-                        new_sec.append(ln)
-                result.extend(new_sec)
-            return '\r\n'.join(result)
-
         # Wait for EITHER webrtcResp (normal) OR webrtcReq from camera (role reversal).
         # Some firmware (e.g. LK.IPC.A001064) responds to our offer by sending back
         # its own webrtcReq (counter-offer) instead of a webrtcResp answer.
+        #
+        # Note: _patch_answer_mid2_for_aiortc is no longer needed.  With 3-section
+        # SDP the camera's answer mid:1=H264 video and mid:2=datachannel — aiortc
+        # accepts both without patching.
         _rr_done, _rr_pending = await asyncio.wait(
             {answer_fut, camera_offer_fut},
             timeout=timeout,
@@ -3650,7 +3601,7 @@ class DeviceClient(object):
                     _rr_pm = _rr_re.match(r'm=\S+ (\d+)', _rr_cln)
                     if _rr_pm:
                         _rr_cp = int(_rr_pm.group(1))
-                        if _rr_cp != 0 and _rr_cm_idx <= 2:
+                        if _rr_cp != 0 and _rr_cm_idx <= 1:
                             _rr_cam_ports.append((str(_rr_cm_idx), _rr_cm_idx, _rr_cp))
             # Use pc.localDescription.sdp (the unpatched aiortc offer) as the
             # synthetic answer base so the codec list matches aiortc's internal state
@@ -3770,7 +3721,7 @@ class DeviceClient(object):
             for _rr_ln in _rr_re.split(r'\r?\n', _rr_local_sdp):
                 if _rr_ln.startswith('m='):
                     _rr_cur_midx += 1
-                    if _rr_cur_midx > 2:   # only mid:0 audio, mid:1 video, mid:2 H265
+                    if _rr_cur_midx > 1:   # only mid:0 audio, mid:1 video (skip mid:2 datachannel)
                         break
                 elif _rr_ln.startswith('a=candidate:') and _rr_cur_midx >= 0:
                     # Skip loopback candidates (unreachable from any remote peer).
@@ -3820,11 +3771,10 @@ class DeviceClient(object):
             )
             _status("Answer m-sections (%d): %s" % (len(_ans_mlines), " | ".join(_ans_mlines)))
 
-            _ans_sdp_aiortc = _patch_answer_mid2_for_aiortc(_ans_sdp)
             try:
                 await pc.setRemoteDescription(
                     RTCSessionDescription(
-                        sdp=_ans_sdp_aiortc,
+                        sdp=_ans_sdp,
                         type=answer.get("type", "answer"),
                     )
                 )
@@ -3842,7 +3792,7 @@ class DeviceClient(object):
             # automatically; aiortc requires explicit addIceCandidate() calls.
             import re as _re
             for _m_sdp_cand in _re.finditer(
-                r'(?m)^a=candidate:(.+)$', _ans_sdp_aiortc
+                r'(?m)^a=candidate:(.+)$', _ans_sdp
             ):
                 _sdp_cand_line = _re.sub(
                     r'\s+generation\s+\d+.*$',
