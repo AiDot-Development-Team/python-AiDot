@@ -2766,6 +2766,8 @@ class DeviceClient(object):
                 # Check multiple field name variants — firmware differs across models.
                 _cam_ip = (inner.get("ipAddress") or inner.get("ip")
                            or inner.get("localIp") or inner.get("localIPAddress")
+                           or inner.get("wlanIp") or inner.get("wlanIPAddress")
+                           or inner.get("deviceIp") or inner.get("localAddr")
                            or msg.get("ipAddress") or msg.get("ip")
                            or msg.get("localIp") or msg.get("localIPAddress"))
                 if _cam_ip:
@@ -2825,6 +2827,30 @@ class DeviceClient(object):
                 f"async_open_webrtc_stream: MQTT connection failed: {_err}"
             )
         _status(f"MQTT connected (clientId={mqtt_cid})")
+
+        # ------------------------------------------------------------------ #
+        # Send getDevAttrReq to prompt the camera to report its LAN IP via
+        # setDevAttrNotif.  Required for ICE-lite cameras (e.g. LK.IPC.A001064)
+        # whose IP is absent from batchGetDeviceUserInfo and who do not send
+        # setDevAttrNotif spontaneously.  The setDevAttrNotif handler (below)
+        # enqueues the IP into cam_ip_q; the ICE wait loop converts it to a
+        # synthetic host candidate so aiortc can STUN-probe the camera.
+        # Sent unconditionally (both initial and DTLS-fallback sessions) because
+        # each session creates a new MQTT connection and a new cam_ip_q.
+        # ------------------------------------------------------------------ #
+        _dev_attr_req_payload = json.dumps({
+            "method":  "getDevAttrReq",
+            "service": "IPC",
+            "devId":   device_id,
+            "srcAddr": f"{terminal_idx}.{user_id}",
+            "seq":     f"ap{random.randint(1000000, 9999999)}",
+            "tst":     int(time.time() * 1000),
+            **( {"userId": _numeric_uid_raw} if _numeric_uid_raw is not None else {} ),
+            "payload": {"devId": device_id},
+        })
+        outgoing_q.put_nowait(
+            (f"iot/v1/s/{user_id}/IPC/getDevAttrReq", _dev_attr_req_payload)
+        )
 
         # ------------------------------------------------------------------ #
         # Send getIceConfigReq first — this warms up the broker-side WebRTC
@@ -3546,10 +3572,13 @@ class DeviceClient(object):
                 _status(f"pre-seeded cam_ip_q from user-info IP: {_cam_local_ip}")
 
             # Send webrtcResp so the camera knows our DTLS fingerprint and ICE params.
-            # The camera (offerer with setup:actpass) always declares setup:active in
-            # its real second answer, meaning it acts as the DTLS client and will
-            # send the ClientHello.  We must therefore be setup:passive (DTLS server)
-            # so the two sides don't both wait for the other to initiate.
+            # The camera's real second answer (second webrtcResp) declares a=setup:passive —
+            # the camera acts as DTLS server.  By setting the synthetic remote SDP to
+            # passive (above), aiortc becomes DTLS active (client) and sends the DTLS
+            # ClientHello after ICE connects.  RFC 5763: remote=passive → local=active.
+            # We therefore also declare setup:passive in our webrtcResp so the camera
+            # knows we intend to be the DTLS server from the SDP perspective; in practice
+            # aiortc drives the handshake as client regardless.
             # aiortc generates SDPs with \r\n so a simple replace is safe here.
             _rr_answer_sdp = _normalize_bundle_ice_credentials(
                 pc.localDescription.sdp.replace(
