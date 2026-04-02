@@ -1535,6 +1535,18 @@ class DeviceClient(object):
                 key_bytes = key_string.encode()
                 self.aes_key[: len(key_bytes)] = key_bytes
         self._simpleVersion = device.get("simpleVersion")
+        # Pre-populate _ip_address from the device-list entry if it contains
+        # an IP field.  Covers cameras (e.g. LK.IPC.A001064) whose
+        # batchGetDeviceUserInfo response returns no IP and whose firmware
+        # does not respond to getDevAttrReq with a setDevAttrNotif.
+        _dev_ip_init = (
+            device.get("localIp") or device.get("ipAddress")
+            or device.get("ip") or device.get("localIPAddress")
+            or device.get("wlanIp") or device.get("wifiIp")
+            or device.get("lanIp") or device.get("addr")
+        )
+        if _dev_ip_init:
+            self._ip_address = _dev_ip_init
 
     # -- Camera helpers ------------------------------------------------------ #
 
@@ -2584,9 +2596,11 @@ class DeviceClient(object):
                 "async_open_webrtc_stream: camera IP unknown for %s"
                 " — no IP field in batchGetDeviceUserInfo and no LAN-discovered IP."
                 " Synthetic ICE candidates cannot be injected; ICE will fail for"
-                " ICE-lite cameras (e.g. LK.IPC.A001064).  user_info_keys=%s",
+                " ICE-lite cameras (e.g. LK.IPC.A001064).  user_info_keys=%s"
+                "  raw_device_keys=%s",
                 self.device_id,
                 sorted((_cam_user_info or {}).keys()),
+                sorted((self._raw_device or {}).keys()),
             )
 
         # Respect isDTLS='0': those cameras cannot do DTLS, so falling back
@@ -2780,6 +2794,30 @@ class DeviceClient(object):
                 else:
                     _LOGGER.warning(
                         "setDevAttrNotif: no IP address field found;"
+                        " inner_keys=%s  msg_keys=%s",
+                        list(inner.keys()),
+                        [k for k in msg if k != "payload"],
+                    )
+            elif method == "getDevAttrResp":
+                # Some camera firmware replies to getDevAttrReq with
+                # getDevAttrResp rather than the push notification
+                # setDevAttrNotif.  Run the same IP-extraction logic.
+                _cam_ip = (inner.get("ipAddress") or inner.get("ip")
+                           or inner.get("localIp") or inner.get("localIPAddress")
+                           or inner.get("wlanIp") or inner.get("wlanIPAddress")
+                           or inner.get("deviceIp") or inner.get("localAddr")
+                           or msg.get("ipAddress") or msg.get("ip")
+                           or msg.get("localIp") or msg.get("localIPAddress"))
+                if _cam_ip:
+                    loop.call_soon_threadsafe(cam_ip_q.put_nowait, _cam_ip)
+                    loop.call_soon_threadsafe(
+                        lambda ip=_cam_ip: _status(
+                            f"getDevAttrResp: camera IP = {ip}"
+                        )
+                    )
+                else:
+                    _LOGGER.warning(
+                        "getDevAttrResp: no IP address field found;"
                         " inner_keys=%s  msg_keys=%s",
                         list(inner.keys()),
                         [k for k in msg if k != "payload"],
@@ -3070,6 +3108,25 @@ class DeviceClient(object):
                 _LOGGER.warning(
                     "Failed to parse getIceConfigResp ICE config: %s", _ice_exc
                 )
+        # Log the ICE server configuration so every test run shows which
+        # STUN/TURN servers will be used.  STUN[0] is always the Google
+        # public STUN server used for srflx candidate discovery.  TURN
+        # servers (indices 1+) come from getIceConfigResp and are needed
+        # when the camera is behind NAT and unreachable via host candidates.
+        _stun_url = (_ice_servers[0].urls[0]
+                     if _ice_servers and _ice_servers[0].urls
+                     else "none")
+        if len(_ice_servers) > 1:
+            _status(
+                f"ICE servers: STUN={_stun_url}"
+                f"  TURN×{len(_ice_servers)-1}:"
+                f" {[s.urls for s in _ice_servers[1:]]}"
+            )
+        else:
+            _status(
+                f"ICE servers: STUN={_stun_url}"
+                f"  (no TURN — getIceConfigReq timed out or no credentials)"
+            )
         pc = RTCPeerConnection(
             configuration=RTCConfiguration(iceServers=_ice_servers)
         )
@@ -3373,6 +3430,27 @@ class DeviceClient(object):
         outgoing_q.put_nowait((webrtc_req_topic, webrtc_req_payload))
         _status(f"webrtcReq sent  peerid={peer_id}")
 
+        # Re-send getDevAttrReq now that the camera is confirmed awake
+        # (it responded to livePlayReq).  The first getDevAttrReq was sent
+        # at MQTT-setup time when the camera may have been sleeping; this
+        # second attempt gives ICE-lite cameras (e.g. LK.IPC.A001064) a
+        # better chance of returning setDevAttrNotif/getDevAttrResp with
+        # their LAN IP before the ICE wait loop starts.
+        if not _cam_local_ip:
+            outgoing_q.put_nowait((
+                f"iot/v1/s/{user_id}/IPC/getDevAttrReq",
+                json.dumps({
+                    "method":  "getDevAttrReq",
+                    "service": "IPC",
+                    "devId":   device_id,
+                    "srcAddr": f"{terminal_idx}.{user_id}",
+                    "seq":     _seq(),
+                    "tst":     int(time.time() * 1000),
+                    **( {"userId": _numeric_uid_raw} if _numeric_uid_raw is not None else {} ),
+                    "payload": {"devId": device_id},
+                })
+            ))
+
         # Forward our own ICE candidates to the camera via MQTT
         @pc.on("icecandidate")
         def _on_local_ice(candidate) -> None:
@@ -3549,11 +3627,13 @@ class DeviceClient(object):
             # creates peer-reflexive candidates and ICE connects.
             import re as _rr_re
             # Extract camera's ICE credentials from its counter-offer.
-            # The camera (LK.IPC.A001064) uses its OWN credentials in both the
-            # counter-offer (webrtcReq) and its real second answer — it does NOT echo
-            # ours.  We inject these into the synthetic remote description so aioice
-            # can authenticate the camera's incoming STUN binding requests.  Without
-            # this, every STUN probe from the camera fails auth → ICE stuck checking.
+            # Observed behaviour for LK.IPC.A001064: the camera echoes our ICE
+            # credentials exactly (ufrag/pwd are identical in both the counter-offer
+            # and the real second answer).  The substitution below is therefore a
+            # no-op in practice for this model, but is kept for correctness in case
+            # a future firmware version uses its own credentials.  Without the
+            # substitution, any camera that does generate different credentials would
+            # cause every STUN probe to fail auth → ICE stuck checking.
             _cam_counter_sdp = (camera_offer_fut.result() or {}).get("sdp", "")
             _cam_ice_ufrag: str | None = None
             _cam_ice_pwd:   str | None = None
