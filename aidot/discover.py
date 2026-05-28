@@ -30,7 +30,7 @@ class BroadcastProtocol:
 
     def send_broadcast(self, message: dict) -> None:
         if self._is_closed is True:
-            _LOGGER.error(f"Connection is closed")
+            _LOGGER.error("Connection is closed")
             return
         try:
             send_data = aes_encrypt(json.dumps(message).encode(), self.aes_key)

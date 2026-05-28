@@ -24,6 +24,8 @@ from .const import (
     CONF_PRODUCT_ID,
     CONF_IS_OWNER,
     SUPPORTED_COUNTRYS,
+    CONF_TYPE,
+    CONF_AES_KEY,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -35,6 +37,7 @@ class AidotClient:
     _device_clients: dict[str, DeviceClient]
     user_info: UserInformation = None
     _token_fresh_cb: Optional[callable] = None
+    _products: dict[str, dict[str, Any]] = {}
 
     def __init__(
         self,
@@ -127,30 +130,36 @@ class AidotClient:
 
     async def async_get_all_device(self) -> dict[str, Any]:
         """Get all devices for the user."""
-        final_device_list: list[dict[str, Any]] = []
+        filter_devices: dict[str, Any] = {}
+        filter_product_ids: set[str] = set()
         try:
-            houses = await CloudApi.get_houses()
+            houses = await CloudApi.get_houses() or []
             for house in houses:
                 if house.get(CONF_IS_OWNER) is False:
                     continue
-                device_list = await CloudApi.get_devices(house[CONF_ID])
-                if device_list:
-                    final_device_list.extend(device_list)
+                device_list = await CloudApi.get_devices(house[CONF_ID]) or []
+                for device in device_list:
+                    filter_device: dict[str, Any] = None
+                    if (
+                        device.get(CONF_TYPE) == "light"
+                        and device.get(CONF_AES_KEY, [None])[0] is not None
+                    ):
+                        filter_device = device
+                    if filter_device is not None:
+                        filter_devices[device[CONF_ID]] = device
+                        filter_product_ids.add(device[CONF_PRODUCT_ID])
 
             # Get product info and merge into devices
-            product_ids = ",".join(
-                [item[CONF_PRODUCT_ID] for item in final_device_list]
-            )
-            product_list = await CloudApi.get_products(product_ids)
-
-            for product in product_list:
-                for device in final_device_list:
-                    if device[CONF_PRODUCT_ID] == product[CONF_ID]:
-                        device[CONF_PRODUCT] = product
+            if filter_product_ids:
+                product_ids = ",".join(filter_product_ids)
+                product_list = await CloudApi.get_products(product_ids) or []
+                product_map = {p[CONF_ID]: p for p in product_list}
+                for device in filter_devices.values():
+                    device[CONF_PRODUCT] = product_map.get(device[CONF_PRODUCT_ID])
 
         except Exception as e:
             raise e
-        return {CONF_DEVICE_LIST: final_device_list}
+        return filter_devices
 
     def get_device_client(self, device: dict[str, Any]) -> DeviceClient:
         """Get or create device client for a device."""
