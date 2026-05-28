@@ -2,74 +2,39 @@
 
 import asyncio
 import logging
-import base64
-import aiohttp
 from aiohttp import ClientSession
 from typing import Any, Optional
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import padding
 import uuid
 from pathlib import Path
 import hashlib
-from .exceptions import AidotAuthFailed, AidotUserOrPassIncorrect
+
+from .utils import rsa_encrypt
 from .device_client import DeviceClient
+from .models.auth_model import UserInformation, LoginRequest
+from .models.device_model import DeviceModel
+from .api.cloud_api import CloudApi
 from .discover import Discover
-from .login_const import APP_ID, PUBLIC_KEY_PEM, API_URL_TEMPLATE, DEFAULT_REGION
+from .const import PUBLIC_KEY_PEM
 from .const import (
-    CONF_ACCESS_TOKEN,
-    CONF_APP_ID,
-    CONF_CODE,
-    CONF_COUNTRY,
-    CONF_DEVICE_LIST,
     CONF_ID,
     CONF_IPADDRESS,
-    CONF_PASSWORD,
+    CONF_LOGIN_INFO,
+    CONF_DEVICE_LIST,
     CONF_PRODUCT,
     CONF_PRODUCT_ID,
-    CONF_REFRESH_TOKEN,
-    CONF_REGION,
-    CONF_TERMINAL,
-    CONF_TOKEN,
-    CONF_USERNAME,
-    DEFAULT_COUNTRY_NAME,
-    SUPPORTED_COUNTRYS,
-    DEFAULT_COUNTRY_CODE,
     CONF_IS_OWNER,
-    CONF_TYPE,
-    CONF_AES_KEY,
-    ServerErrorCode,
+    SUPPORTED_COUNTRYS,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 
-def rsa_password_encrypt(message: str) -> str:
-    """Get password rsa encrypt."""
-    public_key = serialization.load_pem_public_key(
-        PUBLIC_KEY_PEM, backend=default_backend()
-    )
-
-    encrypted = public_key.encrypt(
-        message.encode("utf-8"),
-        padding.PKCS1v15(),
-    )
-
-    encrypted_base64 = base64.b64encode(encrypted).decode("utf-8")
-    return encrypted_base64
-
-
 class AidotClient:
-    _base_url: str = API_URL_TEMPLATE.format(region=DEFAULT_REGION)
-    _region: str = DEFAULT_REGION
-    session: Optional[ClientSession] = None
-    username: str = ""
-    password: str = ""
-    country_name: str = DEFAULT_COUNTRY_NAME
-    country_code: str = DEFAULT_COUNTRY_CODE
-    login_info: dict[str, Any] = {}
+    """AiDot client for managing devices and authentication."""
+
     _device_clients: dict[str, DeviceClient]
-    _discover: Discover = None
+    user_info: UserInformation = None
+    _token_fresh_cb: Optional[callable] = None
 
     def __init__(
         self,
@@ -80,41 +45,53 @@ class AidotClient:
         token: dict | None = None,
     ) -> None:
         _LOGGER.info("Client Version: v0.3.54b3")
-        self.session = session
-        self.username = username
-        self.password = password
         self.country_code = country_code
         self._device_clients = {}
+        self.user_info = UserInformation(
+            username=username, password=password, country_code=country_code
+        )
+
+        # Set region and country from country_code
         for item in SUPPORTED_COUNTRYS:
-            if item["id"] == self.country_code:
-                self.country_name = item["name"]
-                self._region = item["region"].lower()
-                self._base_url = API_URL_TEMPLATE.format(region=self._region)
+            if item[CONF_ID] == self.country_code:
+                self.user_info.country = item["name"]
+                self.user_info.region = item["region"].lower()
                 break
+
+        # Handle token (existing login info)
         if token is not None:
-            # ✅ 兼容性处理: v1.0.8 数据结构迁移到 v1.1.3
-            # 旧版本: config_entry.data[CONF_LOGIN_INFO]
-            # 新版本: config_entry.data
             if token.get(CONF_ID) is None and token.get(CONF_LOGIN_INFO) is not None:
                 token = token.get(CONF_LOGIN_INFO)
-            
-            self.login_info = token.copy()
-            self.username = token[CONF_USERNAME]
-            self.password = token[CONF_PASSWORD]
-            self._region = token[CONF_REGION]
-            self.country_name = token[CONF_COUNTRY]
-            self._base_url = API_URL_TEMPLATE.format(region=self._region)
+            self.user_info.update_from_json(token)
+
+        # Setup CloudApi
+        CloudApi.set_session(session)
+        CloudApi.set_user_info(self.user_info)
+        CloudApi.set_auth_failed_callback(self._on_auth_failed)
+        CloudApi.set_token_refreshed_callback(self._on_token_refreshed)
         self.setup_discover()
+
+    @property
+    def login_info(self) -> dict:
+        return self.user_info.to_dict()
+
+    def _on_auth_failed(self) -> None:
+        """Handle authentication failed event from CloudApi."""
+        _LOGGER.warning("Authentication failed, clearing user info")
+        self.user_info.accessToken = ""
+
+    def _on_token_refreshed(self) -> None:
+        """Handle token refreshed event from CloudApi."""
+        _LOGGER.debug("Token refreshed successfully")
+        if self._token_fresh_cb:
+            self._token_fresh_cb()
+
     def set_token_fresh_cb(self, callback) -> None:
+        """Set callback for token refresh events."""
         self._token_fresh_cb = callback
 
-    def get_identifier(self) -> str:
-        return f"{self._region}-{self.username}"
-
-    def update_password(self, password: str) -> None:
-        self.password = password
-    
     async def get_terminal_id(self) -> str:
+        """Get or create terminal ID for device identification."""
         file_path = Path.home() / ".aidot_terminal_id"
 
         def _read_or_create() -> str:
@@ -127,188 +104,96 @@ class AidotClient:
                 file_path.write_text(raw_id)
                 return raw_id
             except OSError:
-                return 'gvz3gjae10l4zii00t7y0'
+                return "gvz3gjae10l4zii00t7y0"
 
         raw_id = await asyncio.to_thread(_read_or_create)
         return hashlib.md5(raw_id.encode()).hexdigest()
 
     async def async_post_login(self) -> dict[str, Any]:
         """Login the user input allows us to connect."""
-        url = f"{self._base_url}/users/loginWithFreeVerification"
-        headers = {CONF_APP_ID: APP_ID, CONF_TERMINAL: "app"}
-        # f"{region}:{self.country_name.strip()}",
-        terminalId = await self.get_terminal_id()
-        if terminalId is None:
-            terminalId = "gvz3gjae10l4zii00t7y0"
-        data = {
-            "countryKey": f"region:{self.country_name.strip()}",
-            "username": self.username,
-            "password": rsa_password_encrypt(self.password),
-            "terminalId": terminalId,
-            "webVersion": "0.5.0",
-            "area": "Asia/Shanghai",
-            "UTC": "UTC+8",
-        }
+        terminal_id = await self.get_terminal_id()
 
-        try:
-            response = await self.session.post(url, headers=headers, json=data)
-            response_data = await response.json()
-            response.raise_for_status()
-            self.login_info = response_data
-            self.login_info[CONF_PASSWORD] = self.password
-            self.login_info[CONF_REGION] = self._region
-            self.login_info[CONF_COUNTRY] = self.country_name
-            self.setup_discover()
-            return self.login_info
-        except aiohttp.ClientError as e:
-            _LOGGER.error(f"async_post_login ClientError: {e}")
-            if response_data[CONF_CODE] == ServerErrorCode.USER_PWD_INCORRECT:
-                raise AidotUserOrPassIncorrect
-            raise Exception
+        login_request = LoginRequest.create(
+            username=self.user_info.username,
+            encrypted_password=rsa_encrypt(self.user_info.password, PUBLIC_KEY_PEM),
+            country_name=self.user_info.country,
+            terminal_id=terminal_id,
+        )
 
-    async def async_refresh_token(self) -> dict[str, Any]:
-        url = f"{self._base_url}/users/refreshToken"
-        headers = {CONF_APP_ID: APP_ID, CONF_TERMINAL: "app"}
-        data = {
-            CONF_REFRESH_TOKEN: self.login_info[CONF_REFRESH_TOKEN],
-        }
-
-        try:
-            response = await self.session.post(url, headers=headers, json=data)
-            response_data = await response.json()
-            response.raise_for_status()
-            self.login_info[CONF_ACCESS_TOKEN] = response_data[CONF_ACCESS_TOKEN]
-            if response_data[CONF_REFRESH_TOKEN] is not None:
-                self.login_info[CONF_REFRESH_TOKEN] = response_data[CONF_REFRESH_TOKEN]
-            _LOGGER.debug(f"refresh token: {response_data}")
-            if self._token_fresh_cb:
-                self._token_fresh_cb()
-            return response_data
-        except aiohttp.ClientError as e:
-            _LOGGER.error(f"async_refresh_token ClientError: {e} {response_data}")
-            if response_data[CONF_CODE] == ServerErrorCode.LOGIN_INVALID:
-                raise AidotAuthFailed
-            return None
-
-    async def async_session_get(
-        self, params: str, headers: str | None = None
-    ) -> dict[str, Any]:
-        url = f"{self._base_url}{params}"
-        token = self.login_info[CONF_ACCESS_TOKEN]
-        if token is None:
-            raise AidotAuthFailed()
-        if headers is None:
-            headers = {
-                CONF_TERMINAL: "app",
-                CONF_TOKEN: token,
-                CONF_APP_ID: APP_ID,
-            }
-        response_data = {}
-        try:
-            response = await self.session.get(url, headers=headers)
-            response_data = await response.json()
-            response.raise_for_status()
-            return response_data
-        except aiohttp.ClientError as e:
-            _LOGGER.error(f"async_get ClientError: {e} {response_data}")
-            code = response_data.get(CONF_CODE)
-            if code == ServerErrorCode.TOKEN_EXPIRED:
-                try:
-                    await self.async_refresh_token()
-                    return await self.async_session_get(params)
-                except AidotAuthFailed:
-                    raise AidotAuthFailed
-            elif (
-                code == ServerErrorCode.LOGIN_INVALID or code == 21027 or code == 21041
-            ):
-                self.login_info[CONF_ACCESS_TOKEN] = None
-                raise AidotAuthFailed
-            return aiohttp.ClientError
-
-    async def async_get_products(self, product_ids: str) -> list[dict[str, Any]]:
-        """Get device list."""
-        params = f"/products/{product_ids}"
-        return await self.async_session_get(params)
-
-    async def async_get_devices(self, house_id: str) -> list[dict[str, Any]]:
-        """Get device list."""
-        params = f"/devices?houseId={house_id}"
-        return await self.async_session_get(params)
-
-    async def async_get_houses(self) -> list[dict[str, Any]]:
-        """Get house list."""
-        params = "/houses"
-        return await self.async_session_get(params)
+        response_data = await CloudApi.login(login_request.to_dict())
+        self.user_info.update_from_json(response_data)
+        self.setup_discover()
+        return self.user_info.to_dict()
 
     async def async_get_all_device(self) -> dict[str, Any]:
+        """Get all devices for the user."""
         final_device_list: list[dict[str, Any]] = []
         try:
-            houses = await self.async_get_houses()
+            houses = await CloudApi.get_houses()
             for house in houses:
                 if house.get(CONF_IS_OWNER) is False:
                     continue
-                # get device_list
-                device_list = await self.async_get_devices(house[CONF_ID])
+                device_list = await CloudApi.get_devices(house[CONF_ID])
                 if device_list:
                     final_device_list.extend(device_list)
 
-            # get product_list
-            productIds = ",".join([item[CONF_PRODUCT_ID] for item in final_device_list])
-            product_list = await self.async_get_products(productIds)
+            # Get product info and merge into devices
+            product_ids = ",".join(
+                [item[CONF_PRODUCT_ID] for item in final_device_list]
+            )
+            product_list = await CloudApi.get_products(product_ids)
 
             for product in product_list:
                 for device in final_device_list:
                     if device[CONF_PRODUCT_ID] == product[CONF_ID]:
                         device[CONF_PRODUCT] = product
-            
+
         except Exception as e:
             raise e
         return {CONF_DEVICE_LIST: final_device_list}
 
     def get_device_client(self, device: dict[str, Any]) -> DeviceClient:
-        device_id = device.get(CONF_ID)
-        device_client: DeviceClient = self._device_clients.get(device_id)
+        """Get or create device client for a device."""
+        _device: DeviceModel = DeviceModel.from_json(data=device)
+        device_client: DeviceClient = self._device_clients.get(_device.id)
         if device_client is None:
-            device_client = DeviceClient(device, self.login_info)
-            self._device_clients[device_id] = device_client
-        if self._discover is not None:
-            ip = self._discover.discovered_device.get(device_id)
-            device_client.update_ip_address(ip)
+            device_client = DeviceClient(_device, self.user_info)
+            self._device_clients[_device.id] = device_client
+
+        ip = Discover.DISCOVERED_DEVICE.get(_device.id)
+        device_client.update_ip_address(ip)
         return device_client
 
     async def remove_device_client(self, dev_id: str) -> None:
+        """Remove and close device client."""
         device_client: DeviceClient = self._device_clients.get(dev_id)
         if device_client is not None:
             await device_client.close()
             del self._device_clients[dev_id]
 
     def setup_discover(self) -> None:
-        """初始化完成后调用，启动设备发现"""
-        if self.login_info.get(CONF_ID) is None:
-            return
-        if self._discover is not None:
+        """Initialize device discovery after login."""
+        if not self.user_info.id:
             return
 
-        _LOGGER.warning(f"setup_discover")
-        def _discover_callback(dev_id, event: dict[str, str]) -> None:
+        _LOGGER.warning("setup_discover")
+
+        def _discover_callback(dev_id: str, event: dict[str, str]) -> None:
             device_ip = event[CONF_IPADDRESS]
             device_client: DeviceClient = self._device_clients.get(dev_id)
             if device_client is not None:
                 device_client.update_ip_address(device_ip)
 
-        self._discover = Discover(self.login_info, _discover_callback)
-        self._discover.start_repeat_broadcast()
+        Discover.set_call_back(_discover_callback)
+        Discover.set_user_info(self.user_info)
 
     async def async_close(self) -> None:
-        """关闭客户端，清理资源"""
-        if self._discover is not None:
-            self._discover.close()
-            self._discover = None
+        """Close client and cleanup resources."""
         for client in self._device_clients.values():
             await client.close()
         self._device_clients.clear()
 
     async def async_cleanup(self) -> None:
-        """清理所有资源"""
+        """Cleanup all resources."""
         _LOGGER.debug("async_cleanup")
         await self.async_close()
