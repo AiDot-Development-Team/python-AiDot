@@ -136,6 +136,10 @@ class DeviceClient(object):
     def connecting(self) -> bool:
         return self._connecting
 
+    @property
+    def ip_address(self) -> str | None:
+        return self._ip_address
+
     def __init__(self, device: dict[str, Any], user_info: dict[str, Any]) -> None:
         self.ping_count = 0
         self.status = DeviceStatusData()
@@ -301,7 +305,7 @@ class DeviceClient(object):
             raise ConnectionError('Device offline')
         if not self.status.on and not CONF_ON_OFF in dev_attr:
             self.status.on = True
-            attr[CONF_ON_OFF] = 1
+            dev_attr[CONF_ON_OFF] = 1
         await self.send_action(dev_attr, CONF_SET_DEV_ATTR_REQ)
 
     async def async_turn_off(self) -> None:
