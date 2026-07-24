@@ -47,7 +47,7 @@ class AidotClient:
         password: str | None = None,
         token: dict | None = None,
     ) -> None:
-        _LOGGER.info("Client Version: v0.3.54b3")
+        _LOGGER.info("Client Version: v0.3.54")
         self.country_code = country_code
         self._device_clients = {}
         self.user_info = UserInformation(

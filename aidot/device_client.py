@@ -76,12 +76,7 @@ class DeviceStatusData:
             self.dimming = int(attr.Dimming * 255 / 100)
 
         if attr.RGBW is not None:
-            rgbw_value = attr.RGBW
-            if rgbw_value == 0:
-                self.rgdb = 0xFF000000
-            else:
-                self.rgdb = rgbw_value
-
+            self.rgdb = attr.RGBW if attr.RGBW else 0xFF000000
             rgbw = ctypes.c_uint32(self.rgdb).value
             r = (rgbw >> 24) & 0xFF
             g = (rgbw >> 16) & 0xFF
@@ -142,10 +137,9 @@ class DeviceClient:
     info: DeviceInformation
     _state: DeviceState = DeviceState.IDLE
     _ip_address: Optional[str] = None
-    _is_close: bool = False
+    _is_closed: bool = False
     on_status_update: Optional[Callable[[DeviceStatusData], None]] = None
     _receive_task: Optional[asyncio.Task] = None
-    _reconnect_handle: Optional[asyncio.TimerHandle] = None
     _ping_timer: Optional[AsyncTimer] = None
     _reconnect_timer: Optional[AsyncTimer] = None
     writer: Optional[asyncio.StreamWriter] = None
@@ -155,7 +149,7 @@ class DeviceClient:
     _seq_num: int = 0
     _is_special_model: bool = False
     _TAG: str = "DeviceClient"
-    syncProperties = [CONF_ON_OFF, CONF_DIMMING, CONF_RGBW, CONF_CCT]
+    _sync_properties = [CONF_ON_OFF, CONF_DIMMING, CONF_RGBW, CONF_CCT]
 
     def __init__(self, device: DeviceModel, user_info: UserInformation) -> None:
         """Initialize device client with device model and user credentials."""
@@ -234,7 +228,7 @@ class DeviceClient:
             self._start_ping()
 
             request = self.action_request(
-                self.syncProperties, DeviceProtocol.METHOD_GET_DEV_ATTR_REQ
+                self._sync_properties, DeviceProtocol.METHOD_GET_DEV_ATTR_REQ
             )
             await self.write_request(request)
         except Exception as e:
@@ -268,7 +262,7 @@ class DeviceClient:
         self.ping_count = 0
         self._notify_status_update()
 
-        if not self._is_close and self._ip_address:
+        if not self._is_closed and self._ip_address:
             _LOGGER.info(f"{self._TAG}: Scheduling reconnect in 45s")
             self._reconnect_timer = AsyncTimer(
                 callback=self.async_login,
@@ -278,7 +272,7 @@ class DeviceClient:
 
     async def close(self) -> None:
         """Permanently close connection (no reconnect) and cleanup."""
-        self._is_close = True
+        self._is_closed = True
         await self.reset()
         _LOGGER.info(f"{self._TAG}: Connection closed")
 
@@ -353,7 +347,8 @@ class DeviceClient:
 
             except Exception as e:
                 _LOGGER.error(f"{self._TAG}: Receive error: {e}")
-                continue
+                asyncio.create_task(self.reset())
+                return
 
             response = DeviceResponse.from_json(json_data)
             if response.service == DeviceProtocol.SERVICE_TEST:
@@ -389,7 +384,7 @@ class DeviceClient:
 
             if self._is_special_model:
                 request = self.action_request(
-                    self.syncProperties, DeviceProtocol.METHOD_GET_DEV_ATTR_REQ
+                    self._sync_properties, DeviceProtocol.METHOD_GET_DEV_ATTR_REQ
                 )
             else:
                 request = PingRequest()
@@ -410,6 +405,12 @@ class DeviceClient:
     # Device Control
     # =========================================================================
 
+    @staticmethod
+    def _encode_rgbw(rgbw: tuple[int, int, int, int]) -> int:
+        """Encode RGBW tuple into the device's signed 32-bit value."""
+        packed_rgbw = (rgbw[0] << 24) | (rgbw[1] << 16) | (rgbw[2] << 8) | rgbw[3]
+        return ctypes.c_int32(packed_rgbw).value
+
     async def send_dev_attr(self, dev_attr: dict[str, Any]) -> None:
         """Send device attribute command. Auto-turns on the device if currently off."""
         if self._state != DeviceState.AUTHENTICATED:
@@ -422,9 +423,17 @@ class DeviceClient:
         request = self.action_request(dev_attr, DeviceProtocol.METHOD_SET_DEV_ATTR_REQ)
         await self.write_request(request)
 
-    async def async_turn_on(self) -> None:
+    async def async_turn_on(self, attrs: dict[str, Any] | None = None) -> None:
         """Turn device on."""
-        await self.send_dev_attr({CONF_ON_OFF: 1})
+        dev_attr = {CONF_ON_OFF: 1, **(attrs or {})}
+
+        if (brightness := dev_attr.get(CONF_DIMMING)) is not None:
+            dev_attr[CONF_DIMMING] = int(brightness * 100 / 255)
+
+        if isinstance(rgbw := dev_attr.get(CONF_RGBW), tuple):
+            dev_attr[CONF_RGBW] = self._encode_rgbw(rgbw)
+
+        await self.send_dev_attr(dev_attr)
 
     async def async_turn_off(self) -> None:
         """Turn device off."""
@@ -437,8 +446,7 @@ class DeviceClient:
 
     async def async_set_rgbw(self, rgbw: tuple[int, int, int, int]) -> None:
         """Set device RGBW color. Tuple order: (R, G, B, W), each 0-255."""
-        final_rgbw = (rgbw[0] << 24) | (rgbw[1] << 16) | (rgbw[2] << 8) | rgbw[3]
-        await self.send_dev_attr({CONF_RGBW: ctypes.c_int32(final_rgbw).value})
+        await self.send_dev_attr({CONF_RGBW: self._encode_rgbw(rgbw)})
 
     async def async_set_cct(self, cct: int) -> None:
         """Set device color temperature in Kelvin."""
