@@ -47,7 +47,7 @@ class AidotClient:
         password: str | None = None,
         token: dict | None = None,
     ) -> None:
-        _LOGGER.info("Client Version: v0.3.54")
+        _LOGGER.info("Client Version: v0.3.55")
         self.country_code = country_code
         self._device_clients = {}
         self.user_info = UserInformation(
@@ -67,11 +67,12 @@ class AidotClient:
                 token = token.get(CONF_LOGIN_INFO)
             self.user_info.update_from_json(token)
 
-        # Setup CloudApi
-        CloudApi.set_session(session)
-        CloudApi.set_user_info(self.user_info)
-        CloudApi.set_auth_failed_callback(self._on_auth_failed)
-        CloudApi.set_token_refreshed_callback(self._on_token_refreshed)
+        self._cloud_api = CloudApi(
+            session=session,
+            user_info=self.user_info,
+            auth_failed_callback=self._on_auth_failed,
+            token_refreshed_callback=self._on_token_refreshed,
+        )
         self.setup_discover()
 
     @property
@@ -123,7 +124,7 @@ class AidotClient:
             terminal_id=terminal_id,
         )
 
-        response_data = await CloudApi.login(login_request.to_dict())
+        response_data = await self._cloud_api.login(login_request.to_dict())
         self.user_info.update_from_json(response_data)
         self.setup_discover()
         return self.user_info.to_dict()
@@ -133,11 +134,11 @@ class AidotClient:
         filter_devices: dict[str, Any] = {}
         filter_product_ids: set[str] = set()
         try:
-            houses = await CloudApi.get_houses() or []
+            houses = await self._cloud_api.get_houses() or []
             for house in houses:
                 if house.get(CONF_IS_OWNER) is False:
                     continue
-                device_list = await CloudApi.get_devices(house[CONF_ID]) or []
+                device_list = await self._cloud_api.get_devices(house[CONF_ID]) or []
                 for device in device_list:
                     filter_device: dict[str, Any] = None
                     if (
@@ -152,7 +153,7 @@ class AidotClient:
             # Get product info and merge into devices
             if filter_product_ids:
                 product_ids = ",".join(filter_product_ids)
-                product_list = await CloudApi.get_products(product_ids) or []
+                product_list = await self._cloud_api.get_products(product_ids) or []
                 product_map = {p[CONF_ID]: p for p in product_list}
                 for device in filter_devices.values():
                     device[CONF_PRODUCT] = product_map.get(device[CONF_PRODUCT_ID])
