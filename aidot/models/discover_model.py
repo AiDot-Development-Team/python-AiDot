@@ -1,4 +1,5 @@
 """Models for AiDot discover."""
+
 import time
 from dataclasses import dataclass, asdict, field
 from typing import Any, Optional
@@ -94,7 +95,7 @@ class DiscoverRequest:
             tst=current_timestamp_milliseconds,
             payload=DiscoverRequestPayload(
                 timestamp=str(current_timestamp_milliseconds)
-            )
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
