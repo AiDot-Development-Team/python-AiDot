@@ -1,76 +1,58 @@
 """Models for AiDot device client."""
 
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, asdict, field
 from typing import Any, Optional
-from .base_model import BaseModel
-from .device_model import DeviceModel
 
-
-class DeviceProtocol:
-    """Device protocol constants."""
-
-    # Service types
-    SERVICE_DEVICE = "device"
-    SERVICE_TEST = "test"
-
-    # Method types
-    METHOD_LOGIN_REQ = "loginReq"
-    METHOD_PING_REQ = "pingreq"
-    METHOD_GET_DEV_ATTR_REQ = "getDevAttrReq"
-    METHOD_SET_DEV_ATTR_REQ = "setDevAttrReq"
-
-    # Msg types
-    MSG_TYPE_DATA = 1  # 业务数据
-    MSG_TYPE_HEARTBEAT = 2  # 心跳包
+from dacite import Config, from_dict
 
 
 @dataclass
-class BaseRequest(BaseModel):
-    """Base request with common fields."""
-
-    service: str = ""
-    method: str = ""
-    seq: str = ""
-    srcAddr: str = ""
-    payload: Any = None
-
-
-@dataclass
-class PingRequest(BaseRequest):
+class PingRequest:
     """Ping request (heartbeat)."""
 
+    service: str = "test"
+    method: str = "pingreq"
+    seq: str = "123456"
+    srcAddr: str = "123456"
     payload: dict[str, Any] = field(default_factory=dict)
 
-    def __post_init__(self) -> None:
-        """Set default values for inherited fields."""
-        self.service = DeviceProtocol.SERVICE_TEST
-        self.method = DeviceProtocol.METHOD_PING_REQ
-        self.seq = "123456"
-        self.srcAddr = "123456"
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return asdict(self)
 
 
 @dataclass
-class PingResponse(BaseModel):
+class PingResponse:
     """Ping response."""
 
-    service: Optional[str] = None
-    method: Optional[str] = None
-    seq: Optional[str] = None
-    srcAddr: Optional[str] = None
-    payload: Optional[dict[str, Any]] = None
+    service: str = None
+    method: str = None
+    seq: str = None
+    srcAddr: str = None
+    payload: dict[str, Any] = None
+
+    @staticmethod
+    def from_json(data: dict[str, Any]) -> "PingResponse":
+        """Create PingResponse from JSON dict."""
+        return from_dict(
+            data_class=PingResponse, data=data, config=Config(check_types=False)
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return asdict(self)
 
 
 @dataclass
-class LoginPayload(BaseModel):
+class LoginPayload:
     """Login request payload."""
 
-    userId: Optional[str] = None
-    password: Optional[str] = None
-    timestamp: Optional[str] = None
+    userId: str = None
+    password: str = None
+    timestamp: str = field(default=None)
     ascNumber: int = 1
 
-    def __post_init__(self) -> None:
+    def __post_init__(self):
         """Auto-generate timestamp if not provided."""
         if self.timestamp is None:
             from datetime import datetime
@@ -79,25 +61,23 @@ class LoginPayload(BaseModel):
 
 
 @dataclass
-class LoginRequest(BaseRequest):
+class LoginRequest:
     """Login request."""
 
-    deviceId: Optional[str] = None
+    service: str = "device"
+    method: str = "loginReq"
+    seq: str = None
+    srcAddr: str = None
+    deviceId: str = None
+    payload: LoginPayload = None
 
-    def __init__(self, device: DeviceModel, user_id: str) -> None:
-        self.service = DeviceProtocol.SERVICE_DEVICE
-        self.method = DeviceProtocol.METHOD_LOGIN_REQ
-        self.seq = str(int(time.time() * 1000))[-9:]
-        self.srcAddr = user_id
-        self.deviceId = device.id
-        self.payload = LoginPayload(
-            userId=user_id,
-            password=device.password,
-        )
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return asdict(self)
 
 
 @dataclass
-class DeviceAck(BaseModel):
+class DeviceAck:
     """Device response ack."""
 
     code: int = 0
@@ -105,17 +85,17 @@ class DeviceAck(BaseModel):
 
 
 @dataclass
-class DeviceAttr(BaseModel):
+class DeviceAttr:
     """Device attribute."""
 
-    OnOff: Optional[int] = None
-    Dimming: Optional[int] = None
-    RGBW: Optional[int] = None
-    CCT: Optional[int] = None
+    OnOff: int = None
+    Dimming: int = None
+    RGBW: int = None
+    CCT: int = None
 
 
 @dataclass
-class DeviceAttrPayload(BaseModel):
+class DeviceAttrPayload:
     """Device payload."""
 
     devId: str = ""
@@ -129,7 +109,7 @@ class DeviceAttrPayload(BaseModel):
 
 
 @dataclass
-class DeviceResponse(BaseModel):
+class DeviceResponse:
     """Generic device response."""
 
     service: str = ""
@@ -142,9 +122,20 @@ class DeviceResponse(BaseModel):
     ack: DeviceAck = field(default_factory=DeviceAck)
     tst: int = 0
 
+    @staticmethod
+    def from_json(data: dict[str, Any]) -> "DeviceResponse":
+        """Create DeviceResponse from JSON dict."""
+        return from_dict(
+            data_class=DeviceResponse, data=data, config=Config(check_types=False)
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return asdict(self)
+
 
 @dataclass
-class DeviceActionPayload(BaseModel):
+class DeviceActionPayload:
     """Device action payload."""
 
     devId: str = ""
@@ -157,44 +148,56 @@ class DeviceActionPayload(BaseModel):
 
 
 @dataclass
-class DeviceActionRequest(BaseRequest):
+class DeviceActionRequest:
     """Device action request."""
 
+    method: str = ""
+    service: str = "device"
     clientId: str = ""
+    srcAddr: str = ""
+    seq: str = ""
+    payload: DeviceActionPayload = field(default_factory=DeviceActionPayload)
     tst: int = 0
     deviceId: str = ""
 
-    def __post_init__(self) -> None:
-        """Set default values for inherited fields."""
-        self.service = DeviceProtocol.SERVICE_DEVICE
+    def __post_init__(self):
+        """Auto-generate timestamp if not provided."""
         if self.tst == 0:
+            import time
+
             self.tst = int(time.time() * 1000)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return asdict(self)
 
     @staticmethod
     def from_params(
         method: str,
         user_id: str,
-        device: DeviceModel,
+        device_id: str,
+        password: str,
         ascNumber: int,
         attr: dict[str, Any],
         seq: str,
+        simpleVersion: str = None,
     ) -> "DeviceActionRequest":
         """Create DeviceActionRequest from params."""
-        if device.simpleVersion is not None:
+        if simpleVersion is not None:
             return DeviceActionRequest(
                 method=method,
                 clientId="ha-" + user_id,
                 srcAddr="0." + user_id,
                 seq=seq,
                 payload=DeviceActionPayload(
-                    devId=device.id,
-                    parentId=device.id,
+                    devId=device_id,
+                    parentId=device_id,
                     userId=user_id,
-                    password=device.password,
+                    password=password,
                     attr=attr,
                     ascNumber=ascNumber,
                 ),
-                deviceId=device.id,
+                deviceId=device_id,
             )
         else:
             return DeviceActionRequest(
@@ -205,5 +208,5 @@ class DeviceActionRequest(BaseRequest):
                     attr=attr,
                     ascNumber=ascNumber,
                 ),
-                deviceId=device.id,
+                deviceId=device_id,
             )
