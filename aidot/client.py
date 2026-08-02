@@ -27,6 +27,7 @@ from .const import (
     CONF_PASSWORD,
     CONF_PRODUCT,
     CONF_PRODUCT_ID,
+    CONF_PROPERTIES,
     CONF_REFRESH_TOKEN,
     CONF_REGION,
     CONF_TERMINAL,
@@ -270,9 +271,20 @@ class AidotClient:
         if device_client is None:
             device_client = DeviceClient(device, self.login_info)
             self._device_clients[device_id] = device_client
+        props = device.get(CONF_PROPERTIES)
+        cloud_ip = props.get(CONF_IPADDRESS) if isinstance(props, dict) else None
         if self._discover is not None:
             ip = self._discover.discovered_device.get(device_id)
-            device_client.update_ip_address(ip)
+            if ip:
+                device_client.update_ip_address(ip)
+            elif cloud_ip and (
+                not device_client.ip_address or not device_client.connect_and_login
+            ):
+                device_client.update_ip_address(cloud_ip)
+        elif cloud_ip and (
+            not device_client.ip_address or not device_client.connect_and_login
+        ):
+            device_client.update_ip_address(cloud_ip)
         return device_client
 
     async def remove_device_client(self, dev_id: str) -> None:

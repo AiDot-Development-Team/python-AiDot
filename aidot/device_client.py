@@ -137,6 +137,10 @@ class DeviceClient(object):
     def connecting(self) -> bool:
         return self._connecting
 
+    @property
+    def ip_address(self) -> str | None:
+        return self._ip_address
+
     def __init__(self, device: dict[str, Any], user_info: dict[str, Any]) -> None:
         self.ping_count = 0
         self.status = DeviceStatusData()
