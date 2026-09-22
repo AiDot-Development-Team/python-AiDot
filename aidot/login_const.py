@@ -3,7 +3,7 @@
 APP_ID = "1383974540041977857"
 
 # API URL template - use .format(region="us") to construct
-API_URL_TEMPLATE = "https://prod-{region}-api.arnoo.com/v17"
+API_URL_TEMPLATE = "https://prod-{region}-api.arnoo.com/v35"
 DEFAULT_REGION = "us"
 
 PUBLIC_KEY_PEM = b"""

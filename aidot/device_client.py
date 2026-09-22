@@ -7,7 +7,7 @@ import time
 import json
 import asyncio
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .aes_utils import aes_encrypt, aes_decrypt_to_json
 from .models.device_client_model import (
@@ -24,6 +24,7 @@ from .const import (
     CONF_HARDWARE_VERSION,
     CONF_ID,
     CONF_IDENTITY,
+    CONF_EFFECT_MODE,
     CONF_MAC,
     CONF_MAXVALUE,
     CONF_MINVALUE,
@@ -32,6 +33,7 @@ from .const import (
     CONF_ON_OFF,
     CONF_DIMMING,
     CONF_PASSWORD,
+    CONF_PRESETS,
     CONF_PRODUCT,
     CONF_PROPERTIES,
     CONF_RGBW,
@@ -42,6 +44,9 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from .client import AidotClient
 
 
 class DeviceStatusData:
@@ -89,6 +94,8 @@ class DeviceInformation:
     model_id: str
     name: str
     hw_version: str
+    presets: dict[str, Any]
+    preset_names: list[str]
 
     def __init__(self, device: dict[str, Any]) -> None:
         self.dev_id = device.get(CONF_ID)
@@ -96,6 +103,8 @@ class DeviceInformation:
         self.model_id = device.get(CONF_MODEL_ID)
         self.name = device.get(CONF_NAME)
         self.hw_version = device.get(CONF_HARDWARE_VERSION)
+        self.presets = device.get(CONF_PRESETS, {})
+        self.preset_names = list(self.presets)
         if CONF_PRODUCT in device and CONF_SERVICE_MODULES in device[CONF_PRODUCT]:
             for service in device[CONF_PRODUCT][CONF_SERVICE_MODULES]:
                 if service[CONF_IDENTITY] == Identity.RGBW:
@@ -137,10 +146,16 @@ class DeviceClient(object):
     def connecting(self) -> bool:
         return self._connecting
 
-    def __init__(self, device: dict[str, Any], user_info: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        device: dict[str, Any],
+        user_info: dict[str, Any],
+        client: "AidotClient",
+    ) -> None:
         self.ping_count = 0
         self.status = DeviceStatusData()
         self.info = DeviceInformation(device)
+        self.client = client
         self.user_id = user_info.get(CONF_ID)
 
         if CONF_AES_KEY in device:
@@ -158,7 +173,7 @@ class DeviceClient(object):
             self.ping_data = None
             self.heart_time = 10
 
-        _LOGGER.warning(f"{self._TAG}:{device}")
+        # _LOGGER.warning(f"{self._TAG}:{device}")
 
     async def connect(self, ip_address) -> None:
         _LOGGER.warning(f"{self._TAG}:connect device: {ip_address}")
@@ -319,6 +334,17 @@ class DeviceClient(object):
     async def async_set_rgbw(self, rgbw: tuple[int, int, int, int]) -> None:
         final_rgbw = (rgbw[0] << 24) | (rgbw[1] << 16) | (rgbw[2] << 8) | rgbw[3]
         await self.send_dev_attr({CONF_RGBW: ctypes.c_int32(final_rgbw).value})
+
+    async def async_set_effect(self, effect: str) -> None:
+        effect_item = self.info.presets.get(effect)
+        if effect_item is None:
+            raise ValueError(f"Unknown effect: {effect}")
+
+        effect_params = await self.client.async_get_effect_mode_params(
+            self.device_id, effect_item
+        )
+        _LOGGER.warning(f"{self.device_id} effect params {effect_params}")
+        # await self.send_dev_attr({CONF_EFFECT_MODE: effect_item.primitiveEffectId})
 
     async def async_set_cct(self, cct: int) -> None:
         await self.send_dev_attr({CONF_CCT: cct})
