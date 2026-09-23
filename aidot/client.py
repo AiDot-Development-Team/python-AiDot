@@ -77,7 +77,7 @@ class AidotClient:
         password: str | None = None,
         token: dict | None = None,
     ) -> None:
-        _LOGGER.info("Client Version: v0.3.56")
+        _LOGGER.info("Client Version: v0.3.57")
         self.session = session
         self.username = username
         self.password = password
