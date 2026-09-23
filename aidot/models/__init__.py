@@ -17,6 +17,9 @@ from .device_model import (
     DeviceProperties,
     DeviceProduct,
     DeviceInformation,
+    FavoriteEffectMode,
+    FavoriteEffectPrimitive,
+    FavoriteEffectTags,
 )
 
 __all__ = [
@@ -34,4 +37,7 @@ __all__ = [
     "DeviceProperties",
     "DeviceProduct",
     "DeviceInformation",
+    "FavoriteEffectMode",
+    "FavoriteEffectPrimitive",
+    "FavoriteEffectTags",
 ]

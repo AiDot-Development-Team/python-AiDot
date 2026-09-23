@@ -81,3 +81,60 @@ class DeviceInformation:
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return asdict(self)
+
+
+@dataclass
+class FavoriteEffectTags:
+    """Favorite effect tags."""
+
+    advanced: str = None
+    directional: str = None
+
+
+@dataclass
+class FavoriteEffectPrimitive:
+    """Favorite primitive effect mode."""
+
+    primitiveEffectId: str = None
+    favoriteId: str = None
+    icon: str = None
+    libraryId: str = "aidot.preset"
+    name: str = None
+    tags: Optional[FavoriteEffectTags] = None
+    scriptSize: int = None
+    secondShareFlag: bool = None
+    changeFlag: bool = None
+    createTime: int = None
+    imageUrl: str = None
+    videoUrl: str = None
+    sharedUserName: str = None
+    sharedUserHeadImg: str = None
+    sharedTime: int = None
+    shareId: str = None
+    isOldParams: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return asdict(self)
+
+
+@dataclass
+class FavoriteEffectMode:
+    """Favorite effect mode response."""
+
+    data: list[Any] = field(default_factory=list)
+    primitive: list[FavoriteEffectPrimitive] = field(default_factory=list)
+
+    @staticmethod
+    def from_json(data: dict[str, Any]) -> "FavoriteEffectMode":
+        """Create FavoriteEffectMode from JSON dict."""
+        return from_dict(
+            data_class=FavoriteEffectMode, data=data, config=Config(check_types=False)
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return asdict(self)
+
+
+EffectResp = FavoriteEffectMode

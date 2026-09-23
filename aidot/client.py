@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import base64
+import random
 import aiohttp
 from aiohttp import ClientSession
 from typing import Any, Optional
@@ -14,6 +15,7 @@ from pathlib import Path
 import hashlib
 from .exceptions import AidotAuthFailed, AidotUserOrPassIncorrect
 from .device_client import DeviceClient
+from .models.device_model import EffectResp, FavoriteEffectPrimitive
 from .discover import Discover
 from .login_const import APP_ID, PUBLIC_KEY_PEM, API_URL_TEMPLATE, DEFAULT_REGION
 from .const import (
@@ -38,6 +40,14 @@ from .const import (
     CONF_IS_OWNER,
     CONF_LOGIN_INFO,
     ServerErrorCode,
+    CONF_MODEL_ID,
+    CONF_PROPERTIES,
+    CONF_LIGHT_SCRIPT_FLAGS,
+    CONF_PRESETS,
+    CONF_TYPE,
+    CONF_AES_KEY,
+    CONF_FIRMWARE_VERSION,
+    CONF_PRIMITIVE,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -67,7 +77,7 @@ class AidotClient:
         password: str | None = None,
         token: dict | None = None,
     ) -> None:
-        _LOGGER.info("Client Version: v0.3.56")
+        _LOGGER.info("Client Version: v0.3.57")
         self.session = session
         self.username = username
         self.password = password
@@ -77,6 +87,9 @@ class AidotClient:
         self._base_url = API_URL_TEMPLATE.format(region=self._region)
         self.login_info: dict[str, Any] = {}
         self._device_clients = {}
+        self._effect_mode_params_cache: dict[
+            tuple[str, str, str, bool], dict[str, Any]
+        ] = {}
         self._discover: Discover | None = None
         self._token_fresh_cb = None
         for item in SUPPORTED_COUNTRYS:
@@ -222,6 +235,45 @@ class AidotClient:
                 raise AidotAuthFailed from err
             raise
 
+    async def async_session_post(
+        self,
+        params: str,
+        data: Any,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Post data to AiDot API."""
+        url = f"{self._base_url}{params}"
+        token = self.login_info[CONF_ACCESS_TOKEN]
+        if token is None:
+            raise AidotAuthFailed()
+        if headers is None:
+            headers = {
+                CONF_TERMINAL: "app",
+                CONF_TOKEN: token,
+                CONF_APP_ID: APP_ID,
+            }
+        response_data = {}
+        try:
+            response = await self.session.post(url, headers=headers, json=data)
+            response_data = await response.json()
+            response.raise_for_status()
+            return response_data
+        except aiohttp.ClientError as err:
+            _LOGGER.error("async_post ClientError: %s %s", err, response_data)
+            code = response_data.get(CONF_CODE)
+            if code == ServerErrorCode.TOKEN_EXPIRED:
+                try:
+                    await self.async_refresh_token()
+                    return await self.async_session_post(params, data)
+                except AidotAuthFailed as auth_err:
+                    raise AidotAuthFailed from auth_err
+            elif (
+                code == ServerErrorCode.LOGIN_INVALID or code == 21027 or code == 21041
+            ):
+                self.login_info[CONF_ACCESS_TOKEN] = None
+                raise AidotAuthFailed from err
+            raise
+
     async def async_get_products(self, product_ids: str) -> list[dict[str, Any]]:
         """Get device list."""
         params = f"/products/{product_ids}"
@@ -236,6 +288,173 @@ class AidotClient:
         """Get house list."""
         params = "/houses"
         return await self.async_session_get(params)
+
+    async def async_get_diy_list(
+        self, device: dict[str, Any]
+    ) -> list[FavoriteEffectPrimitive]:
+        """Get favorite list."""
+        params = f"/devices/{device[CONF_ID]}/v4.0/favoriteEffectMode"
+        resp = await self.async_session_get(params)
+        return EffectResp.from_json(resp).primitive
+
+    async def async_get_fav_presets(
+        self, device: dict[str, Any]
+    ) -> list[FavoriteEffectPrimitive]:
+        """Get favorite list."""
+        # https://prod-us-api.arnoo.com/v35/devices/8a040e2233a243e7a07eb6a1b7a210a7/v4.0/favoriteEffectMode?libraryId=aidot.preset
+
+        params = (
+            f"/devices/{device[CONF_ID]}/v4.0/favoriteEffectMode?libraryId=aidot.preset"
+        )
+        resp = await self.async_session_get(params)
+        return EffectResp.from_json(resp).primitive
+
+    async def async_get_presets(
+        self, device: dict[str, Any]
+    ) -> list[FavoriteEffectPrimitive]:
+        """Get preset list."""
+        # https://prod-us-api.arnoo.com/v35/models/LK.light.A001855/v3.0/effectModes?libraryId=aidot.preset&version=3.30.09&lightScriptFlags=0002140503140500000062
+
+        params = (
+            f"/models/{device[CONF_MODEL_ID]}/v3.0/effectModes?libraryId=aidot.preset"
+        )
+        properties = device.get(CONF_PROPERTIES, {})
+        light_script_flags = properties.get(CONF_LIGHT_SCRIPT_FLAGS)
+        if light_script_flags:
+            params = (
+                f"{params}&version={device[CONF_FIRMWARE_VERSION]}"
+                f"&lightScriptFlags={light_script_flags}"
+            )
+        resp = await self.async_session_get(params)
+        return EffectResp.from_json(resp).primitive
+
+    async def async_get_effect_mode_params(
+        self,
+        device_id: str,
+        primitive: FavoriteEffectPrimitive,
+    ) -> dict[str, Any]:
+        """Get effect mode params."""
+        primitive_effect_id = primitive.primitiveEffectId
+        favorite_id = primitive.favoriteId
+        library_id = primitive.libraryId
+        if favorite_id is not None:
+            effect_query = f"favoriteIds={favorite_id}"
+            effect_cache_id = favorite_id
+        elif primitive_effect_id is not None:
+            effect_query = f"primitiveEffectIds={primitive_effect_id}"
+            effect_cache_id = primitive_effect_id
+        else:
+            raise ValueError(
+                "Effect primitive must have favoriteId or primitiveEffectId"
+            )
+        if library_id is None:
+            raise ValueError("Effect primitive must have libraryId")
+
+        cache_key = (device_id, effect_cache_id, library_id, primitive.isOldParams)
+        if cache_key in self._effect_mode_params_cache:
+            return self._effect_mode_params_cache[cache_key]
+
+        params = (
+            f"/devices/{device_id}/v3.0/effectModeParams"
+            f"?{effect_query}"
+            f"&isOldParams={primitive.isOldParams}"
+            f"&libraryId={library_id}"
+        )
+        resp = await self.async_session_get(params)
+        effect_primitives = resp.get(CONF_PRIMITIVE) or []
+        if not effect_primitives:
+            raise ValueError("Effect mode params response has no primitive")
+
+        effect_params = effect_primitives[0]
+        self._effect_mode_params_cache[cache_key] = effect_params
+        return effect_params
+
+    async def async_execute_diff_command(
+        self,
+        device_id: str,
+        primitive: FavoriteEffectPrimitive,
+    ) -> dict[str, Any]:
+        """Execute diff command."""
+        # effect_params = await self.async_get_effect_mode_params(device_id, primitive)
+        data = [
+            {
+                "devId": device_id,
+                "effectUniqueID": primitive.primitiveEffectId,
+                "action": "runLScript",
+                "in": [
+                    {
+                        "sessionId": random.randint(1, 2_147_483_647),
+                        # "params": effect_params["params"],
+                    }
+                ],
+            }
+        ]
+        return await self.async_session_post("/devices/execute/diffCommand", data)
+
+    async def async_get_all_effects(
+        self, device: dict[str, Any]
+    ) -> dict[str, FavoriteEffectPrimitive]:
+        """Get all effects list."""
+        diy_list: list[FavoriteEffectPrimitive] = []
+        fav_preset: list[FavoriteEffectPrimitive] = []
+        preset_list: list[FavoriteEffectPrimitive] = []
+
+        try:
+            diy_list = await self.async_get_diy_list(device)
+        except Exception as err:
+            _LOGGER.warning(
+                "Failed to get DIY effects for %s: %s", device[CONF_ID], err
+            )
+
+        try:
+            fav_preset = await self.async_get_fav_presets(device)
+        except Exception as err:
+            _LOGGER.warning(
+                "Failed to get favorite preset effects for %s: %s",
+                device[CONF_ID],
+                err,
+            )
+
+        try:
+            preset_list = await self.async_get_presets(device)
+        except Exception as err:
+            _LOGGER.warning(
+                "Failed to get preset effects for %s: %s", device[CONF_ID], err
+            )
+
+        fav_preset_ids = {
+            item.primitiveEffectId
+            for item in fav_preset
+            if item.primitiveEffectId is not None
+        }
+        preset_list = [
+            item for item in preset_list if item.primitiveEffectId not in fav_preset_ids
+        ]
+        return self._merge_effects_by_unique_name(diy_list, fav_preset, preset_list)
+
+    @staticmethod
+    def _merge_effects_by_unique_name(
+        *effect_lists: list[FavoriteEffectPrimitive],
+    ) -> dict[str, FavoriteEffectPrimitive]:
+        """Merge effect lists into a dict with unique display names."""
+        effects: dict[str, FavoriteEffectPrimitive] = {}
+        name_counts: dict[str, int] = {}
+
+        for effect_list in effect_lists:
+            for effect in effect_list:
+                name = (
+                    effect.name
+                    or effect.primitiveEffectId
+                    or effect.favoriteId
+                    or "Effect"
+                )
+                name_counts[name] = name_counts.get(name, 0) + 1
+                unique_name = (
+                    name if name_counts[name] == 1 else f"{name} ({name_counts[name]})"
+                )
+                effects[unique_name] = effect
+
+        return effects
 
     async def async_get_all_device(self) -> dict[str, Any]:
         final_device_list: list[dict[str, Any]] = []
@@ -260,6 +479,14 @@ class AidotClient:
                     if device[CONF_PRODUCT_ID] == product[CONF_ID]:
                         device[CONF_PRODUCT] = product
 
+            for device in final_device_list:
+                if (
+                    device[CONF_TYPE] == "light"
+                    and CONF_AES_KEY in device
+                    and device[CONF_AES_KEY][0] is not None
+                ):
+                    device[CONF_PRESETS] = await self.async_get_all_effects(device)
+
         except Exception as e:
             raise e
         return {CONF_DEVICE_LIST: final_device_list}
@@ -268,7 +495,7 @@ class AidotClient:
         device_id = device.get(CONF_ID)
         device_client: DeviceClient = self._device_clients.get(device_id)
         if device_client is None:
-            device_client = DeviceClient(device, self.login_info)
+            device_client = DeviceClient(device, self.login_info, self)
             self._device_clients[device_id] = device_client
         if self._discover is not None:
             ip = self._discover.discovered_device.get(device_id)
