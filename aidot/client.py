@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import base64
+import random
 import aiohttp
 from aiohttp import ClientSession
 from typing import Any, Optional
@@ -234,6 +235,45 @@ class AidotClient:
                 raise AidotAuthFailed from err
             raise
 
+    async def async_session_post(
+        self,
+        params: str,
+        data: Any,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Post data to AiDot API."""
+        url = f"{self._base_url}{params}"
+        token = self.login_info[CONF_ACCESS_TOKEN]
+        if token is None:
+            raise AidotAuthFailed()
+        if headers is None:
+            headers = {
+                CONF_TERMINAL: "app",
+                CONF_TOKEN: token,
+                CONF_APP_ID: APP_ID,
+            }
+        response_data = {}
+        try:
+            response = await self.session.post(url, headers=headers, json=data)
+            response_data = await response.json()
+            response.raise_for_status()
+            return response_data
+        except aiohttp.ClientError as err:
+            _LOGGER.error("async_post ClientError: %s %s", err, response_data)
+            code = response_data.get(CONF_CODE)
+            if code == ServerErrorCode.TOKEN_EXPIRED:
+                try:
+                    await self.async_refresh_token()
+                    return await self.async_session_post(params, data)
+                except AidotAuthFailed as auth_err:
+                    raise AidotAuthFailed from auth_err
+            elif (
+                code == ServerErrorCode.LOGIN_INVALID or code == 21027 or code == 21041
+            ):
+                self.login_info[CONF_ACCESS_TOKEN] = None
+                raise AidotAuthFailed from err
+            raise
+
     async def async_get_products(self, product_ids: str) -> list[dict[str, Any]]:
         """Get device list."""
         params = f"/products/{product_ids}"
@@ -304,7 +344,9 @@ class AidotClient:
             effect_query = f"primitiveEffectIds={primitive_effect_id}"
             effect_cache_id = primitive_effect_id
         else:
-            raise ValueError("Effect primitive must have favoriteId or primitiveEffectId")
+            raise ValueError(
+                "Effect primitive must have favoriteId or primitiveEffectId"
+            )
         if library_id is None:
             raise ValueError("Effect primitive must have libraryId")
 
@@ -326,6 +368,28 @@ class AidotClient:
         effect_params = effect_primitives[0]
         self._effect_mode_params_cache[cache_key] = effect_params
         return effect_params
+
+    async def async_execute_diff_command(
+        self,
+        device_id: str,
+        primitive: FavoriteEffectPrimitive,
+    ) -> dict[str, Any]:
+        """Execute diff command."""
+        # effect_params = await self.async_get_effect_mode_params(device_id, primitive)
+        data = [
+            {
+                "devId": device_id,
+                "effectUniqueID": primitive.primitiveEffectId,
+                "action": "runLScript",
+                "in": [
+                    {
+                        "sessionId": random.randint(1, 2_147_483_647),
+                        # "params": effect_params["params"],
+                    }
+                ],
+            }
+        ]
+        return await self.async_session_post("/devices/execute/diffCommand", data)
 
     async def async_get_all_effects(
         self, device: dict[str, Any]

@@ -24,7 +24,6 @@ from .const import (
     CONF_HARDWARE_VERSION,
     CONF_ID,
     CONF_IDENTITY,
-    CONF_EFFECT_MODE,
     CONF_MAC,
     CONF_MAXVALUE,
     CONF_MINVALUE,
@@ -41,6 +40,7 @@ from .const import (
     CONF_GET_DEV_ATTR_REQ,
     CONF_SET_DEV_ATTR_REQ,
     Identity,
+    CONF_EFFECT_MODE,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -56,6 +56,7 @@ class DeviceStatusData:
     rgbw: tuple[int, int, int, int] = (255, 0, 0, 0)
     cct: int = 2700
     dimming: int = 100
+    effect: str = ""
 
     def update(self, attr: DeviceAttr) -> None:
         """Update status from DeviceAttr model."""
@@ -66,6 +67,7 @@ class DeviceStatusData:
         if attr.Dimming is not None:
             self.dimming = int(attr.Dimming * 255 / 100)
         if attr.RGBW is not None:
+            self.effect = ""
             rgbw_value = attr.RGBW
             # If RGBW is 0, set default red color (255, 0, 0, 0)
             if rgbw_value == 0:
@@ -80,6 +82,7 @@ class DeviceStatusData:
             w = rgbw & 0xFF
             self.rgbw = (r, g, b, w)
         if attr.CCT is not None:
+            self.effect = ""
             self.cct = attr.CCT
 
 
@@ -133,7 +136,8 @@ class DeviceClient(object):
     _ping_timer: Any = None
     writer: Any = None
     reader: Any = None
-    syncProperties = [CONF_ON_OFF, CONF_DIMMING, CONF_RGBW, CONF_CCT]
+    # syncProperties = [CONF_ON_OFF, CONF_DIMMING, CONF_RGBW, CONF_CCT, CONF_EFFECT_MODE]
+    syncProperties: Any = None
     heart_time = 30
     ping_data = PingRequest().to_dict()
     _TAG: str = "DeviceClient"
@@ -169,7 +173,9 @@ class DeviceClient(object):
         self.device_id = device.get(CONF_ID)
         self._simpleVersion = device.get("simpleVersion")
         self._TAG = f"{self.device_id}"
+        self.syncProperties = []
         if self.info.model_id == "lk.WIFI-RGBWLight-D0006":
+            self.syncProperties = [CONF_ON_OFF, CONF_DIMMING, CONF_RGBW, CONF_CCT]
             self.ping_data = None
             self.heart_time = 10
 
@@ -306,7 +312,25 @@ class DeviceClient(object):
                     self.ascNumber = response.payload.ascNumber
                 if response.payload.attr:
                     self.status.update(response.payload.attr)
+                    effect_name = self._get_effect_name_by_unique_id(
+                        response.payload.attr.effectUniqueID
+                    )
+                    if effect_name is not None:
+                        self.status.effect = effect_name
                     self._notify_status_update()
+
+    def _get_effect_name_by_unique_id(self, effect_unique_id: str | None) -> str | None:
+        """Get effect display name by primitive effect id."""
+        if not effect_unique_id:
+            return None
+
+        for effect_name, effect in self.info.presets.items():
+            if (
+                effect.primitiveEffectId == effect_unique_id
+                or effect.favoriteId == effect_unique_id
+            ):
+                return effect_name
+        return None
 
     def _schedule_ping(self):
         loop = asyncio.get_running_loop()
@@ -339,12 +363,12 @@ class DeviceClient(object):
         effect_item = self.info.presets.get(effect)
         if effect_item is None:
             raise ValueError(f"Unknown effect: {effect}")
+        if effect_item.primitiveEffectId is None:
+            raise ValueError(f"Effect has no primitiveEffectId: {effect}")
 
-        effect_params = await self.client.async_get_effect_mode_params(
-            self.device_id, effect_item
+        await self.client.async_execute_diff_command(
+            device_id=self.device_id, primitive=effect_item
         )
-        _LOGGER.warning(f"{self.device_id} effect params {effect_params}")
-        # await self.send_dev_attr({CONF_EFFECT_MODE: effect_item.primitiveEffectId})
 
     async def async_set_cct(self, cct: int) -> None:
         await self.send_dev_attr({CONF_CCT: cct})

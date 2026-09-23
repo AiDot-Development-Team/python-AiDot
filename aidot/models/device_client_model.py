@@ -92,6 +92,8 @@ class DeviceAttr:
     Dimming: int = None
     RGBW: int = None
     CCT: int = None
+    effectUniqueID: str = None
+    EffectMode: str = None
 
 
 @dataclass
