@@ -7,6 +7,7 @@ import time
 import json
 import asyncio
 import logging
+from ipaddress import ip_address
 from typing import TYPE_CHECKING, Any
 
 from .aes_utils import aes_encrypt, aes_decrypt_to_json
@@ -174,12 +175,27 @@ class DeviceClient(object):
         self._simpleVersion = device.get("simpleVersion")
         self._TAG = f"{self.device_id}"
         self.syncProperties = []
-        if self.info.model_id == "lk.WIFI-RGBWLight-D0006":
+        if self.info.model_id == "lk.WIFI-RGBWLight-D0006":  # 一代灯
             self.syncProperties = [CONF_ON_OFF, CONF_DIMMING, CONF_RGBW, CONF_CCT]
             self.ping_data = None
             self.heart_time = 10
+        else:
+            properties = device.get(CONF_PROPERTIES)
+            if properties is not None:
+                ip_address = self._get_valid_ip(properties.get("ipAddress"))
+                self.update_ip_address(ip_address)
 
         # _LOGGER.warning(f"{self._TAG}:{device}")
+
+    @staticmethod
+    def _get_valid_ip(ip: str | None) -> str | None:
+        """Return a valid IP address string."""
+        if not ip:
+            return None
+        try:
+            return str(ip_address(ip))
+        except ValueError:
+            return None
 
     async def connect(self, ip_address) -> None:
         _LOGGER.warning(f"{self._TAG}:connect device: {ip_address}")
