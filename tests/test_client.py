@@ -2,6 +2,7 @@
 
 import unittest
 from typing import Any
+from unittest.mock import AsyncMock
 
 import aiohttp
 
@@ -9,12 +10,19 @@ from aidot.client import AidotClient
 from aidot.const import (
     CONF_ACCESS_TOKEN,
     CONF_COUNTRY,
+    CONF_DIYS,
+    CONF_EFFECTS,
+    CONF_EFFECT_SOURCE,
+    CONF_FAV_PRESETS,
     CONF_ID,
     CONF_PASSWORD,
+    CONF_PRESETS,
     CONF_REFRESH_TOKEN,
     CONF_REGION,
     CONF_USERNAME,
+    EFFECT_SOURCE_RECOMMENDED,
 )
+from aidot.models.device_model import FavoriteEffectPrimitive
 
 
 class FakeResponse:
@@ -141,6 +149,155 @@ class AidotClientTest(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(aiohttp.ClientConnectionError):
             await client.async_post_login()
+
+    def test_recommended_effect_source_keeps_tagged_presets(self) -> None:
+        """Recommended effect source keeps tagged presets except New."""
+        client = AidotClient(session=None, effect_source=EFFECT_SOURCE_RECOMMENDED)
+        presets = [
+            FavoriteEffectPrimitive(name="Calm", primitiveEffectId="p_1"),
+            FavoriteEffectPrimitive(
+                name="Spark",
+                primitiveEffectId="p_3",
+                tag=" New ",
+            ),
+            FavoriteEffectPrimitive(
+                name="Wave",
+                primitiveEffectId="p_4",
+                tag="Hot",
+            ),
+            FavoriteEffectPrimitive(
+                name="Blank tag",
+                primitiveEffectId="p_5",
+                tag="",
+            ),
+            FavoriteEffectPrimitive(
+                name="Space tag",
+                primitiveEffectId="p_6",
+                tag=" ",
+            ),
+        ]
+
+        filtered = client._filter_preset_list(presets)
+
+        self.assertEqual(
+            [effect.name for effect in filtered],
+            ["Wave", "Space tag"],
+        )
+
+    def test_options_effect_source_takes_precedence(self) -> None:
+        """Options effect source takes precedence over legacy argument."""
+        client = AidotClient(
+            session=None,
+            options={CONF_EFFECT_SOURCE: EFFECT_SOURCE_RECOMMENDED},
+        )
+
+        self.assertEqual(client.effect_source, EFFECT_SOURCE_RECOMMENDED)
+
+    def test_recommended_effect_source_falls_back_to_top_ten(self) -> None:
+        """Recommended effect source falls back to the first ten presets."""
+        client = AidotClient(session=None, effect_source=EFFECT_SOURCE_RECOMMENDED)
+        presets = [
+            FavoriteEffectPrimitive(
+                name=f"Effect {index}", primitiveEffectId=f"p_{index}"
+            )
+            for index in range(12)
+        ]
+
+        filtered = client._filter_preset_list(presets)
+
+        self.assertEqual(len(filtered), 10)
+        self.assertEqual(filtered[-1].name, "Effect 9")
+
+    def test_all_effect_source_keeps_all_presets(self) -> None:
+        """All effect source keeps all preset effects."""
+        client = AidotClient(session=None)
+        device = {
+            CONF_DIYS: [
+                FavoriteEffectPrimitive(name="DIY", primitiveEffectId="d_1")
+            ],
+            CONF_FAV_PRESETS: [
+                FavoriteEffectPrimitive(name="Favorite", primitiveEffectId="f_1")
+            ],
+            CONF_PRESETS: [
+                FavoriteEffectPrimitive(name="Hot", primitiveEffectId="p_1", tag=" "),
+                FavoriteEffectPrimitive(
+                    name="New", primitiveEffectId="p_2", tag="New"
+                ),
+                FavoriteEffectPrimitive(name="Plain", primitiveEffectId="p_3"),
+            ],
+        }
+
+        effects = client.get_filtered_effects(device)
+
+        self.assertEqual(list(effects), ["DIY", "Favorite", "Hot", "New", "Plain"])
+
+    async def test_get_all_effects_stores_raw_lists_before_filtering(self) -> None:
+        """All effect sources are stored on the device before final filtering."""
+        client = AidotClient(session=None, effect_source=EFFECT_SOURCE_RECOMMENDED)
+        diy = [FavoriteEffectPrimitive(name="DIY", primitiveEffectId="d_1")]
+        favorite = [
+            FavoriteEffectPrimitive(name="Favorite", primitiveEffectId="p_1")
+        ]
+        presets = [
+            FavoriteEffectPrimitive(
+                name=f"Preset {index}", primitiveEffectId=f"p_{index}"
+            )
+            for index in range(12)
+        ]
+        device = {CONF_ID: "device_id"}
+        client.async_get_diy_list = AsyncMock(return_value=diy)
+        client.async_get_fav_presets = AsyncMock(return_value=favorite)
+        client.async_get_presets = AsyncMock(return_value=presets)
+
+        effects = await client.async_get_all_effects(device)
+
+        self.assertIs(device[CONF_DIYS], diy)
+        self.assertIs(device[CONF_FAV_PRESETS], favorite)
+        self.assertEqual(
+            [effect.primitiveEffectId for effect in device[CONF_PRESETS]],
+            ["p_0", *[f"p_{index}" for index in range(2, 12)]],
+        )
+        self.assertEqual(
+            list(effects),
+            [
+                "DIY",
+                "Favorite",
+                "Preset 0",
+                "Preset 2",
+                "Preset 3",
+                "Preset 4",
+                "Preset 5",
+                "Preset 6",
+                "Preset 7",
+                "Preset 8",
+                "Preset 9",
+                "Preset 10",
+            ],
+        )
+
+    def test_device_information_reads_final_effects(self) -> None:
+        """Device information uses final effects instead of raw preset list."""
+        from aidot.device_client import DeviceInformation
+
+        device = {
+            CONF_ID: "device_id",
+            "mac": "00:11:22:33:44:55",
+            "modelId": "model",
+            "name": "Light",
+            "hardwareVersion": "1",
+            CONF_PRESETS: [
+                FavoriteEffectPrimitive(name="Raw", primitiveEffectId="p_raw")
+            ],
+            CONF_EFFECTS: {
+                "Final": FavoriteEffectPrimitive(
+                    name="Final", primitiveEffectId="p_final"
+                )
+            },
+        }
+
+        info = DeviceInformation(device)
+
+        self.assertEqual(info.preset_names, ["Final"])
 
 
 if __name__ == "__main__":

@@ -24,6 +24,10 @@ from .const import (
     CONF_CODE,
     CONF_COUNTRY,
     CONF_DEVICE_LIST,
+    CONF_DIYS,
+    CONF_EFFECTS,
+    CONF_EFFECT_SOURCE,
+    CONF_FAV_PRESETS,
     CONF_ID,
     CONF_IPADDRESS,
     CONF_PASSWORD,
@@ -48,6 +52,8 @@ from .const import (
     CONF_AES_KEY,
     CONF_FIRMWARE_VERSION,
     CONF_PRIMITIVE,
+    DEFAULT_EFFECT_SOURCE,
+    EFFECT_SOURCE_RECOMMENDED,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -76,9 +82,13 @@ class AidotClient:
         username: str | None = None,
         password: str | None = None,
         token: dict | None = None,
+        options: dict[str, Any] | None = None,
+        effect_source: str = DEFAULT_EFFECT_SOURCE,
     ) -> None:
         _LOGGER.info("Client Version: v0.3.57")
         self.session = session
+        self.options = options.copy() if options is not None else {}
+        self.effect_source = self.options.get(CONF_EFFECT_SOURCE, effect_source)
         self.username = username
         self.password = password
         self.country_code = country_code or DEFAULT_COUNTRY_CODE
@@ -394,7 +404,7 @@ class AidotClient:
     async def async_get_all_effects(
         self, device: dict[str, Any]
     ) -> dict[str, FavoriteEffectPrimitive]:
-        """Get all effects list."""
+        """Get all effects list and store raw effect sources on the device."""
         diy_list: list[FavoriteEffectPrimitive] = []
         fav_preset: list[FavoriteEffectPrimitive] = []
         preset_list: list[FavoriteEffectPrimitive] = []
@@ -430,7 +440,44 @@ class AidotClient:
         preset_list = [
             item for item in preset_list if item.primitiveEffectId not in fav_preset_ids
         ]
-        return self._merge_effects_by_unique_name(diy_list, fav_preset, preset_list)
+
+        device[CONF_DIYS] = diy_list
+        device[CONF_FAV_PRESETS] = fav_preset
+        device[CONF_PRESETS] = preset_list
+        return self.get_filtered_effects(device)
+
+    def get_filtered_effects(
+        self, device: dict[str, Any]
+    ) -> dict[str, FavoriteEffectPrimitive]:
+        """Get final effects for Home Assistant from raw device effect sources."""
+        diy_list = device.get(CONF_DIYS, [])
+        fav_preset = device.get(CONF_FAV_PRESETS, [])
+        preset_list = device.get(CONF_PRESETS, [])
+
+        return self._merge_effects_by_unique_name(
+            diy_list,
+            fav_preset,
+            self._filter_preset_list(preset_list),
+        )
+
+    def _filter_preset_list(
+        self, preset_list: list[FavoriteEffectPrimitive]
+    ) -> list[FavoriteEffectPrimitive]:
+        """Filter preset effects by configured source."""
+        if self.effect_source != EFFECT_SOURCE_RECOMMENDED:
+            return preset_list
+
+        recommended = [
+            effect for effect in preset_list if self._is_recommended_effect(effect)
+        ]
+        if recommended:
+            return recommended
+        return preset_list[:10]
+
+    @staticmethod
+    def _is_recommended_effect(effect: FavoriteEffectPrimitive) -> bool:
+        """Return whether an effect should be included in recommended presets."""
+        return effect.tag not in (None, "") and effect.tag.strip() != "New"
 
     @staticmethod
     def _merge_effects_by_unique_name(
@@ -485,7 +532,7 @@ class AidotClient:
                     and CONF_AES_KEY in device
                     and device[CONF_AES_KEY][0] is not None
                 ):
-                    device[CONF_PRESETS] = await self.async_get_all_effects(device)
+                    device[CONF_EFFECTS] = await self.async_get_all_effects(device)
 
         except Exception as e:
             raise e

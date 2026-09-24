@@ -22,6 +22,7 @@ from .models.device_client_model import (
 from .const import (
     CONF_AES_KEY,
     CONF_CCT,
+    CONF_EFFECTS,
     CONF_HARDWARE_VERSION,
     CONF_ID,
     CONF_IDENTITY,
@@ -107,7 +108,7 @@ class DeviceInformation:
         self.model_id = device.get(CONF_MODEL_ID)
         self.name = device.get(CONF_NAME)
         self.hw_version = device.get(CONF_HARDWARE_VERSION)
-        self.presets = device.get(CONF_PRESETS, {})
+        self.presets = device.get(CONF_EFFECTS, device.get(CONF_PRESETS, {}))
         self.preset_names = list(self.presets)
         if CONF_PRODUCT in device and CONF_SERVICE_MODULES in device[CONF_PRODUCT]:
             for service in device[CONF_PRODUCT][CONF_SERVICE_MODULES]:
