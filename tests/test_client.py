@@ -12,6 +12,7 @@ from aidot.const import (
     CONF_COUNTRY,
     CONF_DIYS,
     CONF_EFFECTS,
+    CONF_EFFECT_SELECTION,
     CONF_EFFECT_SOURCE,
     CONF_FAV_PRESETS,
     CONF_ID,
@@ -20,6 +21,7 @@ from aidot.const import (
     CONF_REFRESH_TOKEN,
     CONF_REGION,
     CONF_USERNAME,
+    EFFECT_SOURCE_MANUAL,
     EFFECT_SOURCE_RECOMMENDED,
 )
 from aidot.models.device_model import FavoriteEffectPrimitive
@@ -230,6 +232,63 @@ class AidotClientTest(unittest.IsolatedAsyncioTestCase):
         effects = client.get_filtered_effects(device)
 
         self.assertEqual(list(effects), ["DIY", "Favorite", "Hot", "New", "Plain"])
+
+    def test_manual_effect_source_filters_selected_device_effects(self) -> None:
+        """Manual effect source keeps selected effects for one device."""
+        client = AidotClient(
+            session=None,
+            options={
+                CONF_EFFECT_SOURCE: EFFECT_SOURCE_MANUAL,
+                CONF_EFFECT_SELECTION: {
+                    "device_id_1": ["d_1", "f_1", "p_2"],
+                    "device_id_2": ["p_3"],
+                },
+            },
+        )
+        device = {
+            CONF_ID: "device_id_1",
+            CONF_DIYS: [
+                FavoriteEffectPrimitive(name="DIY", primitiveEffectId="d_1"),
+                FavoriteEffectPrimitive(name="Other DIY", primitiveEffectId="d_2"),
+            ],
+            CONF_FAV_PRESETS: [
+                FavoriteEffectPrimitive(
+                    name="Favorite",
+                    primitiveEffectId="p_1",
+                    favoriteId="f_1",
+                )
+            ],
+            CONF_PRESETS: [
+                FavoriteEffectPrimitive(name="Preset 2", primitiveEffectId="p_2"),
+                FavoriteEffectPrimitive(name="Preset 3", primitiveEffectId="p_3"),
+            ],
+        }
+
+        effects = client.get_filtered_effects(device)
+
+        self.assertEqual(list(effects), ["DIY", "Favorite", "Preset 2"])
+
+    def test_manual_effect_source_returns_empty_without_selection(self) -> None:
+        """Manual effect source returns no effects when device has no selection."""
+        client = AidotClient(
+            session=None,
+            options={
+                CONF_EFFECT_SOURCE: EFFECT_SOURCE_MANUAL,
+                CONF_EFFECT_SELECTION: {
+                    "other_device_id": ["p_1"],
+                },
+            },
+        )
+        device = {
+            CONF_ID: "device_id",
+            CONF_PRESETS: [
+                FavoriteEffectPrimitive(name="Preset", primitiveEffectId="p_1"),
+            ],
+        }
+
+        effects = client.get_filtered_effects(device)
+
+        self.assertEqual(effects, {})
 
     async def test_get_all_effects_stores_raw_lists_before_filtering(self) -> None:
         """All effect sources are stored on the device before final filtering."""

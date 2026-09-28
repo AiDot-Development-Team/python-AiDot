@@ -26,6 +26,7 @@ from .const import (
     CONF_DEVICE_LIST,
     CONF_DIYS,
     CONF_EFFECTS,
+    CONF_EFFECT_SELECTION,
     CONF_EFFECT_SOURCE,
     CONF_FAV_PRESETS,
     CONF_ID,
@@ -53,6 +54,7 @@ from .const import (
     CONF_FIRMWARE_VERSION,
     CONF_PRIMITIVE,
     DEFAULT_EFFECT_SOURCE,
+    EFFECT_SOURCE_MANUAL,
     EFFECT_SOURCE_RECOMMENDED,
 )
 
@@ -85,7 +87,7 @@ class AidotClient:
         options: dict[str, Any] | None = None,
         effect_source: str = DEFAULT_EFFECT_SOURCE,
     ) -> None:
-        _LOGGER.info("Client Version: v0.3.57")
+        _LOGGER.info("Client Version: v0.3.59")
         self.session = session
         self.options = options.copy() if options is not None else {}
         self.effect_source = self.options.get(CONF_EFFECT_SOURCE, effect_source)
@@ -454,11 +456,44 @@ class AidotClient:
         fav_preset = device.get(CONF_FAV_PRESETS, [])
         preset_list = device.get(CONF_PRESETS, [])
 
+        if self.effect_source == EFFECT_SOURCE_MANUAL:
+            return self._merge_effects_by_unique_name(
+                self._filter_manual_effects(device, diy_list),
+                self._filter_manual_effects(device, fav_preset),
+                self._filter_manual_effects(device, preset_list),
+            )
+
         return self._merge_effects_by_unique_name(
             diy_list,
             fav_preset,
             self._filter_preset_list(preset_list),
         )
+
+    def _filter_manual_effects(
+        self, device: dict[str, Any], effect_list: list[FavoriteEffectPrimitive]
+    ) -> list[FavoriteEffectPrimitive]:
+        """Filter effect list by manual device selection."""
+        selected_ids = self._get_manual_effect_ids(device)
+        return [
+            effect
+            for effect in effect_list
+            if self._get_effect_ids(effect) & selected_ids
+        ]
+
+    def _get_manual_effect_ids(self, device: dict[str, Any]) -> set[str]:
+        """Get manually selected effect ids for a device."""
+        effect_selection = self.options.get(CONF_EFFECT_SELECTION, {})
+        selected_ids = effect_selection.get(device.get(CONF_ID), [])
+        return {effect_id for effect_id in selected_ids if effect_id}
+
+    @staticmethod
+    def _get_effect_ids(effect: FavoriteEffectPrimitive) -> set[str]:
+        """Get selectable ids for an effect."""
+        return {
+            effect_id
+            for effect_id in (effect.primitiveEffectId, effect.favoriteId)
+            if effect_id
+        }
 
     def _filter_preset_list(
         self, preset_list: list[FavoriteEffectPrimitive]
