@@ -469,6 +469,16 @@ class AidotClient:
             self._filter_preset_list(preset_list),
         )
 
+    def get_all_cached_effects(
+        self, device: dict[str, Any]
+    ) -> dict[str, FavoriteEffectPrimitive]:
+        """Get all effects from cached raw device effect sources."""
+        return self._merge_effects_by_unique_name(
+            device.get(CONF_DIYS, []),
+            device.get(CONF_FAV_PRESETS, []),
+            device.get(CONF_PRESETS, []),
+        )
+
     def _filter_manual_effects(
         self, device: dict[str, Any], effect_list: list[FavoriteEffectPrimitive]
     ) -> list[FavoriteEffectPrimitive]:

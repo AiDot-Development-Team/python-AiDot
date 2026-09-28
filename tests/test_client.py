@@ -290,6 +290,27 @@ class AidotClientTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(effects, {})
 
+    def test_get_all_cached_effects_ignores_effect_source(self) -> None:
+        """All cached effects ignores the configured effect source."""
+        client = AidotClient(
+            session=None,
+            options={
+                CONF_EFFECT_SOURCE: EFFECT_SOURCE_MANUAL,
+                CONF_EFFECT_SELECTION: {"device_id": ["p_1"]},
+            },
+        )
+        device = {
+            CONF_ID: "device_id",
+            CONF_PRESETS: [
+                FavoriteEffectPrimitive(name="Selected", primitiveEffectId="p_1"),
+                FavoriteEffectPrimitive(name="Available", primitiveEffectId="p_2"),
+            ],
+        }
+
+        effects = client.get_all_cached_effects(device)
+
+        self.assertEqual(list(effects), ["Selected", "Available"])
+
     async def test_get_all_effects_stores_raw_lists_before_filtering(self) -> None:
         """All effect sources are stored on the device before final filtering."""
         client = AidotClient(session=None, effect_source=EFFECT_SOURCE_RECOMMENDED)
