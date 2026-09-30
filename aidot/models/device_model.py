@@ -100,6 +100,7 @@ class FavoriteEffectPrimitive:
     icon: str = None
     libraryId: str = "aidot.preset"
     name: str = None
+    tag: str = None
     tags: Optional[FavoriteEffectTags] = None
     scriptSize: int = None
     secondShareFlag: bool = None
