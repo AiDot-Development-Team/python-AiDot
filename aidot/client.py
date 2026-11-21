@@ -607,7 +607,7 @@ class AidotClient:
         if self._discover is not None:
             return
 
-        _LOGGER.warning("setup_discover")
+        _LOGGER.debug("setup_discover")
 
         def _discover_callback(dev_id, event: dict[str, str]) -> None:
             device_ip = event[CONF_IPADDRESS]

@@ -199,7 +199,7 @@ class DeviceClient(object):
             return None
 
     async def connect(self, ip_address) -> None:
-        _LOGGER.warning(f"{self._TAG}:connect device: {ip_address}")
+        _LOGGER.debug(f"{self._TAG}:connect device: {ip_address}")
         self.reader = self.writer = None
         self._connecting = True
         try:
@@ -267,7 +267,7 @@ class DeviceClient(object):
             magic, msgtype, bodysize = struct.unpack(">HHI", header)
             body = await self.reader.readexactly(bodysize)
             json_data = aes_decrypt_to_json(body, self.aes_key)
-            _LOGGER.warning(f"{self._TAG}:login result: {json_data}")
+            _LOGGER.debug(f"{self._TAG}:login result: {json_data}")
 
             response = DeviceResponse.from_json(json_data)
             if response.ack.code != 200:
@@ -288,7 +288,7 @@ class DeviceClient(object):
                 self._reconnect_handle.cancel()
                 self._reconnect_handle = None
             self._schedule_ping()
-            _LOGGER.warning(f"{self._TAG}:connect success: {self._ip_address}")
+            _LOGGER.debug(f"{self._TAG}:connect success: {self._ip_address}")
             await self.send_action(self.syncProperties, CONF_GET_DEV_ATTR_REQ)
         except (BrokenPipeError, ConnectionResetError, Exception) as e:
             _LOGGER.error(f"{self.device_id} login read status error {e}")
@@ -302,7 +302,7 @@ class DeviceClient(object):
                 self.ping_count = 0  # 有读到数据就把ping清零
                 body = await self.reader.readexactly(bodysize)
                 json_data = aes_decrypt_to_json(body, self.aes_key)
-                _LOGGER.warning(f"{self._TAG}:reveive_data : {json_data}")
+                _LOGGER.debug(f"{self._TAG}:reveive_data : {json_data}")
             except asyncio.CancelledError:
                 _LOGGER.debug(f"{self._TAG}:Receive task cancelled")
                 raise
@@ -404,7 +404,7 @@ class DeviceClient(object):
         )
 
         action = action_request.to_dict()
-        _LOGGER.warning(f"{self.device_id} send_action {action}")
+        _LOGGER.debug(f"{self.device_id} send_action {action}")
         try:
             self.writer.write(self.get_send_packet(json.dumps(action).encode(), 1))
             await self.writer.drain()
@@ -429,13 +429,13 @@ class DeviceClient(object):
 
             self.ping_count += 1
             if self.ping_data is not None:
-                _LOGGER.warning(f"{self.device_id} send_ping {self.ping_data}")
+                _LOGGER.debug(f"{self.device_id} send_ping {self.ping_data}")
                 self.writer.write(
                     self.get_send_packet(json.dumps(self.ping_data).encode(), 2)
                 )
                 await self.writer.drain()
             else:
-                _LOGGER.warning(f"{self.device_id} send_ping {self.syncProperties}")
+                _LOGGER.debug(f"{self.device_id} send_ping {self.syncProperties}")
                 await self.send_action(self.syncProperties, CONF_GET_DEV_ATTR_REQ)
             return 1
         except Exception as e:
@@ -454,8 +454,8 @@ class DeviceClient(object):
             self._receive_task.cancel()
             try:
                 await self._receive_task
-            except asyncio.CancelledError as e:
-                _LOGGER.error(f"{self.device_id} writer close error {e}")
+            except asyncio.CancelledError:
+                _LOGGER.debug(f"{self.device_id} receive task cancelled")
                 pass
         try:
             if self.writer:
