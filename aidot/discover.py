@@ -35,7 +35,7 @@ class BroadcastProtocol:
         try:
             request = DiscoverRequest.from_params(userId=self.user_id)
             message = request.to_dict()
-            _LOGGER.warning(f"send_broadcast {message}")
+            _LOGGER.debug(f"send_broadcast {message}")
             send_data = aes_encrypt(json.dumps(message).encode(), self.aes_key)
             self.transport.sendto(send_data, ("255.255.255.255", 6666))
         except Exception as error:
@@ -46,7 +46,7 @@ class BroadcastProtocol:
             data_str = aes_decrypt(data, self.aes_key)
             data_json = json.loads(data_str)
             response = DiscoverResponse.from_json(data=data_json)
-            _LOGGER.warning(f"datagram_received {data_json}")
+            _LOGGER.debug(f"datagram_received {data_json}")
             if response.payload and response.payload.devId and self._discover_cb:
                 self._discover_cb(response.payload.devId, {CONF_IPADDRESS: addr[0]})
         except Exception as error:
@@ -104,7 +104,7 @@ class Discover:
         self._schedule_broadcast()
 
     def _schedule_broadcast(self) -> None:
-        _LOGGER.warning("_schedule_broadcast")
+        _LOGGER.debug("_schedule_broadcast")
         # 前几次快速发现，之后慢速
         if self._fast_discover_count > 0:
             interval = _DISCOVER_FAST
